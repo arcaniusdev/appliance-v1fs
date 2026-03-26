@@ -550,7 +550,7 @@ Resources:
       ReceiveMessageWaitTimeSeconds: 20
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt ScanDLQ.Arn
-        maxReceiveCount: 3
+        maxReceiveCount: 5
       Tags:
         - Key: Name
           Value: !Sub ScanQueue-${AWS::StackName}
@@ -579,6 +579,90 @@ Resources:
             Condition:
               ArnLike:
                 aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-*"
+
+  # ── DLQ Remediation Lambda ─────────────────────────────────────────
+  DLQRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DLQRemediationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ScanDLQ.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ScanQueue.Arn
+
+  DLQRemediationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub dlq-remediation-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DLQRemediationRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ScanQueue
+          MAX_DLQ_RETRIES: "3"
+      Code:
+        ZipFile: |
+          import boto3, json, os, logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          sqs = boto3.client("sqs")
+          QUEUE_URL = os.environ["QUEUE_URL"]
+          MAX_RETRIES = int(os.environ["MAX_DLQ_RETRIES"])
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  body = record["body"]
+                  attrs = record.get("messageAttributes", {})
+                  retry = int(attrs.get("DLQRetryCount", {}).get("stringValue", "0"))
+
+                  if retry >= MAX_RETRIES:
+                      logger.warning("PERMANENT_FAILURE after %d DLQ retries: %s", retry, body[:200])
+                      continue
+
+                  retry += 1
+                  delay = min(60 * (5 ** (retry - 1)), 900)
+                  logger.info("DLQ retry %d/%d (delay %ds): %s", retry, MAX_RETRIES, delay, body[:200])
+
+                  sqs.send_message(
+                      QueueUrl=QUEUE_URL,
+                      MessageBody=body,
+                      DelaySeconds=delay,
+                      MessageAttributes={
+                          "DLQRetryCount": {
+                              "DataType": "Number",
+                              "StringValue": str(retry),
+                          }
+                      },
+                  )
+
+  DLQRemediationEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ScanDLQ.Arn
+      FunctionName: !Ref DLQRemediationLambda
+      BatchSize: 10
+      Enabled: true
 
   # ── CloudWatch Audit Log ───────────────────────────────────────────
   AuditLogGroup:
