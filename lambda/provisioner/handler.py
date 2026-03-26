@@ -176,9 +176,18 @@ def _handle_wait_for_scanner(event, context):
         raise TimeoutError("File Security scanner not detected")
 
     # Extract CA cert via EICE tunnel on port 443
-    with EICETunnel(instance_id, endpoint_id, remote_port=443) as tunnel:
-        logger.info("Extracting CA certificate via EICE tunnel")
-        cert_pem = extract_cert_pem("127.0.0.1", port=tunnel.local_port)
+    cert_pem = None
+    for cert_attempt in range(10):
+        try:
+            with EICETunnel(instance_id, endpoint_id, remote_port=443) as tunnel:
+                logger.info("Extracting CA certificate (attempt %d)", cert_attempt + 1)
+                cert_pem = extract_cert_pem("127.0.0.1", port=tunnel.local_port, retries=1)
+                break
+        except Exception:
+            logger.warning("Cert extraction attempt %d failed", cert_attempt + 1, exc_info=True)
+            time.sleep(10)
+    if cert_pem is None:
+        raise ConnectionError("Failed to extract CA cert after all attempts")
 
     # Store in Secrets Manager
     sm = boto3.client("secretsmanager", region_name=region)

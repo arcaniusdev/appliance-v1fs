@@ -62,6 +62,13 @@ Parameters:
     Default: 1
     MinValue: 1
     MaxValue: 3
+  PMLEnabled:
+    Description: Enable Predictive Machine Learning (PML) for scans
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
 
 Conditions:
   DeploySG2: !Not [!Equals [!Ref NumberOfServiceGateways, 1]]
@@ -775,6 +782,7 @@ Resources:
           SG_CA_CERT_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert"
           V1FS_API_KEY_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key"
           AUDIT_LOG_GROUP: !Sub scan-audit-${AWS::StackName}
+          PML_ENABLED: !Ref PMLEnabled
           LOG_LEVEL: INFO
 
   ScannerEventSourceMapping:
