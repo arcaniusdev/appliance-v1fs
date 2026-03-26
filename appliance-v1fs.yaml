@@ -1193,8 +1193,11 @@ Resources:
                 Action: lambda:InvokeFunction
                 Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
               - Effect: Allow
-                Action: ec2-instance-connect:OpenTunnel
-                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance-connect-endpoint/*"
+                Action:
+                  - ec2-instance-connect:OpenTunnel
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceConnectEndpoints
+                Resource: "*"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
