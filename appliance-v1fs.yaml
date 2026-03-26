@@ -76,6 +76,13 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
+  ServiceGatewayInstanceType:
+    Description: EC2 instance type for Service Gateway appliances
+    Type: String
+    Default: c5.4xlarge
+    AllowedValues:
+      - c5.2xlarge
+      - c5.4xlarge
 
 Conditions:
   DeploySG2: !Not [!Equals [!Ref NumberOfServiceGateways, 1]]
@@ -319,7 +326,7 @@ Resources:
     DependsOn: PrivateRoute1
     Properties:
       ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
-      InstanceType: c5.4xlarge
+      InstanceType: !Ref ServiceGatewayInstanceType
       KeyName: !Ref ServiceGatewayKeyPair
       SubnetId: !Ref PrivateSubnet1
       SecurityGroupIds:
@@ -334,7 +341,7 @@ Resources:
     DependsOn: PrivateRoute2
     Properties:
       ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
-      InstanceType: c5.4xlarge
+      InstanceType: !Ref ServiceGatewayInstanceType
       KeyName: !Ref ServiceGatewayKeyPair
       SubnetId: !Ref PrivateSubnet2
       SecurityGroupIds:
@@ -349,7 +356,7 @@ Resources:
     DependsOn: PrivateRoute1
     Properties:
       ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
-      InstanceType: c5.4xlarge
+      InstanceType: !Ref ServiceGatewayInstanceType
       KeyName: !Ref ServiceGatewayKeyPair
       SubnetId: !Ref PrivateSubnet1
       SecurityGroupIds:
