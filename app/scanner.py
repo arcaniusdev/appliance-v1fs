@@ -16,6 +16,8 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 _channels = None
 _channel_addrs = None
 _s3_client = None
+_logs_client = None
+_audit_stream_created = False
 
 
 def _get_s3():
@@ -23,6 +25,13 @@ def _get_s3():
     if _s3_client is None:
         _s3_client = boto3.client("s3")
     return _s3_client
+
+
+def _get_logs():
+    global _logs_client
+    if _logs_client is None:
+        _logs_client = boto3.client("logs")
+    return _logs_client
 
 
 def _build_channels():
@@ -171,15 +180,18 @@ def _process_record(
 
 
 def _audit(log_group, key, size, verdict, result, scan_ms, sg_addr):
+    global _audit_stream_created
     if not log_group:
         return
     try:
-        logs = boto3.client("logs")
+        logs = _get_logs()
         stream = f"scanner-{os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown')}"
-        try:
-            logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
-        except logs.exceptions.ResourceAlreadyExistsException:
-            pass
+        if not _audit_stream_created:
+            try:
+                logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
+            except (logs.exceptions.ResourceAlreadyExistsException, Exception):
+                pass
+            _audit_stream_created = True
         entry = {
             "timestamp": time.time(),
             "file": key,
