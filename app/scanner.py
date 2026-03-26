@@ -64,15 +64,20 @@ def _build_channels():
     ]
 
     # SG_ADDRESS supports single or comma-separated addresses
+    # CHANNELS_PER_SG opens multiple gRPC channels to each SG for higher concurrency
     addrs = [a.strip() for a in os.environ["SG_ADDRESS"].split(",") if a.strip()]
+    channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
     channels = []
+    channel_addrs = []
     for addr in addrs:
-        ch = grpc.secure_channel(addr, composite, options=options)
-        channels.append(ch)
-        logger.info("gRPC channel created to %s", addr)
+        for c in range(channels_per_sg):
+            ch = grpc.secure_channel(addr, composite, options=options)
+            channels.append(ch)
+            channel_addrs.append(addr)
+        logger.info("Created %d gRPC channel(s) to %s", channels_per_sg, addr)
 
     _channels = channels
-    _channel_addrs = addrs
+    _channel_addrs = channel_addrs
 
 
 def _get_channel():

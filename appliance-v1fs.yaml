@@ -83,6 +83,12 @@ Parameters:
     AllowedValues:
       - c5.2xlarge
       - c5.4xlarge
+  ChannelsPerSG:
+    Description: Number of gRPC channels per Service Gateway (higher = more concurrent scans)
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 8
 
 Conditions:
   DeploySG2: !Not [!Equals [!Ref NumberOfServiceGateways, 1]]
@@ -798,6 +804,7 @@ Resources:
           AUDIT_LOG_GROUP: !Sub scan-audit-${AWS::StackName}
           PML_ENABLED: !Ref PMLEnabled
           FEEDBACK_ENABLED: !Ref SmartFeedbackEnabled
+          CHANNELS_PER_SG: !Ref ChannelsPerSG
           LOG_LEVEL: INFO
 
   ScannerEventSourceMapping:
