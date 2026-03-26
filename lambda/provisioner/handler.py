@@ -7,7 +7,6 @@ import boto3
 
 import cfn_response
 from ssh_helper import ClishSession
-from cert_extractor import extract_cert_pem
 from eice_tunnel import EICETunnel
 
 logger = logging.getLogger()
@@ -175,19 +174,33 @@ def _handle_wait_for_scanner(event, context):
     if not scanner_found:
         raise TimeoutError("File Security scanner not detected")
 
-    # Extract CA cert via EICE tunnel on port 443
+    # Extract CA cert via SSH (openssl s_client to localhost:443 on the SG)
     cert_pem = None
-    for cert_attempt in range(10):
+    for cert_attempt in range(5):
         try:
-            with EICETunnel(instance_id, endpoint_id, remote_port=443) as tunnel:
-                logger.info("Extracting CA certificate (attempt %d)", cert_attempt + 1)
-                cert_pem = extract_cert_pem("127.0.0.1", port=tunnel.local_port, retries=1)
-                break
+            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+                logger.info("Extracting CA certificate via SSH (attempt %d)", cert_attempt + 1)
+                with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
+                    session.connect(timeout=30)
+                    session.send_command("enable", expect="# ", timeout=15)
+                    output = session.send_command(
+                        "execute shell openssl s_client -connect localhost:443 -servername sg.sgi.xdr.trendmicro.com </dev/null 2>/dev/null | openssl x509",
+                        expect="# ",
+                        timeout=30,
+                    )
+                if "-----BEGIN CERTIFICATE-----" in output and "-----END CERTIFICATE-----" in output:
+                    start = output.index("-----BEGIN CERTIFICATE-----")
+                    end = output.index("-----END CERTIFICATE-----") + len("-----END CERTIFICATE-----")
+                    cert_pem = output[start:end] + "\n"
+                    logger.info("CA cert extracted via SSH (%d bytes)", len(cert_pem))
+                    break
+                else:
+                    logger.warning("No cert found in openssl output: %s", output[-300:])
         except Exception:
             logger.warning("Cert extraction attempt %d failed", cert_attempt + 1, exc_info=True)
-            time.sleep(10)
+        time.sleep(10)
     if cert_pem is None:
-        raise ConnectionError("Failed to extract CA cert after all attempts")
+        raise ConnectionError("Failed to extract CA cert via SSH after all attempts")
 
     # Store in Secrets Manager
     sm = boto3.client("secretsmanager", region_name=region)
