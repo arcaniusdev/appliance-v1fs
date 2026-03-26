@@ -578,7 +578,7 @@ Resources:
   ScanQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 600
+      VisibilityTimeout: 900
       MessageRetentionPeriod: 1209600
       ReceiveMessageWaitTimeSeconds: 20
       RedrivePolicy:
@@ -780,7 +780,7 @@ Resources:
       Code:
         ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-scanner:latest"
       Role: !GetAtt ScannerLambdaRole.Arn
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1024
       VpcConfig:
         SubnetIds:
