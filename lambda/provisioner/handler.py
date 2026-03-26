@@ -138,23 +138,23 @@ def _handle_wait_for_scanner(event, context):
 
     private_key = _get_ssh_key(key_pair_id, region)
     attempt = retry_state.get("attempt", 0)
-    max_attempts = 28  # ~14 minutes at 30s intervals, leaves buffer for Lambda timeout
 
     with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
         host = "127.0.0.1"
         port = tunnel.local_port
 
-        while attempt < max_attempts:
+        while True:
             remaining_ms = context.get_remaining_time_in_millis()
-            if remaining_ms < 60_000:
+            if remaining_ms < 120_000:
                 logger.info(
                     "Lambda timeout approaching (%dms left), re-invoking (attempt %d)",
                     remaining_ms, attempt,
                 )
+                tunnel.close()
                 _reinvoke(event, context, attempt)
                 return {"Status": "Re-invoked", "Attempt": attempt}
 
-            logger.info("Checking for File Security scanner (attempt %d/%d)", attempt + 1, max_attempts)
+            logger.info("Checking for File Security scanner (attempt %d)", attempt + 1)
             try:
                 with ClishSession(host, "admin", private_key, port=port) as session:
                     session.connect(timeout=30)
@@ -173,11 +173,6 @@ def _handle_wait_for_scanner(event, context):
 
             attempt += 1
             time.sleep(30)
-        else:
-            raise TimeoutError(
-                "File Security scanner not detected after all attempts. "
-                "Ensure File Security is installed via the Vision One console."
-            )
 
     # Extract CA cert via EICE tunnel on port 443
     with EICETunnel(instance_id, endpoint_id, remote_port=443) as tunnel:
