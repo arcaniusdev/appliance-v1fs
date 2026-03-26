@@ -1,5 +1,4 @@
 import logging
-import socket
 import time
 from io import StringIO
 
@@ -19,8 +18,9 @@ class ClishSession:
     character-by-character to work around this behavior.
     """
 
-    def __init__(self, host: str, username: str, private_key_pem: str):
+    def __init__(self, host: str, username: str, private_key_pem: str, port: int = 22):
         self.host = host
+        self.port = port
         self.username = username
         self._pkey = paramiko.Ed25519Key.from_private_key(StringIO(private_key_pem))
         self._client = None
@@ -32,6 +32,7 @@ class ClishSession:
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self._client.connect(
             self.host,
+            port=self.port,
             username=self.username,
             pkey=self._pkey,
             timeout=timeout,
@@ -85,15 +86,3 @@ class ClishSession:
         self.close()
 
 
-def wait_for_ssh(host: str, port: int = 22, timeout: int = 600, interval: int = 10):
-    """Wait for SSH port to become reachable."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=5):
-                logger.info("SSH port %s:%d reachable", host, port)
-                return
-        except (OSError, socket.timeout):
-            logger.debug("SSH port %s:%d not ready, retrying in %ds", host, port, interval)
-            time.sleep(interval)
-    raise TimeoutError(f"SSH port {host}:{port} not reachable after {timeout}s")

@@ -348,14 +348,14 @@ Resources:
   ScannerECRRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: appliance-v1fs-scanner
+      RepositoryName: !Sub ${AWS::StackName}-scanner
       ImageScanningConfiguration:
         ScanOnPush: true
 
   ProvisionerECRRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: appliance-v1fs-provisioner
+      RepositoryName: !Sub ${AWS::StackName}-provisioner
       ImageScanningConfiguration:
         ScanOnPush: true
 
@@ -417,6 +417,10 @@ Resources:
             Value: !Ref "AWS::AccountId"
           - Name: AWS_DEFAULT_REGION
             Value: !Ref "AWS::Region"
+          - Name: SCANNER_REPO
+            Value: !Sub ${AWS::StackName}-scanner
+          - Name: PROVISIONER_REPO
+            Value: !Sub ${AWS::StackName}-provisioner
       Source:
         Type: GITHUB
         Location: https://github.com/arcaniusdev/appliance-v1fs.git
@@ -745,7 +749,7 @@ Resources:
       FunctionName: !Sub scanner-${AWS::StackName}
       PackageType: Image
       Code:
-        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/appliance-v1fs-scanner:latest"
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-scanner:latest"
       Role: !GetAtt ScannerLambdaRole.Arn
       Timeout: 600
       MemorySize: 1024
@@ -1160,26 +1164,6 @@ Resources:
         }
 
   # ── Provisioner Lambda ──────────────────────────────────────────────
-  ProvisionerLambdaSecGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      VpcId: !Ref BaseVPC
-      GroupDescription: Provisioner Lambda - egress to Service Gateway
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          DestinationSecurityGroupId: !Ref ServiceGatewaySecGroup
-          Description: SSH to Service Gateway
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS to AWS APIs and Service Gateway
-      Tags:
-        - Key: Name
-          Value: !Sub ProvisionerLambdaSecGroup-${AWS::StackName}
-
   ProvisionerLambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1191,7 +1175,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
         - PolicyName: ProvisionerPolicy
           PolicyDocument:
@@ -1208,6 +1192,9 @@ Resources:
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+              - Effect: Allow
+                Action: ec2-instance-connect:OpenTunnel
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance-connect-endpoint/*"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
@@ -1216,26 +1203,23 @@ Resources:
       FunctionName: !Sub provisioner-${AWS::StackName}
       PackageType: Image
       Code:
-        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/appliance-v1fs-provisioner:latest"
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-provisioner:latest"
       Role: !GetAtt ProvisionerLambdaRole.Arn
       Timeout: 900
       MemorySize: 256
-      VpcConfig:
-        SubnetIds:
-          - !Ref PrivateSubnet1
-          - !Ref PrivateSubnet2
-        SecurityGroupIds:
-          - !Ref ProvisionerLambdaSecGroup
 
   # ── Custom Resources: Registration & Scanner Detection ─────────────
   # ── Custom Resources: SG1 (always) ──────────────────────────────────
   SGRegistration1:
     Type: Custom::SGRegistration
-    DependsOn: ServiceGateway1
+    DependsOn:
+      - ServiceGateway1
+      - EICEndpoint
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Action: register
-      ServiceGatewayIP: !GetAtt ServiceGateway1.PrivateIp
+      InstanceId: !Ref ServiceGateway1
+      EndpointId: !Ref EICEndpoint
       RegistrationToken: !Ref RegistrationToken
       Hostname: !Sub "${ServiceGatewayHostname}-01"
       KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
@@ -1247,6 +1231,8 @@ Resources:
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Action: wait-for-scanner
+      InstanceId: !Ref ServiceGateway1
+      EndpointId: !Ref EICEndpoint
       ServiceGatewayIP: !GetAtt ServiceGateway1.PrivateIp
       KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
       CACertSecretName: appliance-v1fs/sg-ca-cert
@@ -1256,11 +1242,14 @@ Resources:
   SGRegistration2:
     Type: Custom::SGRegistration
     Condition: DeploySG2
-    DependsOn: ServiceGateway2
+    DependsOn:
+      - ServiceGateway2
+      - EICEndpoint
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Action: register
-      ServiceGatewayIP: !GetAtt ServiceGateway2.PrivateIp
+      InstanceId: !Ref ServiceGateway2
+      EndpointId: !Ref EICEndpoint
       RegistrationToken: !Ref RegistrationToken
       Hostname: !Sub "${ServiceGatewayHostname}-02"
       KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
@@ -1273,6 +1262,8 @@ Resources:
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Action: wait-for-scanner
+      InstanceId: !Ref ServiceGateway2
+      EndpointId: !Ref EICEndpoint
       ServiceGatewayIP: !GetAtt ServiceGateway2.PrivateIp
       KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
       CACertSecretName: appliance-v1fs/sg-ca-cert
@@ -1282,11 +1273,14 @@ Resources:
   SGRegistration3:
     Type: Custom::SGRegistration
     Condition: DeploySG3
-    DependsOn: ServiceGateway3
+    DependsOn:
+      - ServiceGateway3
+      - EICEndpoint
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Action: register
-      ServiceGatewayIP: !GetAtt ServiceGateway3.PrivateIp
+      InstanceId: !Ref ServiceGateway3
+      EndpointId: !Ref EICEndpoint
       RegistrationToken: !Ref RegistrationToken
       Hostname: !Sub "${ServiceGatewayHostname}-03"
       KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
@@ -1299,6 +1293,8 @@ Resources:
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Action: wait-for-scanner
+      InstanceId: !Ref ServiceGateway3
+      EndpointId: !Ref EICEndpoint
       ServiceGatewayIP: !GetAtt ServiceGateway3.PrivateIp
       KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
       CACertSecretName: appliance-v1fs/sg-ca-cert

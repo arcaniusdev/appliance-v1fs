@@ -6,8 +6,9 @@ import time
 import boto3
 
 import cfn_response
-from ssh_helper import ClishSession, wait_for_ssh
+from ssh_helper import ClishSession
 from cert_extractor import extract_cert_pem
+from eice_tunnel import EICETunnel
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -50,7 +51,8 @@ def _get_ssh_key(key_pair_id: str, region: str) -> str:
 
 def _handle_register(event, context):
     props = event["ResourceProperties"]
-    sg_ip = props["ServiceGatewayIP"]
+    instance_id = props["InstanceId"]
+    endpoint_id = props["EndpointId"]
     token = props["RegistrationToken"]
     key_pair_id = props["KeyPairId"]
     hostname = props.get("Hostname", "FSVA-AWS-01")
@@ -58,46 +60,45 @@ def _handle_register(event, context):
 
     private_key = _get_ssh_key(key_pair_id, region)
 
-    # Wait for SSH
-    logger.info("Waiting for SSH on %s", sg_ip)
-    wait_for_ssh(sg_ip, timeout=600)
+    with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+        host = "127.0.0.1"
+        port = tunnel.local_port
 
-    # Wait for appliance services to finish initializing.
-    # The clish shell rejects admin commands while internal services are starting.
-    _wait_for_admin_ready(sg_ip, private_key)
+        # Wait for appliance services to finish initializing
+        _wait_for_admin_ready(host, private_key, port=port)
 
-    # Set hostname before registration so Vision One sees the correct name
-    logger.info("Setting hostname to %s", hostname)
-    with ClishSession(sg_ip, "admin", private_key) as session:
-        session.connect(timeout=30)
-        session.send_command("enable", expect="# ", timeout=15)
-        output = session.send_command(
-            f"configure endpoint {hostname}",
-            expect="# ",
-            timeout=30,
-        )
-        logger.info("Hostname output: %s", output[-200:])
+        # Set hostname before registration so Vision One sees the correct name
+        logger.info("Setting hostname to %s", hostname)
+        with ClishSession(host, "admin", private_key, port=port) as session:
+            session.connect(timeout=30)
+            session.send_command("enable", expect="# ", timeout=15)
+            output = session.send_command(
+                f"configure endpoint {hostname}",
+                expect="# ",
+                timeout=30,
+            )
+            logger.info("Hostname output: %s", output[-200:])
 
-    # Register
-    logger.info("Registering Service Gateway")
-    with ClishSession(sg_ip, "admin", private_key) as session:
-        session.connect(timeout=30)
-        session.send_command("enable", expect="# ", timeout=15)
-        output = session.send_command(
-            f"register {token}",
-            expect="# ",
-            timeout=300,
-        )
-        logger.info("Register output: %s", output[-500:])
+        # Register
+        logger.info("Registering Service Gateway")
+        with ClishSession(host, "admin", private_key, port=port) as session:
+            session.connect(timeout=30)
+            session.send_command("enable", expect="# ", timeout=15)
+            output = session.send_command(
+                f"register {token}",
+                expect="# ",
+                timeout=300,
+            )
+            logger.info("Register output: %s", output[-500:])
 
-    if "Try again later" in output:
-        raise RuntimeError(f"Register command blocked: {output[-300:]}")
+        if "Try again later" in output:
+            raise RuntimeError(f"Register command blocked: {output[-300:]}")
 
-    # Verify registration via banner
-    time.sleep(15)
-    logger.info("Verifying registration via banner")
-    with ClishSession(sg_ip, "admin", private_key) as session:
-        banner = session.connect(timeout=30)
+        # Verify registration via banner
+        time.sleep(15)
+        logger.info("Verifying registration via banner")
+        with ClishSession(host, "admin", private_key, port=port) as session:
+            banner = session.connect(timeout=30)
 
     if "Status: Registered" not in banner:
         raise RuntimeError(
@@ -105,15 +106,15 @@ def _handle_register(event, context):
         )
 
     logger.info("Service Gateway registered as %s", hostname)
-    return {"Status": "Registered", "ServiceGatewayIP": sg_ip, "Hostname": hostname}
+    return {"Status": "Registered", "InstanceId": instance_id, "Hostname": hostname}
 
 
-def _wait_for_admin_ready(sg_ip, private_key, max_attempts=12, interval=15):
+def _wait_for_admin_ready(host, private_key, port=22, max_attempts=12, interval=15):
     """Poll until admin commands are accepted (no 'Try again later' errors)."""
     for attempt in range(max_attempts):
         logger.info("Checking admin readiness (attempt %d/%d)", attempt + 1, max_attempts)
         try:
-            with ClishSession(sg_ip, "admin", private_key) as session:
+            with ClishSession(host, "admin", private_key, port=port) as session:
                 session.connect(timeout=30)
                 output = session.send_command("enable", expect="# ", timeout=15)
                 if "Try again later" not in output:
@@ -127,6 +128,8 @@ def _wait_for_admin_ready(sg_ip, private_key, max_attempts=12, interval=15):
 
 def _handle_wait_for_scanner(event, context):
     props = event["ResourceProperties"]
+    instance_id = props["InstanceId"]
+    endpoint_id = props["EndpointId"]
     sg_ip = props["ServiceGatewayIP"]
     key_pair_id = props["KeyPairId"]
     region = props.get("Region", os.environ.get("AWS_REGION"))
@@ -137,45 +140,49 @@ def _handle_wait_for_scanner(event, context):
     attempt = retry_state.get("attempt", 0)
     max_attempts = 28  # ~14 minutes at 30s intervals, leaves buffer for Lambda timeout
 
-    while attempt < max_attempts:
-        remaining_ms = context.get_remaining_time_in_millis()
-        if remaining_ms < 60_000:
-            # Less than 60s left — re-invoke self to continue polling
-            logger.info(
-                "Lambda timeout approaching (%dms left), re-invoking (attempt %d)",
-                remaining_ms, attempt,
-            )
-            _reinvoke(event, context, attempt)
-            return {"Status": "Re-invoked", "Attempt": attempt}
+    with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+        host = "127.0.0.1"
+        port = tunnel.local_port
 
-        logger.info("Checking for File Security scanner (attempt %d/%d)", attempt + 1, max_attempts)
-        try:
-            with ClishSession(sg_ip, "admin", private_key) as session:
-                session.connect(timeout=30)
-                session.send_command("enable", expect="# ", timeout=15)
-                output = session.send_command(
-                    "configure verify plat",
-                    expect="# ",
-                    timeout=60,
+        while attempt < max_attempts:
+            remaining_ms = context.get_remaining_time_in_millis()
+            if remaining_ms < 60_000:
+                logger.info(
+                    "Lambda timeout approaching (%dms left), re-invoking (attempt %d)",
+                    remaining_ms, attempt,
                 )
+                _reinvoke(event, context, attempt)
+                return {"Status": "Re-invoked", "Attempt": attempt}
 
-            if "sg-sfs-scanner" in output and "Running" in output:
-                logger.info("File Security scanner pod detected")
-                break
-        except Exception:
-            logger.warning("SSH check failed (attempt %d)", attempt, exc_info=True)
+            logger.info("Checking for File Security scanner (attempt %d/%d)", attempt + 1, max_attempts)
+            try:
+                with ClishSession(host, "admin", private_key, port=port) as session:
+                    session.connect(timeout=30)
+                    session.send_command("enable", expect="# ", timeout=15)
+                    output = session.send_command(
+                        "configure verify plat",
+                        expect="# ",
+                        timeout=60,
+                    )
 
-        attempt += 1
-        time.sleep(30)
-    else:
-        raise TimeoutError(
-            "File Security scanner not detected after all attempts. "
-            "Ensure File Security is installed via the Vision One console."
-        )
+                if "sg-sfs-scanner" in output and "Running" in output:
+                    logger.info("File Security scanner pod detected")
+                    break
+            except Exception:
+                logger.warning("SSH check failed (attempt %d)", attempt, exc_info=True)
 
-    # Extract CA cert
-    logger.info("Extracting CA certificate from %s:443", sg_ip)
-    cert_pem = extract_cert_pem(sg_ip, port=443)
+            attempt += 1
+            time.sleep(30)
+        else:
+            raise TimeoutError(
+                "File Security scanner not detected after all attempts. "
+                "Ensure File Security is installed via the Vision One console."
+            )
+
+    # Extract CA cert via EICE tunnel on port 443
+    with EICETunnel(instance_id, endpoint_id, remote_port=443) as tunnel:
+        logger.info("Extracting CA certificate via EICE tunnel")
+        cert_pem = extract_cert_pem("127.0.0.1", port=tunnel.local_port)
 
     # Store in Secrets Manager
     sm = boto3.client("secretsmanager", region_name=region)
