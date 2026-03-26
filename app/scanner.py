@@ -90,7 +90,7 @@ def handler(event, context):
     clean_bucket = os.environ["S3_CLEAN_BUCKET"]
     quarantine_bucket = os.environ["S3_QUARANTINE_BUCKET"]
     max_file_size = int(os.environ.get("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
-    pml = os.environ.get("PML_ENABLED", "false").lower() == "true"
+    pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
     audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
 
     failures = []
