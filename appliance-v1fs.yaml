@@ -1,0 +1,1307 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: TrendAI Service Gateway File Scanner - Network Infrastructure
+
+Mappings:
+  ServiceGatewayAMI:
+    ap-northeast-1:
+      AMI: ami-061b8e13afe1358d6
+    ap-northeast-2:
+      AMI: ami-06d290f555649e7cf
+    ap-northeast-3:
+      AMI: ami-00f25d39db251653f
+    ap-south-1:
+      AMI: ami-0a2f9a344b741d105
+    ap-southeast-1:
+      AMI: ami-0314c89685371c51b
+    ap-southeast-2:
+      AMI: ami-041754942552affa3
+    ca-central-1:
+      AMI: ami-07402a3cb195e17fc
+    eu-central-1:
+      AMI: ami-052395dc73896c7e9
+    eu-north-1:
+      AMI: ami-01da7559532215e43
+    eu-west-1:
+      AMI: ami-0464d17a390eaa185
+    eu-west-2:
+      AMI: ami-074a722115304208d
+    eu-west-3:
+      AMI: ami-0fb56479bb67150e8
+    sa-east-1:
+      AMI: ami-0fceef1ddaea68074
+    us-east-1:
+      AMI: ami-0cc07c329eab4df1c
+    us-east-2:
+      AMI: ami-070f04f9bc3eea5f5
+    us-west-1:
+      AMI: ami-0d82ee727bafa15e8
+    us-west-2:
+      AMI: ami-0bcbbe1b09927f3d7
+
+Parameters:
+  PrimaryAZ:
+    Description: Availability Zone 1
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+  SecondaryAZ:
+    Description: Availability Zone 2
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1b
+  RegistrationToken:
+    Description: TrendAI Vision One Service Gateway registration token
+    Type: String
+    NoEcho: true
+    MinLength: 1
+  ServiceGatewayHostname:
+    Description: Hostname prefix for Service Gateway appliances (numbered automatically)
+    Type: String
+    Default: FSVA-AWS
+  NumberOfServiceGateways:
+    Description: Number of Service Gateway appliances to deploy (1-3)
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 3
+
+Conditions:
+  DeploySG2: !Not [!Equals [!Ref NumberOfServiceGateways, 1]]
+  DeploySG3: !Equals [!Ref NumberOfServiceGateways, 3]
+
+Resources:
+  # ── VPC ──────────────────────────────────────────────────────────────
+  BaseVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.2.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub BaseVPC-${AWS::StackName}
+
+  # ── Internet Gateway ────────────────────────────────────────────────
+  IG:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub IG-${AWS::StackName}
+
+  VPCIG:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref IG
+      VpcId: !Ref BaseVPC
+
+  # ── Public Subnets ──────────────────────────────────────────────────
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.0.0/22
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref PrimaryAZ
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet1-${AWS::StackName}
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.4.0/22
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref SecondaryAZ
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet2-${AWS::StackName}
+
+  # ── Private Subnets ─────────────────────────────────────────────────
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.32.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref PrimaryAZ
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet1-${AWS::StackName}
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.48.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref SecondaryAZ
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet2-${AWS::StackName}
+
+  # ── NAT Gateway EIPs ────────────────────────────────────────────────
+  NGWEIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP1-${AWS::StackName}
+
+  NGWEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP2-${AWS::StackName}
+
+  # ── NAT Gateways ────────────────────────────────────────────────────
+  NGW1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP1.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub NGW1-${AWS::StackName}
+
+  NGW2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP2.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub NGW2-${AWS::StackName}
+
+  # ── Public Route Tables ─────────────────────────────────────────────
+  PublicRT1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT1-${AWS::StackName}
+
+  PublicRoute1:
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  PublicRT2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT2-${AWS::StackName}
+
+  PublicRoute2:
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT2
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  # ── Private Route Tables ────────────────────────────────────────────
+  PrivateRT1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT1-${AWS::StackName}
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW1
+
+  PrivateRT2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT2-${AWS::StackName}
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW2
+
+  # ── Route Table Associations ────────────────────────────────────────
+  PublicSubnetRT1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT1
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnetRT2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT2
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateSubnetRT1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnetRT2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT2
+      SubnetId: !Ref PrivateSubnet2
+
+  # ── SSH Key Pair ────────────────────────────────────────────────────
+  ServiceGatewayKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ServiceGatewayKeyPair-${AWS::StackName}
+      KeyType: ed25519
+      Tags:
+        - Key: Name
+          Value: !Sub ServiceGatewayKeyPair-${AWS::StackName}
+
+  # ── Service Gateway ────────────────────────────────────────────────
+  ServiceGatewaySecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: Service Gateway appliance - inbound scan traffic and management
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.2.0.0/16
+          Description: HTTPS from VPC (SDK gRPC, management)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.2.0.0/16
+          Description: SSH from VPC (CLI management)
+      Tags:
+        - Key: Name
+          Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
+
+  ServiceGateway1:
+    Type: AWS::EC2::Instance
+    DependsOn: PrivateRoute1
+    Properties:
+      ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
+      InstanceType: c5.4xlarge
+      KeyName: !Ref ServiceGatewayKeyPair
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref ServiceGatewaySecGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ServiceGateway1-${AWS::StackName}
+
+  ServiceGateway2:
+    Type: AWS::EC2::Instance
+    Condition: DeploySG2
+    DependsOn: PrivateRoute2
+    Properties:
+      ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
+      InstanceType: c5.4xlarge
+      KeyName: !Ref ServiceGatewayKeyPair
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref ServiceGatewaySecGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ServiceGateway2-${AWS::StackName}
+
+  ServiceGateway3:
+    Type: AWS::EC2::Instance
+    Condition: DeploySG3
+    DependsOn: PrivateRoute1
+    Properties:
+      ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
+      InstanceType: c5.4xlarge
+      KeyName: !Ref ServiceGatewayKeyPair
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref ServiceGatewaySecGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ServiceGateway3-${AWS::StackName}
+
+  # ── ECR Repositories ────────────────────────────────────────────────
+  ScannerECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: appliance-v1fs-scanner
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  ProvisionerECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: appliance-v1fs-provisioner
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # ── Image Build (CodeBuild) ───────────────────────────────────────
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource:
+                  - !GetAtt ScannerECRRepo.Arn
+                  - !GetAtt ProvisionerECRRepo.Arn
+
+  ImageBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+      - ScannerECRRepo
+      - ProvisionerECRRepo
+    Properties:
+      Name: !Sub appliance-v1fs-build-${AWS::StackName}
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 15
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref "AWS::AccountId"
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref "AWS::Region"
+      Source:
+        Type: GITHUB
+        Location: https://github.com/arcaniusdev/appliance-v1fs.git
+        BuildSpec: buildspec.yml
+      Artifacts:
+        Type: NO_ARTIFACTS
+
+  ImageBuildTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TriggerBuild
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt ImageBuildProject.Arn
+
+  ImageBuildTrigger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub image-build-trigger-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ImageBuildTriggerRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3, json, time, urllib.request
+
+          def handler(event, context):
+              cb = boto3.client("codebuild")
+              props = event.get("ResourceProperties", {})
+              project = props["ProjectName"]
+
+              if event["RequestType"] == "Delete":
+                  return send(event, context, "SUCCESS", {})
+
+              try:
+                  resp = cb.start_build(projectName=project)
+                  build_id = resp["build"]["id"]
+                  while True:
+                      time.sleep(15)
+                      builds = cb.batch_get_builds(ids=[build_id])["builds"]
+                      status = builds[0]["buildStatus"]
+                      if status == "SUCCEEDED":
+                          return send(event, context, "SUCCESS", {"BuildId": build_id})
+                      if status in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT"):
+                          return send(event, context, "FAILED", {}, f"Build {status}: {build_id}")
+                      remaining = context.get_remaining_time_in_millis()
+                      if remaining < 30000:
+                          return send(event, context, "FAILED", {}, "Lambda timeout waiting for build")
+              except Exception as e:
+                  return send(event, context, "FAILED", {}, str(e))
+
+          def send(event, context, status, data, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data,
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("Content-Type", "")
+              req.add_header("Content-Length", str(len(body)))
+              urllib.request.urlopen(req)
+
+  ImageBuild:
+    Type: Custom::ImageBuild
+    DependsOn:
+      - ScannerECRRepo
+      - ProvisionerECRRepo
+    Properties:
+      ServiceToken: !GetAtt ImageBuildTrigger.Arn
+      ProjectName: !Ref ImageBuildProject
+
+  # ── S3 Buckets ──────────────────────────────────────────────────────
+  IngestBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: ScanQueuePolicy
+    Properties:
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ScanQueue.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub IngestBucket-${AWS::StackName}
+
+  CleanBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub CleanBucket-${AWS::StackName}
+
+  QuarantineBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub QuarantineBucket-${AWS::StackName}
+
+  # ── SQS ────────────────────────────────────────────────────────────
+  ScanQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 600
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ScanDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub ScanQueue-${AWS::StackName}
+
+  ScanDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Name
+          Value: !Sub ScanDLQ-${AWS::StackName}
+
+  ScanQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ScanQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ScanQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-*"
+
+  # ── CloudWatch Audit Log ───────────────────────────────────────────
+  AuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub scan-audit-${AWS::StackName}
+      RetentionInDays: 90
+
+  # ── Scanner Lambda ──────────────────────────────────────────────────
+  ScannerLambdaSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: Scanner Lambda - egress to Service Gateway and AWS APIs
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to Service Gateway and AWS APIs
+      Tags:
+        - Key: Name
+          Value: !Sub ScannerLambdaSecGroup-${AWS::StackName}
+
+  ScannerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ScannerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ScanQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt IngestBucket.Arn
+                  - !Sub "${IngestBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:CopyObject
+                Resource:
+                  - !Sub "${CleanBucket.Arn}/*"
+                  - !Sub "${QuarantineBucket.Arn}/*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ScannerLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - SGWaitForScanner1
+      - ImageBuild
+    Properties:
+      FunctionName: !Sub scanner-${AWS::StackName}
+      PackageType: Image
+      Code:
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/appliance-v1fs-scanner:latest"
+      Role: !GetAtt ScannerLambdaRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref ScannerLambdaSecGroup
+      Environment:
+        Variables:
+          S3_CLEAN_BUCKET: !Ref CleanBucket
+          S3_QUARANTINE_BUCKET: !Ref QuarantineBucket
+          SG_ADDRESS: !If
+            - DeploySG3
+            - !Sub "${ServiceGateway1.PrivateIp}:443,${ServiceGateway2.PrivateIp}:443,${ServiceGateway3.PrivateIp}:443"
+            - !If
+              - DeploySG2
+              - !Sub "${ServiceGateway1.PrivateIp}:443,${ServiceGateway2.PrivateIp}:443"
+              - !Sub "${ServiceGateway1.PrivateIp}:443"
+          SG_CA_CERT_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert"
+          V1FS_API_KEY_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key"
+          AUDIT_LOG_GROUP: !Sub scan-audit-${AWS::StackName}
+          LOG_LEVEL: INFO
+
+  ScannerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ScanQueue.Arn
+      FunctionName: !Ref ScannerLambda
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # ── Alarms & Notifications ─────────────────────────────────────────
+  AlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub scan-alarms-${AWS::StackName}
+      Tags:
+        - Key: Name
+          Value: !Sub AlarmSNSTopic-${AWS::StackName}
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-dlq-messages
+      AlarmDescription: Messages in the dead-letter queue indicate scan failures after 3 retries
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScanDLQ.QueueName
+      AlarmActions:
+        - !Ref AlarmSNSTopic
+      OKActions:
+        - !Ref AlarmSNSTopic
+
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-queue-age
+      AlarmDescription: Oldest message age exceeds 20 minutes for 5 consecutive minutes — scanner may be stuck or unable to keep up
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1200
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScanQueue.QueueName
+      AlarmActions:
+        - !Ref AlarmSNSTopic
+      OKActions:
+        - !Ref AlarmSNSTopic
+
+  # ── CloudWatch Dashboard ─────────────────────────────────────────
+  ScannerDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub scanner-${AWS::StackName}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": {
+                "markdown": "# Scanner Pipeline — ${AWS::StackName}"
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0, "y": 1, "width": 6, "height": 3,
+              "properties": {
+                "title": "Alarm Status",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-dlq-messages",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-queue-age"
+                ]
+              }
+            },
+            {
+              "type": "log",
+              "x": 6, "y": 1, "width": 3, "height": 3,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | stats count(*) as Scans",
+                "region": "${AWS::Region}",
+                "title": "Scans (1h)",
+                "view": "singleValue"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 9, "y": 1, "width": 3, "height": 3,
+              "properties": {
+                "metrics": [["AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "${ScanQueue.QueueName}", {"stat": "Sum", "label": "Scans/min"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "Scan Rate",
+                "period": 60,
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 1, "width": 3, "height": 3,
+              "properties": {
+                "metrics": [["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${ScanQueue.QueueName}", {"stat": "Maximum", "color": "#ff7f0e", "label": "Queue Age"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "Queue Age (s)",
+                "period": 60,
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 15, "y": 1, "width": 3, "height": 3,
+              "properties": {
+                "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ScanQueue.QueueName}", {"stat": "Maximum", "label": "Queued"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "Queued",
+                "period": 60,
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 18, "y": 1, "width": 3, "height": 3,
+              "properties": {
+                "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesNotVisible", "QueueName", "${ScanQueue.QueueName}", {"stat": "Maximum", "color": "#9467bd", "label": "In Flight"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "In Flight",
+                "period": 60,
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 21, "y": 1, "width": 3, "height": 3,
+              "properties": {
+                "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ScanDLQ.QueueName}", {"stat": "Maximum", "color": "#d62728", "label": "DLQ Messages"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "DLQ",
+                "period": 60,
+                "sparkline": true
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 4, "width": 24, "height": 1,
+              "properties": { "markdown": "## Queue Health" }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 5, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${ScanQueue.QueueName}", {"stat": "Sum", "color": "#1f77b4", "label": "Sent (ingested)"}],
+                  ["AWS/SQS", "NumberOfMessagesReceived", "QueueName", "${ScanQueue.QueueName}", {"stat": "Sum", "color": "#ff7f0e", "label": "Received (picked up)"}],
+                  ["AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "${ScanQueue.QueueName}", {"stat": "Sum", "color": "#2ca02c", "label": "Deleted (completed)"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Message Flow",
+                "period": 60,
+                "yAxis": { "left": { "label": "Messages", "showUnits": false } }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 5, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ScanQueue.QueueName}", {"stat": "Maximum", "color": "#1f77b4", "label": "Visible"}],
+                  ["AWS/SQS", "ApproximateNumberOfMessagesNotVisible", "QueueName", "${ScanQueue.QueueName}", {"stat": "Maximum", "color": "#9467bd", "label": "In Flight"}],
+                  ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${ScanQueue.QueueName}", {"stat": "Maximum", "color": "#d62728", "label": "Age (s)", "yAxis": "right"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Queue Depth & Message Age",
+                "period": 60,
+                "yAxis": { "left": { "label": "Messages", "showUnits": false }, "right": { "label": "Seconds", "showUnits": false } }
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 11, "width": 24, "height": 1,
+              "properties": { "markdown": "## Scan Performance" }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | stats count(*) as scans by bin(1m)",
+                "region": "${AWS::Region}",
+                "title": "Throughput (scans/min)",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | filter scanDurationMs > 0 | stats avg(scanDurationMs) as avg_ms, pct(scanDurationMs, 50) as p50, pct(scanDurationMs, 90) as p90, pct(scanDurationMs, 99) as p99 by bin(5m)",
+                "region": "${AWS::Region}",
+                "title": "Scan Duration (ms) — avg / p50 / p90 / p99",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 18, "width": 24, "height": 1,
+              "properties": { "markdown": "## Detection Analysis" }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 19, "width": 8, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | stats count(*) as total by verdict",
+                "region": "${AWS::Region}",
+                "title": "Verdict Breakdown",
+                "view": "pie"
+              }
+            },
+            {
+              "type": "log",
+              "x": 8, "y": 19, "width": 8, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | filter verdict = 'malicious' | stats count(*) as detections by bin(5m)",
+                "region": "${AWS::Region}",
+                "title": "Malicious Detections Over Time",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "log",
+              "x": 16, "y": 19, "width": 8, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | filter verdict = 'malicious' | stats count(*) as detections by malware.0 as malware_name | sort detections desc | limit 25",
+                "region": "${AWS::Region}",
+                "title": "Top Malware Names",
+                "view": "table"
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 25, "width": 24, "height": 1,
+              "properties": { "markdown": "## Scanner Lambda" }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 26, "width": 8, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Sum", "color": "#1f77b4", "label": "Invocations"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Sum", "color": "#d62728", "label": "Errors"}],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Sum", "color": "#ff7f0e", "label": "Throttles"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Invocations / Errors / Throttles",
+                "period": 60,
+                "yAxis": { "left": { "label": "Count", "showUnits": false } }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 26, "width": 8, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Average", "color": "#1f77b4", "label": "Avg"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "scanner-${AWS::StackName}", {"stat": "p90", "color": "#ff7f0e", "label": "p90"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Maximum", "color": "#d62728", "label": "Max"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Duration (ms)",
+                "period": 60,
+                "yAxis": { "left": { "label": "ms", "showUnits": false } }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 26, "width": 8, "height": 6,
+              "properties": {
+                "metrics": [["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Maximum", "color": "#9467bd", "label": "Concurrent"}]],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Concurrent Executions",
+                "period": 60,
+                "yAxis": { "left": { "label": "Count", "showUnits": false } }
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 32, "width": 24, "height": 1,
+              "properties": { "markdown": "## Service Gateway & File Distribution" }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 33, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | stats count(*) as scans by serviceGateway | sort scans desc",
+                "region": "${AWS::Region}",
+                "title": "Scans Per Service Gateway",
+                "view": "bar"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12, "y": 33, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | stats avg(size)/1024 as avg_kb, pct(size, 90)/1024 as p90_kb, max(size)/1024 as max_kb by bin(5m)",
+                "region": "${AWS::Region}",
+                "title": "File Size (KB) — avg / p90 / max",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 39, "width": 24, "height": 1,
+              "properties": { "markdown": "## DLQ" }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 40, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ScanDLQ.QueueName}", {"stat": "Maximum", "color": "#d62728", "label": "DLQ Depth"}],
+                  ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${ScanDLQ.QueueName}", {"stat": "Sum", "color": "#ff7f0e", "label": "Messages Arriving"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Dead Letter Queue",
+                "period": 60,
+                "yAxis": { "left": { "label": "Messages", "showUnits": false } }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 40, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${ScanDLQ.QueueName}", {"stat": "Sum", "color": "#d62728", "label": "Failures to DLQ"}],
+                  ["AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "${ScanQueue.QueueName}", {"stat": "Sum", "color": "#2ca02c", "label": "Successful Scans"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Success vs Failure Rate",
+                "period": 60,
+                "yAxis": { "left": { "label": "Count", "showUnits": false } }
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 46, "width": 24, "height": 1,
+              "properties": { "markdown": "## Recent Scans" }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 47, "width": 24, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | fields @timestamp, file, verdict, malware.0 as malware_name, scanDurationMs as duration_ms, size, sha256, serviceGateway | sort @timestamp desc | limit 100",
+                "region": "${AWS::Region}",
+                "title": "Latest Scan Results",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ── Provisioner Lambda ──────────────────────────────────────────────
+  ProvisionerLambdaSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: Provisioner Lambda - egress to Service Gateway
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          DestinationSecurityGroupId: !Ref ServiceGatewaySecGroup
+          Description: SSH to Service Gateway
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS APIs and Service Gateway
+      Tags:
+        - Key: Name
+          Value: !Sub ProvisionerLambdaSecGroup-${AWS::StackName}
+
+  ProvisionerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ProvisionerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ec2/keypair/*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+
+  ProvisionerLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: ImageBuild
+    Properties:
+      FunctionName: !Sub provisioner-${AWS::StackName}
+      PackageType: Image
+      Code:
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/appliance-v1fs-provisioner:latest"
+      Role: !GetAtt ProvisionerLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref ProvisionerLambdaSecGroup
+
+  # ── Custom Resources: Registration & Scanner Detection ─────────────
+  # ── Custom Resources: SG1 (always) ──────────────────────────────────
+  SGRegistration1:
+    Type: Custom::SGRegistration
+    DependsOn: ServiceGateway1
+    Properties:
+      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      Action: register
+      ServiceGatewayIP: !GetAtt ServiceGateway1.PrivateIp
+      RegistrationToken: !Ref RegistrationToken
+      Hostname: !Sub "${ServiceGatewayHostname}-01"
+      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
+      Region: !Ref "AWS::Region"
+
+  SGWaitForScanner1:
+    Type: Custom::SGWaitForScanner
+    DependsOn: SGRegistration1
+    Properties:
+      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      Action: wait-for-scanner
+      ServiceGatewayIP: !GetAtt ServiceGateway1.PrivateIp
+      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
+      CACertSecretName: appliance-v1fs/sg-ca-cert
+      Region: !Ref "AWS::Region"
+
+  # ── Custom Resources: SG2 (conditional) ────────────────────────────
+  SGRegistration2:
+    Type: Custom::SGRegistration
+    Condition: DeploySG2
+    DependsOn: ServiceGateway2
+    Properties:
+      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      Action: register
+      ServiceGatewayIP: !GetAtt ServiceGateway2.PrivateIp
+      RegistrationToken: !Ref RegistrationToken
+      Hostname: !Sub "${ServiceGatewayHostname}-02"
+      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
+      Region: !Ref "AWS::Region"
+
+  SGWaitForScanner2:
+    Type: Custom::SGWaitForScanner
+    Condition: DeploySG2
+    DependsOn: SGRegistration2
+    Properties:
+      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      Action: wait-for-scanner
+      ServiceGatewayIP: !GetAtt ServiceGateway2.PrivateIp
+      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
+      CACertSecretName: appliance-v1fs/sg-ca-cert
+      Region: !Ref "AWS::Region"
+
+  # ── Custom Resources: SG3 (conditional) ────────────────────────────
+  SGRegistration3:
+    Type: Custom::SGRegistration
+    Condition: DeploySG3
+    DependsOn: ServiceGateway3
+    Properties:
+      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      Action: register
+      ServiceGatewayIP: !GetAtt ServiceGateway3.PrivateIp
+      RegistrationToken: !Ref RegistrationToken
+      Hostname: !Sub "${ServiceGatewayHostname}-03"
+      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
+      Region: !Ref "AWS::Region"
+
+  SGWaitForScanner3:
+    Type: Custom::SGWaitForScanner
+    Condition: DeploySG3
+    DependsOn: SGRegistration3
+    Properties:
+      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      Action: wait-for-scanner
+      ServiceGatewayIP: !GetAtt ServiceGateway3.PrivateIp
+      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
+      CACertSecretName: appliance-v1fs/sg-ca-cert
+      Region: !Ref "AWS::Region"
+
+  # ── EC2 Instance Connect Endpoint ──────────────────────────────────
+  EICSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: EC2 Instance Connect Endpoint
+      Tags:
+        - Key: Name
+          Value: !Sub EICSecGroup-${AWS::StackName}
+
+  EICEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref EICSecGroup
+      PreserveClientIp: false
+      Tags:
+        - Key: Name
+          Value: !Sub EICEndpoint-${AWS::StackName}
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref BaseVPC
+  PublicSubnet1Id:
+    Description: Public subnet 1
+    Value: !Ref PublicSubnet1
+  PublicSubnet2Id:
+    Description: Public subnet 2
+    Value: !Ref PublicSubnet2
+  PrivateSubnet1Id:
+    Description: Private subnet 1
+    Value: !Ref PrivateSubnet1
+  PrivateSubnet2Id:
+    Description: Private subnet 2
+    Value: !Ref PrivateSubnet2
+  ServiceGateway1Id:
+    Description: Service Gateway 1 instance ID
+    Value: !Ref ServiceGateway1
+  ServiceGateway1PrivateIP:
+    Description: Service Gateway 1 private IP
+    Value: !GetAtt ServiceGateway1.PrivateIp
+  ServiceGateway2Id:
+    Condition: DeploySG2
+    Description: Service Gateway 2 instance ID
+    Value: !Ref ServiceGateway2
+  ServiceGateway2PrivateIP:
+    Condition: DeploySG2
+    Description: Service Gateway 2 private IP
+    Value: !GetAtt ServiceGateway2.PrivateIp
+  ServiceGateway3Id:
+    Condition: DeploySG3
+    Description: Service Gateway 3 instance ID
+    Value: !Ref ServiceGateway3
+  ServiceGateway3PrivateIP:
+    Condition: DeploySG3
+    Description: Service Gateway 3 private IP
+    Value: !GetAtt ServiceGateway3.PrivateIp
+  IngestBucketName:
+    Description: S3 ingest bucket
+    Value: !Ref IngestBucket
+  CleanBucketName:
+    Description: S3 clean bucket
+    Value: !Ref CleanBucket
+  QuarantineBucketName:
+    Description: S3 quarantine bucket
+    Value: !Ref QuarantineBucket
+  ScanQueueUrl:
+    Description: SQS scan queue URL
+    Value: !Ref ScanQueue
+  ScanDLQUrl:
+    Description: SQS dead letter queue URL
+    Value: !Ref ScanDLQ
+  ScannerLambdaName:
+    Description: Scanner Lambda function name
+    Value: !Ref ScannerLambda
+  DashboardName:
+    Description: CloudWatch dashboard name
+    Value: !Sub scanner-${AWS::StackName}
+  AlarmSNSTopicArn:
+    Description: SNS topic for alarm notifications
+    Value: !Ref AlarmSNSTopic
+  AuditLogGroupName:
+    Description: CloudWatch log group for scan audit trail
+    Value: !Ref AuditLogGroup
