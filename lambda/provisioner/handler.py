@@ -2,8 +2,10 @@ import json
 import logging
 import os
 import time
+from io import StringIO
 
 import boto3
+import paramiko
 
 import cfn_response
 from ssh_helper import ClishSession
@@ -174,33 +176,60 @@ def _handle_wait_for_scanner(event, context):
     if not scanner_found:
         raise TimeoutError("File Security scanner not detected")
 
-    # Extract CA cert via SSH (openssl s_client to localhost:443 on the SG)
+    # Extract CA cert via sgowner root access
+    # 1. Generate a temporary RSA key pair
+    # 2. Install public key via admin clish
+    # 3. SSH as sgowner and run openssl to extract the cert
+    rsa_key = paramiko.RSAKey.generate(4096)
+    pubkey_str = f"{rsa_key.get_name()} {rsa_key.get_base64()}"
+    # clish expects just the base64 portion (no type prefix)
+    pubkey_b64 = rsa_key.get_base64()
+
     cert_pem = None
     for cert_attempt in range(5):
         try:
             with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-                logger.info("Extracting CA certificate via SSH (attempt %d)", cert_attempt + 1)
-                with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
+                host = "127.0.0.1"
+                port = tunnel.local_port
+
+                # Install the public key via admin clish
+                logger.info("Installing temp SSH key for sgowner (attempt %d)", cert_attempt + 1)
+                with ClishSession(host, "admin", private_key, port=port) as session:
                     session.connect(timeout=30)
                     session.send_command("enable", expect="# ", timeout=15)
-                    output = session.send_command(
-                        "execute shell openssl s_client -connect localhost:443 -servername sg.sgi.xdr.trendmicro.com </dev/null 2>/dev/null | openssl x509",
+                    session.send_command(
+                        f"configure verify cli support {pubkey_b64}",
                         expect="# ",
                         timeout=30,
                     )
-                if "-----BEGIN CERTIFICATE-----" in output and "-----END CERTIFICATE-----" in output:
-                    start = output.index("-----BEGIN CERTIFICATE-----")
-                    end = output.index("-----END CERTIFICATE-----") + len("-----END CERTIFICATE-----")
-                    cert_pem = output[start:end] + "\n"
-                    logger.info("CA cert extracted via SSH (%d bytes)", len(cert_pem))
-                    break
-                else:
-                    logger.warning("No cert found in openssl output: %s", output[-300:])
+
+                # SSH as sgowner and extract the cert
+                logger.info("Connecting as sgowner to extract cert")
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(host, port=port, username="sgowner", pkey=rsa_key,
+                               timeout=30, allow_agent=False, look_for_keys=False)
+                stdin, stdout, stderr = client.exec_command(
+                    "openssl s_client -connect localhost:443 -servername sg.sgi.xdr.trendmicro.com "
+                    "</dev/null 2>/dev/null | openssl x509",
+                    timeout=30,
+                )
+                output = stdout.read().decode("utf-8", errors="replace")
+                client.close()
+
+            if "-----BEGIN CERTIFICATE-----" in output and "-----END CERTIFICATE-----" in output:
+                start = output.index("-----BEGIN CERTIFICATE-----")
+                end = output.index("-----END CERTIFICATE-----") + len("-----END CERTIFICATE-----")
+                cert_pem = output[start:end] + "\n"
+                logger.info("CA cert extracted via sgowner (%d bytes)", len(cert_pem))
+                break
+            else:
+                logger.warning("No cert in openssl output: %s", output[-300:])
         except Exception:
             logger.warning("Cert extraction attempt %d failed", cert_attempt + 1, exc_info=True)
         time.sleep(10)
     if cert_pem is None:
-        raise ConnectionError("Failed to extract CA cert via SSH after all attempts")
+        raise ConnectionError("Failed to extract CA cert after all attempts")
 
     # Store in Secrets Manager
     sm = boto3.client("secretsmanager", region_name=region)

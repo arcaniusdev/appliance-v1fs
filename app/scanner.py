@@ -91,6 +91,7 @@ def handler(event, context):
     quarantine_bucket = os.environ["S3_QUARANTINE_BUCKET"]
     max_file_size = int(os.environ.get("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
+    feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
     audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
 
     failures = []
@@ -100,7 +101,7 @@ def handler(event, context):
             for s3_event in body.get("Records", []):
                 _process_record(
                     s3_event, s3, clean_bucket, quarantine_bucket,
-                    max_file_size, pml, audit_log_group,
+                    max_file_size, pml, feedback, audit_log_group,
                 )
         except Exception:
             logger.exception("Failed processing SQS message %s", sqs_record.get("messageId", "?"))
@@ -113,7 +114,7 @@ def handler(event, context):
 
 def _process_record(
     record, s3, clean_bucket, quarantine_bucket,
-    max_file_size, pml, audit_log_group,
+    max_file_size, pml, feedback, audit_log_group,
 ):
     s3_data = record.get("s3", {})
     bucket = s3_data.get("bucket", {}).get("name")
@@ -151,7 +152,7 @@ def _process_record(
     scan_start = time.monotonic()
     result_json = amaas.grpc.scan_buffer(
         channel, file_bytes, os.path.basename(key),
-        tags=["S3-Scan"], pml=pml,
+        tags=["S3-Scan"], pml=pml, feedback=feedback,
     )
     scan_ms = int((time.monotonic() - scan_start) * 1000)
     result = json.loads(result_json)
