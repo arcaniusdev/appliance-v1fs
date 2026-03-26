@@ -139,24 +139,21 @@ def _handle_wait_for_scanner(event, context):
     private_key = _get_ssh_key(key_pair_id, region)
     attempt = retry_state.get("attempt", 0)
 
-    with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-        host = "127.0.0.1"
-        port = tunnel.local_port
+    scanner_found = False
+    while True:
+        remaining_ms = context.get_remaining_time_in_millis()
+        if remaining_ms < 120_000:
+            logger.info(
+                "Lambda timeout approaching (%dms left), re-invoking (attempt %d)",
+                remaining_ms, attempt,
+            )
+            _reinvoke(event, context, attempt)
+            return {"Status": "Re-invoked", "Attempt": attempt}
 
-        while True:
-            remaining_ms = context.get_remaining_time_in_millis()
-            if remaining_ms < 120_000:
-                logger.info(
-                    "Lambda timeout approaching (%dms left), re-invoking (attempt %d)",
-                    remaining_ms, attempt,
-                )
-                tunnel.close()
-                _reinvoke(event, context, attempt)
-                return {"Status": "Re-invoked", "Attempt": attempt}
-
-            logger.info("Checking for File Security scanner (attempt %d)", attempt + 1)
-            try:
-                with ClishSession(host, "admin", private_key, port=port) as session:
+        logger.info("Checking for File Security scanner (attempt %d)", attempt + 1)
+        try:
+            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+                with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
                     session.connect(timeout=30)
                     session.send_command("enable", expect="# ", timeout=15)
                     output = session.send_command(
@@ -165,14 +162,18 @@ def _handle_wait_for_scanner(event, context):
                         timeout=60,
                     )
 
-                if "sg-sfs-scanner" in output and "Running" in output:
-                    logger.info("File Security scanner pod detected")
-                    break
-            except Exception:
-                logger.warning("SSH check failed (attempt %d)", attempt, exc_info=True)
+            if "sg-sfs-scanner" in output and "Running" in output:
+                logger.info("File Security scanner pod detected")
+                scanner_found = True
+                break
+        except Exception:
+            logger.warning("SSH check failed (attempt %d)", attempt, exc_info=True)
 
-            attempt += 1
-            time.sleep(30)
+        attempt += 1
+        time.sleep(30)
+
+    if not scanner_found:
+        raise TimeoutError("File Security scanner not detected")
 
     # Extract CA cert via EICE tunnel on port 443
     with EICETunnel(instance_id, endpoint_id, remote_port=443) as tunnel:
