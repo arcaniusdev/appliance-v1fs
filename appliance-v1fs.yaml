@@ -328,6 +328,17 @@ Resources:
           ToPort: 1344
           CidrIp: 10.2.0.0/16
           Description: ICAP from VPC (large file scanning)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 10.2.0.0/16
+          Description: NFS to EFS (mount point scanning)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound (Vision One, updates)
       Tags:
         - Key: Name
           Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
@@ -579,6 +590,62 @@ Resources:
         - Key: Name
           Value: !Sub QuarantineBucket-${AWS::StackName}
 
+  # ── EFS (Large File Scanning via NFS Mount Point) ──────────────────
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: EFS mount targets - NFS from Lambda and Service Gateway
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 10.2.0.0/16
+          Description: NFS from VPC (Lambda and Service Gateway)
+      Tags:
+        - Key: Name
+          Value: !Sub EFSSecGroup-${AWS::StackName}
+
+  ScanFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ScanEFS-${AWS::StackName}
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref ScanFileSystem
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref ScanFileSystem
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref ScanFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /scan-inbox
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0777"
+
   # ── SQS ────────────────────────────────────────────────────────────
   ScanQueue:
     Type: AWS::SQS::Queue
@@ -817,6 +884,11 @@ Resources:
           ToPort: 1344
           CidrIp: 10.2.0.0/16
           Description: ICAP to Service Gateway for large file scanning
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 10.2.0.0/16
+          Description: NFS to EFS (large file scanning)
       Tags:
         - Key: Name
           Value: !Sub ScannerLambdaSecGroup-${AWS::StackName}
@@ -869,12 +941,19 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: !GetAtt ScanFileSystem.Arn
 
   ScannerLambda:
     Type: AWS::Lambda::Function
     DependsOn:
       - SGWaitForScanner1
       - ImageBuild
+      - EFSMountTarget1
+      - EFSMountTarget2
     Properties:
       FunctionName: !Sub scanner-${AWS::StackName}
       PackageType: Image
@@ -889,6 +968,9 @@ Resources:
           - !Ref PrivateSubnet2
         SecurityGroupIds:
           - !Ref ScannerLambdaSecGroup
+      FileSystemConfigs:
+        - Arn: !GetAtt EFSAccessPoint.Arn
+          LocalMountPath: /mnt/efs
       Environment:
         Variables:
           S3_CLEAN_BUCKET: !Ref CleanBucket
@@ -906,6 +988,7 @@ Resources:
           PML_ENABLED: !Ref PMLEnabled
           FEEDBACK_ENABLED: !Ref SmartFeedbackEnabled
           CHANNELS_PER_SG: !Ref ChannelsPerSG
+          EFS_MOUNT_PATH: /mnt/efs
           LOG_LEVEL: INFO
 
   ScannerEventSourceMapping:
@@ -1522,3 +1605,12 @@ Outputs:
   AuditLogGroupName:
     Description: CloudWatch log group for scan audit trail
     Value: !Ref AuditLogGroup
+  MountPointServer:
+    Description: "NFS server address for Vision One mount point configuration (Server IP)"
+    Value: !Sub "${ScanFileSystem}.efs.${AWS::Region}.amazonaws.com"
+  MountPointPath:
+    Description: "NFS folder path for Vision One mount point configuration (Server folder path)"
+    Value: /scan-inbox
+  MountPointQuarantine:
+    Description: "Quarantine subfolder name for Vision One mount point configuration"
+    Value: quarantine

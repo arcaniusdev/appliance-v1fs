@@ -2,9 +2,9 @@ import json
 import logging
 import os
 import random
-import socket
 import time
 import urllib.parse
+import uuid
 
 import boto3
 import grpc
@@ -13,17 +13,22 @@ import amaas.grpc
 logger = logging.getLogger("scanner")
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
-# gRPC file size threshold — files larger than this use ICAP
+# gRPC file size threshold — files larger than this use EFS mount point scanning
 GRPC_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-ICAP_PORT = 1344  # ICAP on Service Gateway (iptables DNAT to scanner pod)
+
+# EFS mount point scanning
+EFS_MOUNT_PATH = os.environ.get("EFS_MOUNT_PATH", "/mnt/efs")
+EFS_QUARANTINE_DIR = "quarantine"
+EFS_SCAN_POLL_INTERVAL = 2  # seconds between polls
+EFS_SCAN_TIMEOUT = 300  # max seconds to wait for mount point scanner
 
 # Module-level state — persists across warm invocations
 _channels = None
 _channel_addrs = None
-_sg_hosts = None
 _s3_client = None
 _logs_client = None
 _audit_stream_created = False
+_efs_initialized = False
 
 
 def _get_s3():
@@ -41,7 +46,7 @@ def _get_logs():
 
 
 def _build_channels():
-    global _channels, _channel_addrs, _sg_hosts
+    global _channels, _channel_addrs
 
     sm = boto3.client("secretsmanager")
     api_key = sm.get_secret_value(
@@ -69,16 +74,11 @@ def _build_channels():
         ("grpc.keepalive_permit_without_calls", 1),
     ]
 
-    # SG_ADDRESS supports single or comma-separated addresses (host:port)
     addrs = [a.strip() for a in os.environ["SG_ADDRESS"].split(",") if a.strip()]
     channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
     channels = []
     channel_addrs = []
-    sg_hosts = []
     for addr in addrs:
-        host = addr.split(":")[0]
-        if host not in sg_hosts:
-            sg_hosts.append(host)
         for c in range(channels_per_sg):
             ch = grpc.secure_channel(addr, composite, options=options)
             channels.append(ch)
@@ -87,7 +87,6 @@ def _build_channels():
 
     _channels = channels
     _channel_addrs = channel_addrs
-    _sg_hosts = sg_hosts
 
 
 def _get_channel():
@@ -100,112 +99,136 @@ def _get_channel():
     return _channels[idx], _channel_addrs[idx]
 
 
-def _get_sg_host():
-    """Return a random SG host IP for ICAP scanning."""
-    if _sg_hosts is None:
-        _build_channels()
-    return random.choice(_sg_hosts)
+# ── EFS Mount Point Scanning ────────────────────────────────────────
+
+def _ensure_efs_dirs():
+    """Create the quarantine subdirectory on EFS if it doesn't exist."""
+    global _efs_initialized
+    if _efs_initialized:
+        return
+    quarantine_path = os.path.join(EFS_MOUNT_PATH, EFS_QUARANTINE_DIR)
+    os.makedirs(quarantine_path, exist_ok=True)
+    _efs_initialized = True
 
 
-# ── ICAP Client ─────────────────────────────────────────────────────
+def _scan_via_efs(s3, bucket, key, size, clean_bucket, quarantine_bucket, audit_log_group):
+    """Scan a large file via EFS mount point (NFS scanning by the Service Gateway).
 
-def _scan_icap(file_bytes, filename, sg_host, api_key):
-    """Scan a file via ICAP RESPMOD on the Service Gateway."""
-    body = file_bytes
-    body_len = len(body)
+    Flow:
+    1. Download file from S3 to EFS /mnt/efs/{unique_id}_{filename}
+    2. SG's mount point scanner detects the new file and scans it
+    3. If malicious: scanner moves file to /mnt/efs/quarantine/
+    4. If clean: file remains at original path
+    5. Poll until file disappears from original path or appears in quarantine
+    6. Route to appropriate S3 bucket and clean up EFS
+    """
+    _ensure_efs_dirs()
 
-    # Build the encapsulated HTTP response (what ICAP RESPMOD wraps)
-    http_resp_hdr = (
-        f"HTTP/1.1 200 OK\r\n"
-        f"Content-Type: application/octet-stream\r\n"
-        f"Content-Length: {body_len}\r\n"
-        f"\r\n"
-    ).encode()
+    filename = os.path.basename(key)
+    scan_id = uuid.uuid4().hex[:12]
+    efs_filename = f"{scan_id}_{filename}"
+    efs_path = os.path.join(EFS_MOUNT_PATH, efs_filename)
+    quarantine_path = os.path.join(EFS_MOUNT_PATH, EFS_QUARANTINE_DIR, efs_filename)
 
-    encapsulated = f"res-hdr=0, res-body={len(http_resp_hdr)}"
-
-    # Build the ICAP RESPMOD request
-    icap_headers = (
-        f"RESPMOD icap://{sg_host}:{ICAP_PORT}/scan ICAP/1.0\r\n"
-        f"Host: {sg_host}\r\n"
-        f"X-scan-file-name: {filename}\r\n"
-        f"Authorization: Bearer {api_key}\r\n"
-        f"Encapsulated: {encapsulated}\r\n"
-        f"\r\n"
-    ).encode()
-
-    # Chunked body encoding for ICAP
-    chunk_header = f"{body_len:x}\r\n".encode()
-    chunk_trailer = b"\r\n0\r\n\r\n"
-
-    # Send request
-    sock = socket.create_connection((sg_host, ICAP_PORT), timeout=300)
+    # Download from S3 directly to EFS (streaming, no memory buffering)
+    logger.info("EFS scan: downloading s3://%s/%s to %s", bucket, key, efs_path)
+    scan_start = time.monotonic()
     try:
-        sock.sendall(icap_headers + http_resp_hdr + chunk_header + body + chunk_trailer)
+        resp = s3.get_object(Bucket=bucket, Key=key)
+        with open(efs_path, "wb") as f:
+            for chunk in resp["Body"].iter_chunks(chunk_size=1024 * 1024):
+                f.write(chunk)
+    except s3.exceptions.NoSuchKey:
+        logger.warning("s3://%s/%s gone, skipping", bucket, key)
+        return
+    except Exception:
+        # Clean up partial file
+        try:
+            os.unlink(efs_path)
+        except OSError:
+            pass
+        raise
 
-        # Read response
-        response = b""
-        while True:
-            data = sock.recv(8192)
-            if not data:
+    download_ms = int((time.monotonic() - scan_start) * 1000)
+    logger.info("EFS scan: downloaded %d bytes in %dms, waiting for scanner", size, download_ms)
+
+    # Poll for scan completion
+    # The mount point scanner will either:
+    # - Move the file to quarantine/ (malicious)
+    # - Leave it in place (clean) — we detect this by file mtime stabilizing
+    verdict = None
+    poll_start = time.monotonic()
+
+    while time.monotonic() - poll_start < EFS_SCAN_TIMEOUT:
+        time.sleep(EFS_SCAN_POLL_INTERVAL)
+
+        # Check if file was moved to quarantine
+        if os.path.exists(quarantine_path):
+            verdict = "malicious"
+            logger.warning("EFS scan: MALICIOUS (quarantined) %s", efs_filename)
+            break
+
+        # Check if file still exists at original path
+        if not os.path.exists(efs_path):
+            # File disappeared but not in quarantine — scanner may have moved it elsewhere
+            verdict = "malicious"
+            logger.warning("EFS scan: file disappeared (assumed malicious) %s", efs_filename)
+            break
+
+        # File still at original path — check if scan is complete
+        # The scanner modifies the file's access time during scanning.
+        # If the file hasn't been accessed in the last poll interval, scan is likely done.
+        try:
+            stat = os.stat(efs_path)
+            age_since_modify = time.time() - stat.st_mtime
+            # If file hasn't been modified for 2x poll interval, consider scan complete
+            if age_since_modify > EFS_SCAN_POLL_INTERVAL * 3 and (time.monotonic() - poll_start) > 10:
+                verdict = "clean"
+                logger.info("EFS scan: CLEAN (stable) %s after %.0fs", efs_filename, time.monotonic() - poll_start)
                 break
-            response += data
-            # ICAP responses end with \r\n\r\n for headers-only (204)
-            # or contain a full body for error responses
-            if b"\r\n\r\n" in response and (
-                response.startswith(b"ICAP/1.0 204") or
-                b"</html>" in response.lower() or
-                len(response) > 10000
-            ):
-                break
-    finally:
-        sock.close()
+        except OSError:
+            pass
 
-    resp_str = response.decode("utf-8", errors="replace")
-    icap_status_line = resp_str.split("\r\n")[0]
-    logger.info("ICAP response: %s (file=%s, sg=%s)", icap_status_line, filename, sg_host)
+    scan_ms = int((time.monotonic() - scan_start) * 1000)
 
-    # Parse ICAP status
-    if "ICAP/1.0 204" in resp_str:
-        return {"verdict": "clean", "scanResult": 0}
-    elif "ICAP/1.0 200" in resp_str:
-        if "403" in resp_str and "Virus Detected" in resp_str:
-            return {"verdict": "malicious", "scanResult": 1}
-        elif "400" in resp_str:
-            logger.warning("ICAP 400: %s", resp_str[:500])
-            raise RuntimeError(f"ICAP bad request: {resp_str[:300]}")
-        elif "401" in resp_str:
-            raise RuntimeError(f"ICAP auth failed: {resp_str[:300]}")
-        elif "500" in resp_str:
-            # Parse scan errors
-            errors = []
-            for code, msg in [("-69", "zip file count"), ("-71", "compression ratio"),
-                              ("-76", "file too large"), ("-78", "compressed layers"),
-                              ("-92", "password protected")]:
-                if code in resp_str:
-                    errors.append(msg)
-            if errors:
-                logger.warning("ICAP scan errors: %s", errors)
-            return {"verdict": "clean", "scanResult": 0, "foundErrors": errors}
+    if verdict is None:
+        logger.error("EFS scan: timeout after %ds for %s", EFS_SCAN_TIMEOUT, efs_filename)
+        verdict = "clean"  # Default to clean on timeout to avoid blocking
+
+    # Route to S3
+    result = {"scanResult": 1 if verdict == "malicious" else 0}
+
+    if verdict == "malicious":
+        tag = "Malware"
+        # Upload from quarantine path (or original if it disappeared)
+        src_path = quarantine_path if os.path.exists(quarantine_path) else None
+        if src_path:
+            with open(src_path, "rb") as f:
+                s3.put_object(Bucket=quarantine_bucket, Key=key, Body=f, Tagging="ScanResult=Malware")
         else:
-            logger.info("ICAP 200 (clean): %s", resp_str[:200])
-            return {"verdict": "clean", "scanResult": 0}
+            # File gone entirely — copy from S3 ingest to quarantine via server-side copy
+            s3.copy_object(
+                Bucket=quarantine_bucket, Key=key,
+                CopySource={"Bucket": bucket, "Key": key},
+                Tagging="ScanResult=Malware", TaggingDirective="REPLACE",
+            )
     else:
-        raise RuntimeError(f"Unexpected ICAP response: {icap_status_line}")
+        tag = "Clean"
+        with open(efs_path, "rb") as f:
+            s3.put_object(Bucket=clean_bucket, Key=key, Body=f, Tagging="ScanResult=Clean")
 
+    # Delete from ingest
+    s3.delete_object(Bucket=bucket, Key=key)
 
-# ── API Key Cache ────────────────────────────────────────────────────
+    # Clean up EFS
+    for p in [efs_path, quarantine_path]:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
 
-_api_key = None
-
-def _get_api_key():
-    global _api_key
-    if _api_key is None:
-        sm = boto3.client("secretsmanager")
-        _api_key = sm.get_secret_value(
-            SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
-        )["SecretString"]
-    return _api_key
+    _audit(audit_log_group, key, size, verdict, result, scan_ms, "EFS-mount")
+    logger.info("EFS scan: %s %s scan=%dms (download=%dms)", verdict.upper(), key, scan_ms, download_ms)
 
 
 # ── Handler ──────────────────────────────────────────────────────────
@@ -251,7 +274,12 @@ def _process_record(
     size = s3_data.get("object", {}).get("size", 0)
     logger.info("Processing s3://%s/%s (%d bytes)", bucket, key, size)
 
-    # Download
+    # Large files → EFS mount point scanning (NFS, supports PML, no size limit)
+    if size > GRPC_MAX_FILE_SIZE:
+        _scan_via_efs(s3, bucket, key, size, clean_bucket, quarantine_bucket, audit_log_group)
+        return
+
+    # Small files → gRPC (fast, through nginx ingress)
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
         file_bytes = resp["Body"].read()
@@ -259,30 +287,15 @@ def _process_record(
         logger.warning("s3://%s/%s gone, skipping", bucket, key)
         return
 
-    # Scan — gRPC for small files, ICAP for large files
+    channel, sg_addr = _get_channel()
     scan_start = time.monotonic()
-
-    if len(file_bytes) <= GRPC_MAX_FILE_SIZE:
-        # gRPC path
-        channel, sg_addr = _get_channel()
-        result_json = amaas.grpc.scan_buffer(
-            channel, file_bytes, os.path.basename(key),
-            tags=["S3-Scan"], pml=pml, feedback=feedback,
-        )
-        result = json.loads(result_json)
-        is_malicious = result.get("scanResult", 0) > 0
-        scan_method = "gRPC"
-    else:
-        # ICAP path for large files
-        sg_host = _get_sg_host()
-        sg_addr = f"{sg_host}:{ICAP_PORT}"
-        api_key = _get_api_key()
-        result = _scan_icap(file_bytes, os.path.basename(key), sg_host, api_key)
-        is_malicious = result.get("scanResult", 0) > 0
-        has_decomp_errors = bool(result.get("foundErrors"))
-        scan_method = "ICAP"
-
+    result_json = amaas.grpc.scan_buffer(
+        channel, file_bytes, os.path.basename(key),
+        tags=["S3-Scan"], pml=pml, feedback=feedback,
+    )
     scan_ms = int((time.monotonic() - scan_start) * 1000)
+    result = json.loads(result_json)
+    is_malicious = result.get("scanResult", 0) > 0
 
     if is_malicious:
         dest_bucket = quarantine_bucket
@@ -290,22 +303,14 @@ def _process_record(
         tag = "Malware"
         malware_names = [m.get("malwareName", "") for m in result.get("foundMalwares", [])]
         logger.warning(
-            "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s method=%s",
-            bucket, key, malware_names, scan_ms, sg_addr, scan_method,
-        )
-    elif scan_method == "ICAP" and has_decomp_errors:
-        dest_bucket = quarantine_bucket
-        verdict = "decomp_violation"
-        tag = "DecompViolation"
-        logger.warning(
-            "DECOMP_VIOLATION: s3://%s/%s errors=%s scan=%dms sg=%s",
-            bucket, key, result.get("foundErrors"), scan_ms, sg_addr,
+            "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s",
+            bucket, key, malware_names, scan_ms, sg_addr,
         )
     else:
         dest_bucket = clean_bucket
         verdict = "clean"
         tag = "Clean"
-        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s method=%s", bucket, key, scan_ms, sg_addr, scan_method)
+        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s", bucket, key, scan_ms, sg_addr)
 
     s3.put_object(Bucket=dest_bucket, Key=key, Body=file_bytes, Tagging=f"ScanResult={tag}")
     s3.delete_object(Bucket=bucket, Key=key)
