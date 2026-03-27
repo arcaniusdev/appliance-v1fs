@@ -234,6 +234,7 @@ def _scan_via_efs(s3, bucket, key, size, clean_bucket, quarantine_bucket, audit_
 # ── Handler ──────────────────────────────────────────────────────────
 
 def handler(event, context):
+    _ensure_efs_dirs()
     s3 = _get_s3()
     clean_bucket = os.environ["S3_CLEAN_BUCKET"]
     quarantine_bucket = os.environ["S3_QUARANTINE_BUCKET"]

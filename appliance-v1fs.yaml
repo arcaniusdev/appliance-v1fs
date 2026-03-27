@@ -1606,11 +1606,11 @@ Outputs:
     Description: CloudWatch log group for scan audit trail
     Value: !Ref AuditLogGroup
   MountPointServer:
-    Description: "NFS server address for Vision One mount point configuration (Server IP)"
-    Value: !Sub "${ScanFileSystem}.efs.${AWS::Region}.amazonaws.com"
+    Description: "NFS mount target IP for Vision One mount point configuration (Server IP) — use the IP in the same AZ as the Service Gateway"
+    Value: !GetAtt EFSMountTarget1.IpAddress
   MountPointPath:
     Description: "NFS folder path for Vision One mount point configuration (Server folder path)"
     Value: /scan-inbox
   MountPointQuarantine:
-    Description: "Quarantine subfolder name for Vision One mount point configuration"
-    Value: quarantine
+    Description: "Quarantine folder path for Vision One mount point configuration"
+    Value: /scan-inbox/quarantine
