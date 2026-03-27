@@ -203,18 +203,40 @@ def _handle_wait_for_scanner(event, context):
                         timeout=30,
                     )
 
-                # SSH as sgowner and extract the cert
-                logger.info("Connecting as sgowner to extract cert")
+                # SSH as sgowner for cert extraction and ICAP iptables setup
+                logger.info("Connecting as sgowner")
                 client = paramiko.SSHClient()
                 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 client.connect(host, port=port, username="sgowner", pkey=rsa_key,
                                timeout=30, allow_agent=False, look_for_keys=False)
+
+                # Extract CA cert
                 stdin, stdout, stderr = client.exec_command(
                     "openssl s_client -connect localhost:443 -servername sg.sgi.xdr.trendmicro.com "
                     "</dev/null 2>/dev/null | openssl x509",
                     timeout=30,
                 )
                 output = stdout.read().decode("utf-8", errors="replace")
+
+                # Set up iptables DNAT for ICAP (port 1344) to scanner pod
+                logger.info("Setting up ICAP iptables DNAT")
+                stdin, stdout, stderr = client.exec_command(
+                    "POD_IP=$(sudo microk8s kubectl get pod -n sg-sfs-scanner "
+                    "-o jsonpath='{.items[0].status.podIP}') && "
+                    "sudo iptables -t nat -C PREROUTING -p tcp --dport 1344 "
+                    "-j DNAT --to-destination $POD_IP:1344 2>/dev/null || "
+                    "sudo iptables -t nat -A PREROUTING -p tcp --dport 1344 "
+                    "-j DNAT --to-destination $POD_IP:1344 && "
+                    "sudo iptables -C FORWARD -p tcp -d $POD_IP --dport 1344 "
+                    "-j ACCEPT 2>/dev/null || "
+                    "sudo iptables -A FORWARD -p tcp -d $POD_IP --dport 1344 "
+                    "-j ACCEPT && "
+                    "echo ICAP_DNAT_OK:$POD_IP",
+                    timeout=15,
+                )
+                iptables_out = stdout.read().decode().strip()
+                logger.info("ICAP iptables: %s", iptables_out)
+
                 client.close()
 
             if "-----BEGIN CERTIFICATE-----" in output and "-----END CERTIFICATE-----" in output:
@@ -226,7 +248,7 @@ def _handle_wait_for_scanner(event, context):
             else:
                 logger.warning("No cert in openssl output: %s", output[-300:])
         except Exception:
-            logger.warning("Cert extraction attempt %d failed", cert_attempt + 1, exc_info=True)
+            logger.warning("Cert/ICAP setup attempt %d failed", cert_attempt + 1, exc_info=True)
         time.sleep(10)
     if cert_pem is None:
         raise ConnectionError("Failed to extract CA cert after all attempts")
