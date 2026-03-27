@@ -323,11 +323,6 @@ Resources:
           ToPort: 22
           CidrIp: 10.2.0.0/16
           Description: SSH from VPC (CLI management)
-        - IpProtocol: tcp
-          FromPort: 1344
-          ToPort: 1344
-          CidrIp: 10.2.0.0/16
-          Description: ICAP from VPC (large file scanning)
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 2049
@@ -880,11 +875,6 @@ Resources:
           CidrIp: 0.0.0.0/0
           Description: HTTPS to Service Gateway and AWS APIs
         - IpProtocol: tcp
-          FromPort: 1344
-          ToPort: 1344
-          CidrIp: 10.2.0.0/16
-          Description: ICAP to Service Gateway for large file scanning
-        - IpProtocol: tcp
           FromPort: 2049
           ToPort: 2049
           CidrIp: 10.2.0.0/16
@@ -1414,6 +1404,11 @@ Resources:
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceConnectEndpoints
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
@@ -1426,6 +1421,39 @@ Resources:
       Role: !GetAtt ProvisionerLambdaRole.Arn
       Timeout: 900
       MemorySize: 256
+      Environment:
+        Variables:
+          SG_INSTANCES: !If
+            - DeploySG3
+            - !Sub '["${ServiceGateway1}", "${ServiceGateway2}", "${ServiceGateway3}"]'
+            - !If
+              - DeploySG2
+              - !Sub '["${ServiceGateway1}", "${ServiceGateway2}"]'
+              - !Sub '["${ServiceGateway1}"]'
+          EICE_ENDPOINT_ID: !Ref EICEndpoint
+          KEY_PAIR_ID: !GetAtt ServiceGatewayKeyPair.KeyPairId
+          CERT_SECRET_NAME: appliance-v1fs/sg-ca-cert
+          AWS_REGION_NAME: !Ref "AWS::Region"
+
+  WatchdogSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub watchdog-${AWS::StackName}
+      Description: Check SG scanner versions and re-apply customizations if updated
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProvisionerLambda.Arn
+          Id: WatchdogTarget
+          Input: '{"action": "watchdog"}'
+
+  WatchdogPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProvisionerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WatchdogSchedule.Arn
 
   # ── Custom Resources: Registration & Scanner Detection ─────────────
   # ── Custom Resources: SG1 (always) ──────────────────────────────────
