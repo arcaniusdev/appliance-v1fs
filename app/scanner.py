@@ -15,7 +15,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 # gRPC file size threshold — files larger than this use ICAP
 GRPC_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-ICAP_PORT = 31344  # NodePort for ICAP on Service Gateway
+ICAP_PORT = 1344  # ICAP on Service Gateway (iptables DNAT to scanner pod)
 
 # Module-level state — persists across warm invocations
 _channels = None
