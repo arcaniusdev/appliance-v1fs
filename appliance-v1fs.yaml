@@ -323,6 +323,11 @@ Resources:
           ToPort: 22
           CidrIp: 10.2.0.0/16
           Description: SSH from VPC (CLI management)
+        - IpProtocol: tcp
+          FromPort: 1344
+          ToPort: 1344
+          CidrIp: 10.2.0.0/16
+          Description: ICAP from VPC (large file scanning)
       Tags:
         - Key: Name
           Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
@@ -807,6 +812,11 @@ Resources:
           ToPort: 443
           CidrIp: 0.0.0.0/0
           Description: HTTPS to Service Gateway and AWS APIs
+        - IpProtocol: tcp
+          FromPort: 1344
+          ToPort: 1344
+          CidrIp: 10.2.0.0/16
+          Description: ICAP to Service Gateway for large file scanning
       Tags:
         - Key: Name
           Value: !Sub ScannerLambdaSecGroup-${AWS::StackName}

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import random
+import socket
 import time
 import urllib.parse
 
@@ -12,9 +13,14 @@ import amaas.grpc
 logger = logging.getLogger("scanner")
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
+# gRPC file size threshold — files larger than this use ICAP
+GRPC_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+ICAP_PORT = 1344
+
 # Module-level state — persists across warm invocations
 _channels = None
 _channel_addrs = None
+_sg_hosts = None
 _s3_client = None
 _logs_client = None
 _audit_stream_created = False
@@ -35,7 +41,7 @@ def _get_logs():
 
 
 def _build_channels():
-    global _channels, _channel_addrs
+    global _channels, _channel_addrs, _sg_hosts
 
     sm = boto3.client("secretsmanager")
     api_key = sm.get_secret_value(
@@ -63,13 +69,16 @@ def _build_channels():
         ("grpc.keepalive_permit_without_calls", 1),
     ]
 
-    # SG_ADDRESS supports single or comma-separated addresses
-    # CHANNELS_PER_SG opens multiple gRPC channels to each SG for higher concurrency
+    # SG_ADDRESS supports single or comma-separated addresses (host:port)
     addrs = [a.strip() for a in os.environ["SG_ADDRESS"].split(",") if a.strip()]
     channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
     channels = []
     channel_addrs = []
+    sg_hosts = []
     for addr in addrs:
+        host = addr.split(":")[0]
+        if host not in sg_hosts:
+            sg_hosts.append(host)
         for c in range(channels_per_sg):
             ch = grpc.secure_channel(addr, composite, options=options)
             channels.append(ch)
@@ -78,10 +87,11 @@ def _build_channels():
 
     _channels = channels
     _channel_addrs = channel_addrs
+    _sg_hosts = sg_hosts
 
 
 def _get_channel():
-    """Return a gRPC channel, picking randomly when multiple SGs are configured."""
+    """Return a gRPC channel, picking randomly when multiple are configured."""
     if _channels is None:
         _build_channels()
     if len(_channels) == 1:
@@ -90,11 +100,120 @@ def _get_channel():
     return _channels[idx], _channel_addrs[idx]
 
 
+def _get_sg_host():
+    """Return a random SG host IP for ICAP scanning."""
+    if _sg_hosts is None:
+        _build_channels()
+    return random.choice(_sg_hosts)
+
+
+# ── ICAP Client ─────────────────────────────────────────────────────
+
+def _scan_icap(file_bytes, filename, sg_host, api_key):
+    """Scan a file via ICAP RESPMOD on the Service Gateway."""
+    body = file_bytes
+    body_len = len(body)
+
+    # Build the encapsulated HTTP response (what ICAP RESPMOD wraps)
+    http_resp_hdr = (
+        f"HTTP/1.1 200 OK\r\n"
+        f"Content-Type: application/octet-stream\r\n"
+        f"Content-Length: {body_len}\r\n"
+        f"\r\n"
+    ).encode()
+
+    encapsulated = f"res-hdr=0, res-body={len(http_resp_hdr)}"
+
+    # Build the ICAP RESPMOD request
+    icap_headers = (
+        f"RESPMOD icap://{sg_host}:{ICAP_PORT}/avscan ICAP/1.0\r\n"
+        f"Host: {sg_host}\r\n"
+        f"X-scan-file-name: {filename}\r\n"
+        f"Authorization: Bearer {api_key}\r\n"
+        f"Encapsulated: {encapsulated}\r\n"
+        f"\r\n"
+    ).encode()
+
+    # Chunked body encoding for ICAP
+    chunk_header = f"{body_len:x}\r\n".encode()
+    chunk_trailer = b"\r\n0\r\n\r\n"
+
+    # Send request
+    sock = socket.create_connection((sg_host, ICAP_PORT), timeout=300)
+    try:
+        sock.sendall(icap_headers + http_resp_hdr + chunk_header + body + chunk_trailer)
+
+        # Read response
+        response = b""
+        while True:
+            data = sock.recv(8192)
+            if not data:
+                break
+            response += data
+            # ICAP responses end with \r\n\r\n for headers-only (204)
+            # or contain a full body for error responses
+            if b"\r\n\r\n" in response and (
+                response.startswith(b"ICAP/1.0 204") or
+                b"</html>" in response.lower() or
+                len(response) > 10000
+            ):
+                break
+    finally:
+        sock.close()
+
+    resp_str = response.decode("utf-8", errors="replace")
+    icap_status_line = resp_str.split("\r\n")[0]
+    logger.info("ICAP response: %s (file=%s, sg=%s)", icap_status_line, filename, sg_host)
+
+    # Parse ICAP status
+    if "ICAP/1.0 204" in resp_str:
+        return {"verdict": "clean", "scanResult": 0}
+    elif "ICAP/1.0 200" in resp_str:
+        if "403" in resp_str and "Virus Detected" in resp_str:
+            return {"verdict": "malicious", "scanResult": 1}
+        elif "400" in resp_str:
+            logger.warning("ICAP 400: %s", resp_str[:500])
+            raise RuntimeError(f"ICAP bad request: {resp_str[:300]}")
+        elif "401" in resp_str:
+            raise RuntimeError(f"ICAP auth failed: {resp_str[:300]}")
+        elif "500" in resp_str:
+            # Parse scan errors
+            errors = []
+            for code, msg in [("-69", "zip file count"), ("-71", "compression ratio"),
+                              ("-76", "file too large"), ("-78", "compressed layers"),
+                              ("-92", "password protected")]:
+                if code in resp_str:
+                    errors.append(msg)
+            if errors:
+                logger.warning("ICAP scan errors: %s", errors)
+            return {"verdict": "clean", "scanResult": 0, "foundErrors": errors}
+        else:
+            logger.info("ICAP 200 (clean): %s", resp_str[:200])
+            return {"verdict": "clean", "scanResult": 0}
+    else:
+        raise RuntimeError(f"Unexpected ICAP response: {icap_status_line}")
+
+
+# ── API Key Cache ────────────────────────────────────────────────────
+
+_api_key = None
+
+def _get_api_key():
+    global _api_key
+    if _api_key is None:
+        sm = boto3.client("secretsmanager")
+        _api_key = sm.get_secret_value(
+            SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
+        )["SecretString"]
+    return _api_key
+
+
+# ── Handler ──────────────────────────────────────────────────────────
+
 def handler(event, context):
     s3 = _get_s3()
     clean_bucket = os.environ["S3_CLEAN_BUCKET"]
     quarantine_bucket = os.environ["S3_QUARANTINE_BUCKET"]
-    max_file_size = int(os.environ.get("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
     feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
     audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
@@ -106,7 +225,7 @@ def handler(event, context):
             for s3_event in body.get("Records", []):
                 _process_record(
                     s3_event, s3, clean_bucket, quarantine_bucket,
-                    max_file_size, pml, feedback, audit_log_group,
+                    pml, feedback, audit_log_group,
                 )
         except Exception:
             logger.exception("Failed processing SQS message %s", sqs_record.get("messageId", "?"))
@@ -119,7 +238,7 @@ def handler(event, context):
 
 def _process_record(
     record, s3, clean_bucket, quarantine_bucket,
-    max_file_size, pml, feedback, audit_log_group,
+    pml, feedback, audit_log_group,
 ):
     s3_data = record.get("s3", {})
     bucket = s3_data.get("bucket", {}).get("name")
@@ -132,18 +251,6 @@ def _process_record(
     size = s3_data.get("object", {}).get("size", 0)
     logger.info("Processing s3://%s/%s (%d bytes)", bucket, key, size)
 
-    # Oversize → quarantine via server-side copy
-    if max_file_size and size > max_file_size:
-        logger.warning("OVERSIZE: s3://%s/%s (%d > %d) → quarantine", bucket, key, size, max_file_size)
-        s3.copy_object(
-            Bucket=quarantine_bucket, Key=key,
-            CopySource={"Bucket": bucket, "Key": key},
-            Tagging="ScanResult=Oversize", TaggingDirective="REPLACE",
-        )
-        s3.delete_object(Bucket=bucket, Key=key)
-        _audit(audit_log_group, key, size, "oversize", {}, 0, "")
-        return
-
     # Download
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
@@ -152,17 +259,29 @@ def _process_record(
         logger.warning("s3://%s/%s gone, skipping", bucket, key)
         return
 
-    # Scan — pick a Service Gateway channel
-    channel, sg_addr = _get_channel()
+    # Scan — gRPC for small files, ICAP for large files
     scan_start = time.monotonic()
-    result_json = amaas.grpc.scan_buffer(
-        channel, file_bytes, os.path.basename(key),
-        tags=["S3-Scan"], pml=pml, feedback=feedback,
-    )
-    scan_ms = int((time.monotonic() - scan_start) * 1000)
-    result = json.loads(result_json)
 
-    is_malicious = result.get("scanResult", 0) > 0
+    if len(file_bytes) <= GRPC_MAX_FILE_SIZE:
+        # gRPC path
+        channel, sg_addr = _get_channel()
+        result_json = amaas.grpc.scan_buffer(
+            channel, file_bytes, os.path.basename(key),
+            tags=["S3-Scan"], pml=pml, feedback=feedback,
+        )
+        result = json.loads(result_json)
+        is_malicious = result.get("scanResult", 0) > 0
+        scan_method = "gRPC"
+    else:
+        # ICAP path for large files
+        sg_host = _get_sg_host()
+        sg_addr = f"{sg_host}:{ICAP_PORT}"
+        api_key = _get_api_key()
+        result = _scan_icap(file_bytes, os.path.basename(key), sg_host, api_key)
+        is_malicious = result.get("scanResult", 0) > 0
+        scan_method = "ICAP"
+
+    scan_ms = int((time.monotonic() - scan_start) * 1000)
 
     if is_malicious:
         dest_bucket = quarantine_bucket
@@ -170,14 +289,14 @@ def _process_record(
         tag = "Malware"
         malware_names = [m.get("malwareName", "") for m in result.get("foundMalwares", [])]
         logger.warning(
-            "MALICIOUS: s3://%s/%s sha256=%s malware=%s scan=%dms sg=%s",
-            bucket, key, result.get("fileSHA256", "?"), malware_names, scan_ms, sg_addr,
+            "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s method=%s",
+            bucket, key, malware_names, scan_ms, sg_addr, scan_method,
         )
     else:
         dest_bucket = clean_bucket
         verdict = "clean"
         tag = "Clean"
-        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s", bucket, key, scan_ms, sg_addr)
+        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s method=%s", bucket, key, scan_ms, sg_addr, scan_method)
 
     s3.put_object(Bucket=dest_bucket, Key=key, Body=file_bytes, Tagging=f"ScanResult={tag}")
     s3.delete_object(Bucket=bucket, Key=key)
