@@ -698,6 +698,96 @@ Resources:
       BatchSize: 10
       Enabled: true
 
+  # ── Reconciliation Lambda ─────────────────────────────────────────
+  ReconciliationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReconciliationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt IngestBucket.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ScanQueue.Arn
+
+  ReconciliationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub reconciliation-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ReconciliationRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          INGEST_BUCKET: !Ref IngestBucket
+          QUEUE_URL: !Ref ScanQueue
+          AGE_THRESHOLD_SECONDS: "1800"
+      Code:
+        ZipFile: |
+          import boto3, json, os, time, logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3 = boto3.client("s3")
+          sqs = boto3.client("sqs")
+          BUCKET = os.environ["INGEST_BUCKET"]
+          QUEUE_URL = os.environ["QUEUE_URL"]
+          AGE_THRESHOLD = int(os.environ["AGE_THRESHOLD_SECONDS"])
+
+          def handler(event, context):
+              now = time.time()
+              requeued = 0
+              paginator = s3.get_paginator("list_objects_v2")
+              for page in paginator.paginate(Bucket=BUCKET):
+                  for obj in page.get("Contents", []):
+                      age = now - obj["LastModified"].timestamp()
+                      if age > AGE_THRESHOLD:
+                          event_body = {
+                              "Records": [{
+                                  "s3": {
+                                      "bucket": {"name": BUCKET},
+                                      "object": {"key": obj["Key"], "size": obj["Size"]}
+                                  }
+                              }]
+                          }
+                          sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(event_body))
+                          requeued += 1
+              logger.info("Reconciliation: re-queued %d orphaned files (threshold %ds)", requeued, AGE_THRESHOLD)
+              return {"requeued": requeued}
+
+  ReconciliationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub reconciliation-${AWS::StackName}
+      Description: Re-queue orphaned files in the ingest bucket every 5 minutes
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ReconciliationLambda.Arn
+          Id: ReconciliationTarget
+
+  ReconciliationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReconciliationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReconciliationSchedule.Arn
+
   # ── CloudWatch Audit Log ───────────────────────────────────────────
   AuditLogGroup:
     Type: AWS::Logs::LogGroup
