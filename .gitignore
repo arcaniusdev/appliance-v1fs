@@ -2,3 +2,4 @@ CLAUDE.md
 .claude/
 sp-api-open-*.json
 docs/
+.DS_Store
