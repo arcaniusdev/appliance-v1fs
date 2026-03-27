@@ -126,7 +126,7 @@ def _scan_icap(file_bytes, filename, sg_host, api_key):
 
     # Build the ICAP RESPMOD request
     icap_headers = (
-        f"RESPMOD icap://{sg_host}:{ICAP_PORT}/avscan ICAP/1.0\r\n"
+        f"RESPMOD icap://{sg_host}:{ICAP_PORT}/scan ICAP/1.0\r\n"
         f"Host: {sg_host}\r\n"
         f"X-scan-file-name: {filename}\r\n"
         f"Authorization: Bearer {api_key}\r\n"
