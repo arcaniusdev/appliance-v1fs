@@ -15,7 +15,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 # gRPC file size threshold — files larger than this use ICAP
 GRPC_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-ICAP_PORT = 1344
+ICAP_PORT = 31344  # NodePort for ICAP on Service Gateway
 
 # Module-level state — persists across warm invocations
 _channels = None
@@ -279,6 +279,7 @@ def _process_record(
         api_key = _get_api_key()
         result = _scan_icap(file_bytes, os.path.basename(key), sg_host, api_key)
         is_malicious = result.get("scanResult", 0) > 0
+        has_decomp_errors = bool(result.get("foundErrors"))
         scan_method = "ICAP"
 
     scan_ms = int((time.monotonic() - scan_start) * 1000)
@@ -291,6 +292,14 @@ def _process_record(
         logger.warning(
             "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s method=%s",
             bucket, key, malware_names, scan_ms, sg_addr, scan_method,
+        )
+    elif scan_method == "ICAP" and has_decomp_errors:
+        dest_bucket = quarantine_bucket
+        verdict = "decomp_violation"
+        tag = "DecompViolation"
+        logger.warning(
+            "DECOMP_VIOLATION: s3://%s/%s errors=%s scan=%dms sg=%s",
+            bucket, key, result.get("foundErrors"), scan_ms, sg_addr,
         )
     else:
         dest_bucket = clean_bucket

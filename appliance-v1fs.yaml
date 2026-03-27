@@ -324,8 +324,8 @@ Resources:
           CidrIp: 10.2.0.0/16
           Description: SSH from VPC (CLI management)
         - IpProtocol: tcp
-          FromPort: 1344
-          ToPort: 1344
+          FromPort: 31344
+          ToPort: 31344
           CidrIp: 10.2.0.0/16
           Description: ICAP from VPC (large file scanning)
       Tags:
@@ -813,8 +813,8 @@ Resources:
           CidrIp: 0.0.0.0/0
           Description: HTTPS to Service Gateway and AWS APIs
         - IpProtocol: tcp
-          FromPort: 1344
-          ToPort: 1344
+          FromPort: 31344
+          ToPort: 31344
           CidrIp: 10.2.0.0/16
           Description: ICAP to Service Gateway for large file scanning
       Tags:
