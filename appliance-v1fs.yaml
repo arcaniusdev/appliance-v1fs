@@ -1412,9 +1412,9 @@ Outputs:
   ScannerLambdaName:
     Description: Scanner Lambda function name
     Value: !Ref ScannerLambda
-  DashboardName:
-    Description: CloudWatch dashboard name
-    Value: !Sub scanner-${AWS::StackName}
+  DashboardURL:
+    Description: CloudWatch dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/scanner-${AWS::StackName}"
   AlarmSNSTopicArn:
     Description: SNS topic for alarm notifications
     Value: !Ref AlarmSNSTopic
