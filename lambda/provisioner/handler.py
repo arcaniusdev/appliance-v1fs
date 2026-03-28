@@ -135,53 +135,47 @@ def _discover_sg_instances(region):
 
 
 def _assign_hostname(instance_id, region):
-    """Assign a unique hostname to a new SG based on existing hostnames in SSM."""
+    """Assign a unique hostname to a new SG using atomic SSM claims."""
     prefix = os.environ.get("HOSTNAME_PREFIX", "FSVA-AWS")
     ssm = boto3.client("ssm", region_name=region)
 
-    # Find the next available number by checking existing hostname params
-    existing_numbers = set()
-    try:
-        resp = ssm.get_parameters_by_path(
-            Path="/appliance-v1fs/hostname/",
-            Recursive=False,
-        )
-        for param in resp.get("Parameters", []):
-            val = param["Value"]
-            if val.startswith(prefix + "-"):
-                try:
-                    num = int(val.split("-")[-1])
-                    existing_numbers.add(num)
-                except ValueError:
-                    pass
-    except Exception:
-        logger.debug("No existing hostname params found", exc_info=True)
+    # Try to atomically claim a hostname number using PutParameter with Overwrite=False
+    for num in range(1, 100):
+        hostname = f"{prefix}-{num:02d}"
+        claim_param = f"/appliance-v1fs/hostname-claim/{num:02d}"
+        try:
+            ssm.put_parameter(
+                Name=claim_param,
+                Value=instance_id,
+                Type="String",
+                Overwrite=False,  # fails if already exists — atomic claim
+            )
+            # Claimed successfully — also store reverse mapping for cleanup
+            ssm.put_parameter(
+                Name=f"/appliance-v1fs/hostname/{instance_id}",
+                Value=hostname,
+                Type="String",
+                Overwrite=True,
+            )
+            logger.info("Assigned hostname %s to %s", hostname, instance_id)
+            return hostname
+        except ssm.exceptions.ParameterAlreadyExists:
+            continue  # number already claimed, try next
 
-    # Assign next available number
-    num = 1
-    while num in existing_numbers:
-        num += 1
-
-    hostname = f"{prefix}-{num:02d}"
-
-    # Store mapping so we can reclaim the number on termination
-    ssm.put_parameter(
-        Name=f"/appliance-v1fs/hostname/{instance_id}",
-        Value=hostname,
-        Type="String",
-        Overwrite=True,
-    )
-    logger.info("Assigned hostname %s to %s", hostname, instance_id)
-    return hostname
+    raise RuntimeError("No available hostname numbers (1-99 exhausted)")
 
 
 def _release_hostname(instance_id, region):
     """Release hostname assignment for a terminated SG."""
     ssm = boto3.client("ssm", region_name=region)
-    param_name = f"/appliance-v1fs/hostname/{instance_id}"
     try:
-        ssm.delete_parameter(Name=param_name)
-        logger.info("Released hostname for %s", instance_id)
+        resp = ssm.get_parameter(Name=f"/appliance-v1fs/hostname/{instance_id}")
+        hostname = resp["Parameter"]["Value"]
+        # Extract number from hostname (e.g., "FSVA-AWS-01" → "01")
+        num = hostname.rsplit("-", 1)[-1]
+        ssm.delete_parameter(Name=f"/appliance-v1fs/hostname-claim/{num}")
+        ssm.delete_parameter(Name=f"/appliance-v1fs/hostname/{instance_id}")
+        logger.info("Released hostname %s for %s", hostname, instance_id)
     except ssm.exceptions.ParameterNotFound:
         logger.debug("No hostname param found for %s", instance_id)
     except Exception:
@@ -270,13 +264,19 @@ def _handle_lifecycle(event, context):
             if "Try again later" in output:
                 raise RuntimeError(f"Register command blocked: {output[-300:]}")
 
-            time.sleep(15)
-            logger.info("Verifying registration via banner")
-            with ClishSession(host, "admin", private_key, port=port) as session:
-                banner = session.connect(timeout=30)
+        # Verify registration — retry banner check up to 5 times (registration can take 30-60s)
+        banner = ""
+        for verify_attempt in range(5):
+            time.sleep(30)
+            logger.info("Verifying registration via banner (attempt %d/5)", verify_attempt + 1)
+            with EICETunnel(instance_id, endpoint_id, remote_port=22) as vtunnel:
+                with ClishSession("127.0.0.1", "admin", private_key, port=vtunnel.local_port) as session:
+                    banner = session.connect(timeout=30)
+            if "Status: Registered" in banner:
+                break
 
         if "Status: Registered" not in banner:
-            raise RuntimeError(f"Registration verification failed. Banner: {banner[-500:]}")
+            raise RuntimeError(f"Registration verification failed after retries. Banner: {banner[-500:]}")
 
         logger.info("Service Gateway %s registered as %s", instance_id, hostname)
 
