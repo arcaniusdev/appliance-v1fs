@@ -1060,6 +1060,27 @@ Resources:
       OKActions:
         - !Ref AlarmSNSTopic
 
+  QueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-queue-depth
+      AlarmDescription: Queue depth exceeds 10,000 messages for 5 consecutive minutes — scanners may be down or overwhelmed
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScanQueue.QueueName
+      AlarmActions:
+        - !Ref AlarmSNSTopic
+      OKActions:
+        - !Ref AlarmSNSTopic
+
   # ── CloudWatch Dashboard ─────────────────────────────────────────
   ScannerDashboard:
     Type: AWS::CloudWatch::Dashboard
@@ -1082,7 +1103,8 @@ Resources:
                 "title": "Alarm Status",
                 "alarms": [
                   "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-dlq-messages",
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-queue-age"
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-queue-age",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-queue-depth"
                 ]
               }
             },
