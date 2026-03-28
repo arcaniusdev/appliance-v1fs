@@ -677,6 +677,15 @@ Resources:
                   - codebuild:StartBuild
                   - codebuild:BatchGetBuilds
                 Resource: !GetAtt ImageBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                  - s3:ListBucketVersions
+                  - s3:DeleteObjectVersion
+                Resource:
+                  - !GetAtt DeployBucket.Arn
+                  - !Sub "${DeployBucket.Arn}/*"
 
   ImageBuildTrigger:
     Type: AWS::Lambda::Function
@@ -696,6 +705,19 @@ Resources:
               project = props["ProjectName"]
 
               if event["RequestType"] == "Delete":
+                  bucket = props.get("DeployBucket", "")
+                  if bucket:
+                      s3 = boto3.client("s3")
+                      try:
+                          while True:
+                              objs = s3.list_object_versions(Bucket=bucket, MaxKeys=1000)
+                              to_delete = [{"Key": o["Key"], "VersionId": o["VersionId"]} for o in objs.get("Versions", [])]
+                              to_delete += [{"Key": o["Key"], "VersionId": o["VersionId"]} for o in objs.get("DeleteMarkers", [])]
+                              if not to_delete:
+                                  break
+                              s3.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
+                      except Exception as e:
+                          print(f"Bucket cleanup warning: {e}")
                   return send(event, context, "SUCCESS", {})
 
               try:
@@ -738,6 +760,7 @@ Resources:
     Properties:
       ServiceToken: !GetAtt ImageBuildTrigger.Arn
       ProjectName: !Ref ImageBuildProject
+      DeployBucket: !Ref DeployBucket
 
   # ── S3 Buckets ──────────────────────────────────────────────────────
   IngestBucket:
