@@ -408,14 +408,13 @@ Resources:
     Properties:
       AutoScalingGroupName: !Ref ServiceGatewayASG
       PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 300
       TargetTrackingConfiguration:
         CustomizedMetricSpecification:
           MetricName: BacklogPerInstance
           Namespace: !Sub Custom/${AWS::StackName}
           Statistic: Average
         TargetValue: 5000
-        ScaleInCooldown: 300
-        ScaleOutCooldown: 60
 
   # ── ASG Lifecycle Event → Provisioner ────────────────────────────
   SGLifecycleEventRule:
