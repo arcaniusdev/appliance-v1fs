@@ -270,7 +270,7 @@ def _handle_lifecycle(event, context):
         private_key = _get_ssh_key(key_pair_id, region)
         hostname = _assign_hostname(instance_id, region)
 
-        # Register the SG
+        # Register the SG — retry if "Try again later" (SG registration subsystem still booting)
         with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
             host = "127.0.0.1"
             port = tunnel.local_port
@@ -286,18 +286,24 @@ def _handle_lifecycle(event, context):
                     expect="# ", timeout=30,
                 )
 
-            logger.info("Registering Service Gateway")
-            with ClishSession(host, "admin", private_key, port=port) as session:
-                session.connect(timeout=30)
-                session.send_command("enable", expect="# ", timeout=15)
-                output = session.send_command(
-                    f"register {token}",
-                    expect="# ", timeout=300,
-                )
-                logger.info("Register output: %s", output[-500:])
+            output = ""
+            for reg_attempt in range(10):
+                logger.info("Registering Service Gateway (attempt %d/10)", reg_attempt + 1)
+                with ClishSession(host, "admin", private_key, port=port) as session:
+                    session.connect(timeout=30)
+                    session.send_command("enable", expect="# ", timeout=15)
+                    output = session.send_command(
+                        f"register {token}",
+                        expect="# ", timeout=300,
+                    )
+                    logger.info("Register output: %s", output[-500:])
 
-            if "Try again later" in output:
-                raise RuntimeError(f"Register command blocked: {output[-300:]}")
+                if "Try again later" not in output:
+                    break
+                logger.warning("Register blocked, retrying in 30s (attempt %d/10)", reg_attempt + 1)
+                time.sleep(30)
+            else:
+                raise RuntimeError(f"Register still blocked after 10 attempts: {output[-300:]}")
 
         # Verify registration — retry banner check up to 5 times (registration can take 30-60s)
         banner = ""
