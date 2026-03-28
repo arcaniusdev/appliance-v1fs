@@ -196,11 +196,23 @@ def _handle_lifecycle(event, context):
     instance_id = detail["EC2InstanceId"]
     hook_name = detail["LifecycleHookName"]
     asg_name = detail["AutoScalingGroupName"]
-    action_token = detail.get("LifecycleActionToken", "")
+    action_token = detail.get("LifecycleActionToken") or ""
     detail_type = event["detail-type"]
     region = event.get("region", os.environ.get("AWS_REGION_NAME", "us-east-1"))
 
     asg_client = boto3.client("autoscaling", region_name=region)
+
+    def _complete_lifecycle(result):
+        kwargs = dict(
+            LifecycleHookName=hook_name,
+            AutoScalingGroupName=asg_name,
+            LifecycleActionResult=result,
+        )
+        if action_token:
+            kwargs["LifecycleActionToken"] = action_token
+        else:
+            kwargs["InstanceId"] = instance_id
+        asg_client.complete_lifecycle_action(**kwargs)
 
     if detail_type == "EC2 Instance-Terminate Lifecycle Action":
         logger.info("Lifecycle TERMINATE: %s — releasing hostname", instance_id)
@@ -211,12 +223,7 @@ def _handle_lifecycle(event, context):
             ssm.delete_parameter(Name=f"{VERSION_PARAM_PREFIX}{instance_id}")
         except Exception:
             pass
-        asg_client.complete_lifecycle_action(
-            LifecycleHookName=hook_name,
-            AutoScalingGroupName=asg_name,
-            LifecycleActionToken=action_token,
-            LifecycleActionResult="CONTINUE",
-        )
+        _complete_lifecycle("CONTINUE")
         return {"status": "terminated", "instance": instance_id}
 
     # Launch lifecycle — full provisioning flow
@@ -278,23 +285,13 @@ def _handle_lifecycle(event, context):
             instance_id, endpoint_id, private_key, cert_secret_name, region,
         )
 
-        asg_client.complete_lifecycle_action(
-            LifecycleHookName=hook_name,
-            AutoScalingGroupName=asg_name,
-            LifecycleActionToken=action_token,
-            LifecycleActionResult="CONTINUE",
-        )
+        _complete_lifecycle("CONTINUE")
         logger.info("Lifecycle LAUNCH complete: %s", instance_id)
         return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
 
     except Exception as e:
         logger.exception("Lifecycle provisioning failed for %s: %s", instance_id, e)
-        asg_client.complete_lifecycle_action(
-            LifecycleHookName=hook_name,
-            AutoScalingGroupName=asg_name,
-            LifecycleActionToken=action_token,
-            LifecycleActionResult="ABANDON",
-        )
+        _complete_lifecycle("ABANDON")
         return {"status": "failed", "instance": instance_id, "error": str(e)}
 
 
