@@ -25,10 +25,16 @@ EFS_SCAN_TIMEOUT = 300  # max seconds to wait for mount point scanner
 # Module-level state — persists across warm invocations
 _channels = None
 _channel_addrs = None
+_channel_failures = None  # Circuit breaker: failure count per channel
+_channel_cooldown = None  # Circuit breaker: cooldown expiry per channel
 _s3_client = None
 _logs_client = None
 _audit_stream_created = False
 _efs_initialized = False
+
+# Circuit breaker settings
+CB_FAILURE_THRESHOLD = 3  # failures before marking channel unhealthy
+CB_COOLDOWN_SECONDS = 60  # seconds to skip an unhealthy channel
 
 
 def _get_s3():
@@ -46,7 +52,7 @@ def _get_logs():
 
 
 def _build_channels():
-    global _channels, _channel_addrs
+    global _channels, _channel_addrs, _channel_failures, _channel_cooldown
 
     sm = boto3.client("secretsmanager")
     api_key = sm.get_secret_value(
@@ -87,16 +93,50 @@ def _build_channels():
 
     _channels = channels
     _channel_addrs = channel_addrs
+    _channel_failures = [0] * len(channels)
+    _channel_cooldown = [0.0] * len(channels)
 
 
 def _get_channel():
-    """Return a gRPC channel, picking randomly when multiple are configured."""
+    """Return a healthy gRPC channel with circuit breaker logic."""
     if _channels is None:
         _build_channels()
     if len(_channels) == 1:
-        return _channels[0], _channel_addrs[0]
-    idx = random.randrange(len(_channels))
-    return _channels[idx], _channel_addrs[idx]
+        return _channels[0], _channel_addrs[0], 0
+
+    now = time.monotonic()
+    healthy = [i for i in range(len(_channels))
+               if _channel_failures[i] < CB_FAILURE_THRESHOLD or now >= _channel_cooldown[i]]
+
+    if not healthy:
+        # All channels unhealthy — reset cooldowns and try any
+        logger.warning("All gRPC channels unhealthy, resetting circuit breakers")
+        for i in range(len(_channels)):
+            _channel_failures[i] = 0
+            _channel_cooldown[i] = 0.0
+        healthy = list(range(len(_channels)))
+
+    idx = random.choice(healthy)
+    # Reset failure count if cooldown expired (probe the channel)
+    if _channel_failures[idx] >= CB_FAILURE_THRESHOLD and now >= _channel_cooldown[idx]:
+        _channel_failures[idx] = 0
+    return _channels[idx], _channel_addrs[idx], idx
+
+
+def _mark_channel_success(idx):
+    """Reset failure count on successful scan."""
+    if _channel_failures is not None and idx < len(_channel_failures):
+        _channel_failures[idx] = 0
+
+
+def _mark_channel_failure(idx):
+    """Increment failure count and set cooldown if threshold reached."""
+    if _channel_failures is not None and idx < len(_channel_failures):
+        _channel_failures[idx] += 1
+        if _channel_failures[idx] >= CB_FAILURE_THRESHOLD:
+            _channel_cooldown[idx] = time.monotonic() + CB_COOLDOWN_SECONDS
+            logger.warning("Circuit breaker OPEN for channel %d (%s) — cooldown %ds",
+                           idx, _channel_addrs[idx], CB_COOLDOWN_SECONDS)
 
 
 # ── EFS Mount Point Scanning ────────────────────────────────────────
@@ -288,12 +328,17 @@ def _process_record(
         logger.warning("s3://%s/%s gone, skipping", bucket, key)
         return
 
-    channel, sg_addr = _get_channel()
+    channel, sg_addr, ch_idx = _get_channel()
     scan_start = time.monotonic()
-    result_json = amaas.grpc.scan_buffer(
-        channel, file_bytes, os.path.basename(key),
-        tags=["S3-Scan"], pml=pml, feedback=feedback,
-    )
+    try:
+        result_json = amaas.grpc.scan_buffer(
+            channel, file_bytes, os.path.basename(key),
+            tags=["S3-Scan"], pml=pml, feedback=feedback,
+        )
+        _mark_channel_success(ch_idx)
+    except Exception:
+        _mark_channel_failure(ch_idx)
+        raise
     scan_ms = int((time.monotonic() - scan_start) * 1000)
     result = json.loads(result_json)
     is_malicious = result.get("scanResult", 0) > 0
