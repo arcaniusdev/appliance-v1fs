@@ -1,19 +1,27 @@
 version: 0.2
 
 phases:
-  pre_build:
-    commands:
-      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
   build:
     commands:
-      - docker build -t $PROVISIONER_REPO lambda/provisioner/
-      - docker tag $PROVISIONER_REPO:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$PROVISIONER_REPO:latest
-      - mkdir -p /tmp/layer/python
-      - "pip install -r app/requirements.txt -t /tmp/layer/python --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12"
-      - cd /tmp/layer && zip -r /tmp/scanner-layer.zip python/
+      # ── Scanner Lambda layer (visionone-filesecurity + gRPC) ──────
+      - mkdir -p /tmp/scanner-layer/python
+      - "pip install -r app/requirements.txt -t /tmp/scanner-layer/python --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12"
+      - cd /tmp/scanner-layer && zip -r /tmp/scanner-layer.zip python/
       - aws s3 cp /tmp/scanner-layer.zip s3://$DEPLOY_BUCKET/scanner-layer.zip
+
+      # ── Scanner Lambda code ───────────────────────────────────────
       - cd $CODEBUILD_SRC_DIR && cd app && zip /tmp/scanner-code.zip scanner.py
       - aws s3 cp /tmp/scanner-code.zip s3://$DEPLOY_BUCKET/scanner-code.zip
-  post_build:
-    commands:
-      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$PROVISIONER_REPO:latest
+
+      # ── Provisioner Lambda layer (paramiko + AWS CLI v2) ──────────
+      - mkdir -p /tmp/prov-layer/python /tmp/prov-layer/bin
+      - "pip install -r lambda/provisioner/requirements.txt -t /tmp/prov-layer/python --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12"
+      - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
+      - cd /tmp && unzip -q awscli.zip && ./aws/install --install-dir /tmp/prov-layer/aws-cli --bin-dir /tmp/prov-layer/bin
+      - ls -la /tmp/prov-layer/bin/
+      - cd /tmp/prov-layer && zip -yr /tmp/provisioner-layer.zip python/ bin/ aws-cli/
+      - aws s3 cp /tmp/provisioner-layer.zip s3://$DEPLOY_BUCKET/provisioner-layer.zip
+
+      # ── Provisioner Lambda code ───────────────────────────────────
+      - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py ssh_helper.py eice_tunnel.py
+      - aws s3 cp /tmp/provisioner-code.zip s3://$DEPLOY_BUCKET/provisioner-code.zip

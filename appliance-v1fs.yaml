@@ -566,16 +566,7 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt BacklogMetricSchedule.Arn
 
-  # ── ECR Repository (Provisioner only) ───────────────────────────────
-  ProvisionerECRRepo:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub ${AWS::StackName}-provisioner
-      EmptyOnDelete: true
-      ImageScanningConfiguration:
-        ScanOnPush: true
-
-  # ── Image Build (CodeBuild) ───────────────────────────────────────
+  # ── Code Build ────────────────────────────────────────────────────
   CodeBuildRole:
     Type: AWS::IAM::Role
     Properties:
@@ -599,21 +590,6 @@ Resources:
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
               - Effect: Allow
                 Action:
-                  - ecr:GetAuthorizationToken
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - ecr:BatchCheckLayerAvailability
-                  - ecr:GetDownloadUrlForLayer
-                  - ecr:BatchGetImage
-                  - ecr:PutImage
-                  - ecr:InitiateLayerUpload
-                  - ecr:UploadLayerPart
-                  - ecr:CompleteLayerUpload
-                Resource:
-                  - !GetAtt ProvisionerECRRepo.Arn
-              - Effect: Allow
-                Action:
                   - s3:PutObject
                   - s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${DeployBucket}/*"
@@ -627,9 +603,7 @@ Resources:
 
   ImageBuildProject:
     Type: AWS::CodeBuild::Project
-    DependsOn:
-      - ProvisionerECRRepo
-      - DeployBucket
+    DependsOn: DeployBucket
     Properties:
       Name: !Sub appliance-v1fs-build-${AWS::StackName}
       ServiceRole: !GetAtt CodeBuildRole.Arn
@@ -638,14 +612,7 @@ Resources:
         ComputeType: BUILD_GENERAL1_MEDIUM
         Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
         Type: LINUX_CONTAINER
-        PrivilegedMode: true
         EnvironmentVariables:
-          - Name: AWS_ACCOUNT_ID
-            Value: !Ref "AWS::AccountId"
-          - Name: AWS_DEFAULT_REGION
-            Value: !Ref "AWS::Region"
-          - Name: PROVISIONER_REPO
-            Value: !Sub ${AWS::StackName}-provisioner
           - Name: DEPLOY_BUCKET
             Value: !Ref DeployBucket
       Source:
@@ -754,9 +721,7 @@ Resources:
 
   ImageBuild:
     Type: Custom::ImageBuild
-    DependsOn:
-      - ProvisionerECRRepo
-      - DeployBucket
+    DependsOn: DeployBucket
     Properties:
       ServiceToken: !GetAtt ImageBuildTrigger.Arn
       ProjectName: !Ref ImageBuildProject
@@ -1158,6 +1123,17 @@ Resources:
       Content:
         S3Bucket: !Ref DeployBucket
         S3Key: scanner-layer.zip
+      CompatibleRuntimes:
+        - python3.12
+
+  ProvisionerLayer:
+    Type: AWS::Lambda::LayerVersion
+    DependsOn: ImageBuild
+    Properties:
+      LayerName: !Sub provisioner-deps-${AWS::StackName}
+      Content:
+        S3Bucket: !Ref DeployBucket
+        S3Key: provisioner-layer.zip
       CompatibleRuntimes:
         - python3.12
 
@@ -1722,9 +1698,13 @@ Resources:
     DependsOn: ImageBuild
     Properties:
       FunctionName: !Sub provisioner-${AWS::StackName}
-      PackageType: Image
+      Runtime: python3.12
+      Handler: handler.handler
       Code:
-        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-provisioner:latest"
+        S3Bucket: !Ref DeployBucket
+        S3Key: provisioner-code.zip
+      Layers:
+        - !Ref ProvisionerLayer
       Role: !GetAtt ProvisionerLambdaRole.Arn
       Timeout: 900
       MemorySize: 256
