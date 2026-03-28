@@ -604,7 +604,9 @@ Resources:
 
   DeployBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
     Properties:
+      EmptyBucketOnDelete: true
       Tags:
         - Key: Name
           Value: !Sub DeployBucket-${AWS::StackName}
