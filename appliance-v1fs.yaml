@@ -382,15 +382,7 @@ Resources:
         - Key: Name
           Value: !Sub ServiceGateway3-${AWS::StackName}
 
-  # ── ECR Repositories ────────────────────────────────────────────────
-  ScannerECRRepo:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub ${AWS::StackName}-scanner
-      EmptyOnDelete: true
-      ImageScanningConfiguration:
-        ScanOnPush: true
-
+  # ── ECR Repository (Provisioner only) ───────────────────────────────
   ProvisionerECRRepo:
     Type: AWS::ECR::Repository
     Properties:
@@ -435,14 +427,25 @@ Resources:
                   - ecr:UploadLayerPart
                   - ecr:CompleteLayerUpload
                 Resource:
-                  - !GetAtt ScannerECRRepo.Arn
                   - !GetAtt ProvisionerECRRepo.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}/*"
+
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub DeployBucket-${AWS::StackName}
 
   ImageBuildProject:
     Type: AWS::CodeBuild::Project
     DependsOn:
-      - ScannerECRRepo
       - ProvisionerECRRepo
+      - DeployBucket
     Properties:
       Name: !Sub appliance-v1fs-build-${AWS::StackName}
       ServiceRole: !GetAtt CodeBuildRole.Arn
@@ -457,10 +460,10 @@ Resources:
             Value: !Ref "AWS::AccountId"
           - Name: AWS_DEFAULT_REGION
             Value: !Ref "AWS::Region"
-          - Name: SCANNER_REPO
-            Value: !Sub ${AWS::StackName}-scanner
           - Name: PROVISIONER_REPO
             Value: !Sub ${AWS::StackName}-provisioner
+          - Name: DEPLOY_BUCKET
+            Value: !Ref DeployBucket
       Source:
         Type: GITHUB
         Location: https://github.com/arcaniusdev/appliance-v1fs.git
@@ -546,8 +549,8 @@ Resources:
   ImageBuild:
     Type: Custom::ImageBuild
     DependsOn:
-      - ScannerECRRepo
       - ProvisionerECRRepo
+      - DeployBucket
     Properties:
       ServiceToken: !GetAtt ImageBuildTrigger.Arn
       ProjectName: !Ref ImageBuildProject
@@ -937,6 +940,17 @@ Resources:
                   - elasticfilesystem:ClientWrite
                 Resource: !GetAtt ScanFileSystem.Arn
 
+  ScannerLayer:
+    Type: AWS::Lambda::LayerVersion
+    DependsOn: ImageBuild
+    Properties:
+      LayerName: !Sub scanner-deps-${AWS::StackName}
+      Content:
+        S3Bucket: !Ref DeployBucket
+        S3Key: scanner-layer.zip
+      CompatibleRuntimes:
+        - python3.12
+
   ScannerLambda:
     Type: AWS::Lambda::Function
     DependsOn:
@@ -946,9 +960,13 @@ Resources:
       - EFSMountTarget2
     Properties:
       FunctionName: !Sub scanner-${AWS::StackName}
-      PackageType: Image
+      Runtime: python3.12
+      Handler: scanner.handler
       Code:
-        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-scanner:latest"
+        S3Bucket: !Ref DeployBucket
+        S3Key: scanner-code.zip
+      Layers:
+        - !Ref ScannerLayer
       Role: !GetAtt ScannerLambdaRole.Arn
       Timeout: 900
       MemorySize: 1024
