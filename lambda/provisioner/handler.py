@@ -270,6 +270,13 @@ def _handle_lifecycle(event, context):
         private_key = _get_ssh_key(key_pair_id, region)
         hostname = _assign_hostname(instance_id, region)
 
+        # Tag instance with its Vision One hostname
+        ec2 = boto3.client("ec2", region_name=region)
+        ec2.create_tags(Resources=[instance_id], Tags=[
+            {"Key": "Name", "Value": hostname},
+        ])
+        logger.info("Tagged %s as %s", instance_id, hostname)
+
         # Register the SG — retry if "Try again later" (SG registration subsystem still booting)
         with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
             host = "127.0.0.1"

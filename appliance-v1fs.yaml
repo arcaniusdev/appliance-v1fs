@@ -1699,6 +1699,7 @@ Resources:
                   - ec2-instance-connect:OpenTunnel
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceConnectEndpoints
+                  - ec2:CreateTags
                 Resource: "*"
               - Effect: Allow
                 Action:
