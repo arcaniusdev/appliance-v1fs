@@ -27,10 +27,15 @@ _channels = None
 _channel_addrs = None
 _channel_failures = None  # Circuit breaker: failure count per channel
 _channel_cooldown = None  # Circuit breaker: cooldown expiry per channel
+_channels_built_at = 0.0  # monotonic timestamp of last channel build
 _s3_client = None
+_ec2_client = None
 _logs_client = None
 _audit_stream_created = False
 _efs_initialized = False
+
+# Channel refresh interval — re-discover SGs periodically to pick up ASG changes
+CHANNEL_REFRESH_SECONDS = 60
 
 # Circuit breaker settings
 CB_FAILURE_THRESHOLD = 3  # failures before marking channel unhealthy
@@ -44,6 +49,13 @@ def _get_s3():
     return _s3_client
 
 
+def _get_ec2():
+    global _ec2_client
+    if _ec2_client is None:
+        _ec2_client = boto3.client("ec2")
+    return _ec2_client
+
+
 def _get_logs():
     global _logs_client
     if _logs_client is None:
@@ -51,8 +63,33 @@ def _get_logs():
     return _logs_client
 
 
+def _discover_sg_addresses():
+    """Discover running Service Gateway IPs via EC2 tags (ASG-managed)."""
+    tag_spec = os.environ.get("SG_DISCOVERY_TAG", "")
+    if not tag_spec:
+        raise RuntimeError("SG_DISCOVERY_TAG not set")
+
+    tag_key, tag_value = tag_spec.split("=", 1)
+    ec2 = _get_ec2()
+    resp = ec2.describe_instances(Filters=[
+        {"Name": f"tag:{tag_key}", "Values": [tag_value]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ])
+
+    addrs = []
+    for res in resp["Reservations"]:
+        for inst in res["Instances"]:
+            addrs.append(f"{inst['PrivateIpAddress']}:443")
+
+    if not addrs:
+        raise RuntimeError("No running Service Gateway instances found")
+
+    addrs.sort()  # deterministic order for channel stability
+    return addrs
+
+
 def _build_channels():
-    global _channels, _channel_addrs, _channel_failures, _channel_cooldown
+    global _channels, _channel_addrs, _channel_failures, _channel_cooldown, _channels_built_at
 
     sm = boto3.client("secretsmanager")
     api_key = sm.get_secret_value(
@@ -80,7 +117,7 @@ def _build_channels():
         ("grpc.keepalive_permit_without_calls", 1),
     ]
 
-    addrs = [a.strip() for a in os.environ["SG_ADDRESS"].split(",") if a.strip()]
+    addrs = _discover_sg_addresses()
     channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
     channels = []
     channel_addrs = []
@@ -95,11 +132,12 @@ def _build_channels():
     _channel_addrs = channel_addrs
     _channel_failures = [0] * len(channels)
     _channel_cooldown = [0.0] * len(channels)
+    _channels_built_at = time.monotonic()
 
 
 def _get_channel():
     """Return a healthy gRPC channel with circuit breaker logic."""
-    if _channels is None:
+    if _channels is None or (time.monotonic() - _channels_built_at > CHANNEL_REFRESH_SECONDS):
         _build_channels()
     if len(_channels) == 1:
         return _channels[0], _channel_addrs[0], 0

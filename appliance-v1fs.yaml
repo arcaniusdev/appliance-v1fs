@@ -47,21 +47,28 @@ Parameters:
     Description: Availability Zone 2
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1b
-  RegistrationToken:
-    Description: TrendAI Vision One Service Gateway registration token
-    Type: String
-    NoEcho: true
-    MinLength: 1
   ServiceGatewayHostname:
     Description: Hostname prefix for Service Gateway appliances (numbered automatically)
     Type: String
     Default: FSVA-AWS
-  NumberOfServiceGateways:
-    Description: Number of Service Gateway appliances to deploy (1-3)
+  MinServiceGateways:
+    Description: Minimum number of Service Gateway appliances (always running)
     Type: Number
     Default: 1
     MinValue: 1
-    MaxValue: 3
+    MaxValue: 10
+  MaxServiceGateways:
+    Description: Maximum number of Service Gateway appliances (auto-scaled)
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+  WarmPoolSize:
+    Description: Number of pre-provisioned Service Gateways kept stopped in warm pool
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 10
   PMLEnabled:
     Description: Enable Predictive Machine Learning (PML) for scans
     Type: String
@@ -89,10 +96,6 @@ Parameters:
     Default: 1
     MinValue: 1
     MaxValue: 8
-
-Conditions:
-  DeploySG2: !Not [!Equals [!Ref NumberOfServiceGateways, 1]]
-  DeploySG3: !Equals [!Ref NumberOfServiceGateways, 3]
 
 Resources:
   # ── VPC ──────────────────────────────────────────────────────────────
@@ -338,49 +341,213 @@ Resources:
         - Key: Name
           Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
 
-  ServiceGateway1:
-    Type: AWS::EC2::Instance
-    DependsOn: PrivateRoute1
+  # ── Service Gateway Auto Scaling ──────────────────────────────────
+  ServiceGatewayLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
     Properties:
-      ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
-      InstanceType: !Ref ServiceGatewayInstanceType
-      KeyName: !Ref ServiceGatewayKeyPair
-      SubnetId: !Ref PrivateSubnet1
-      SecurityGroupIds:
-        - !Ref ServiceGatewaySecGroup
-      Tags:
-        - Key: Name
-          Value: !Sub ServiceGateway1-${AWS::StackName}
+      LaunchTemplateName: !Sub ServiceGateway-${AWS::StackName}
+      LaunchTemplateData:
+        ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
+        InstanceType: !Ref ServiceGatewayInstanceType
+        KeyName: !Ref ServiceGatewayKeyPair
+        SecurityGroupIds:
+          - !Ref ServiceGatewaySecGroup
+        MetadataOptions:
+          HttpTokens: required
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ServiceGateway-${AWS::StackName}
+              - Key: appliance-v1fs:stack
+                Value: !Ref "AWS::StackName"
 
-  ServiceGateway2:
-    Type: AWS::EC2::Instance
-    Condition: DeploySG2
-    DependsOn: PrivateRoute2
+  ServiceGatewayASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - PrivateRoute1
+      - PrivateRoute2
     Properties:
-      ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
-      InstanceType: !Ref ServiceGatewayInstanceType
-      KeyName: !Ref ServiceGatewayKeyPair
-      SubnetId: !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref ServiceGatewaySecGroup
+      AutoScalingGroupName: !Sub ServiceGateway-${AWS::StackName}
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinServiceGateways
+      MaxSize: !Ref MaxServiceGateways
+      DesiredCapacity: !Ref MinServiceGateways
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 600
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: SGProvisioningHook
+          LifecycleTransition: "autoscaling:EC2_INSTANCE_LAUNCHING"
+          HeartbeatTimeout: 1800
+          DefaultResult: ABANDON
+        - LifecycleHookName: SGTerminationHook
+          LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
+          HeartbeatTimeout: 300
+          DefaultResult: CONTINUE
       Tags:
         - Key: Name
-          Value: !Sub ServiceGateway2-${AWS::StackName}
+          Value: !Sub ServiceGateway-${AWS::StackName}
+          PropagateAtLaunch: false
 
-  ServiceGateway3:
-    Type: AWS::EC2::Instance
-    Condition: DeploySG3
-    DependsOn: PrivateRoute1
+  ServiceGatewayWarmPool:
+    Type: AWS::AutoScaling::WarmPool
     Properties:
-      ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
-      InstanceType: !Ref ServiceGatewayInstanceType
-      KeyName: !Ref ServiceGatewayKeyPair
-      SubnetId: !Ref PrivateSubnet1
-      SecurityGroupIds:
-        - !Ref ServiceGatewaySecGroup
-      Tags:
-        - Key: Name
-          Value: !Sub ServiceGateway3-${AWS::StackName}
+      AutoScalingGroupName: !Ref ServiceGatewayASG
+      MinSize: !Ref WarmPoolSize
+      PoolState: Stopped
+      InstanceReusePolicy:
+        ReuseOnScaleIn: true
+
+  SGScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ServiceGatewayASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        CustomizedMetricSpecification:
+          MetricName: BacklogPerInstance
+          Namespace: !Sub Custom/${AWS::StackName}
+          Statistic: Average
+        TargetValue: 5000
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  # ── ASG Lifecycle Event → Provisioner ────────────────────────────
+  SGLifecycleEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub sg-lifecycle-${AWS::StackName}
+      Description: Trigger provisioner on ASG instance launch/terminate
+      EventPattern:
+        source:
+          - aws.autoscaling
+        detail-type:
+          - "EC2 Instance-Launch Lifecycle Action"
+          - "EC2 Instance-Terminate Lifecycle Action"
+        detail:
+          AutoScalingGroupName:
+            - !Ref ServiceGatewayASG
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProvisionerLambda.Arn
+          Id: ProvisionerLifecycle
+
+  SGLifecyclePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProvisionerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SGLifecycleEventRule.Arn
+
+  # ── Backlog Metric Lambda (publishes BacklogPerInstance) ──────────
+  BacklogMetricRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BacklogMetricPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:GetQueueAttributes
+                Resource: !GetAtt ScanQueue.Arn
+              - Effect: Allow
+                Action: autoscaling:DescribeAutoScalingGroups
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+
+  BacklogMetricLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub backlog-metric-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt BacklogMetricRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ScanQueue
+          ASG_NAME: !Sub ServiceGateway-${AWS::StackName}
+          METRIC_NAMESPACE: !Sub Custom/${AWS::StackName}
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          sqs = boto3.client("sqs")
+          asg = boto3.client("autoscaling")
+          cw = boto3.client("cloudwatch")
+
+          def handler(event, context):
+              queue_url = os.environ["QUEUE_URL"]
+              asg_name = os.environ["ASG_NAME"]
+              namespace = os.environ["METRIC_NAMESPACE"]
+
+              attrs = sqs.get_queue_attributes(
+                  QueueUrl=queue_url,
+                  AttributeNames=["ApproximateNumberOfMessagesVisible"],
+              )
+              backlog = int(attrs["Attributes"]["ApproximateNumberOfMessagesVisible"])
+
+              resp = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+              instances = resp["AutoScalingGroups"][0]["Instances"] if resp["AutoScalingGroups"] else []
+              in_service = len([i for i in instances if i["LifecycleState"] == "InService"])
+
+              backlog_per_instance = backlog / max(in_service, 1)
+
+              cw.put_metric_data(
+                  Namespace=namespace,
+                  MetricData=[
+                      {
+                          "MetricName": "BacklogPerInstance",
+                          "Value": backlog_per_instance,
+                          "Unit": "Count",
+                      },
+                      {
+                          "MetricName": "InServiceInstances",
+                          "Value": in_service,
+                          "Unit": "Count",
+                      },
+                  ],
+              )
+              return {"backlog": backlog, "inService": in_service, "perInstance": backlog_per_instance}
+
+  BacklogMetricSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub backlog-metric-${AWS::StackName}
+      Description: Publish BacklogPerInstance metric every minute for ASG scaling
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BacklogMetricLambda.Arn
+          Id: BacklogMetricTarget
+
+  BacklogMetricPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BacklogMetricLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BacklogMetricSchedule.Arn
 
   # ── ECR Repository (Provisioner only) ───────────────────────────────
   ProvisionerECRRepo:
@@ -939,6 +1106,9 @@ Resources:
                   - elasticfilesystem:ClientMount
                   - elasticfilesystem:ClientWrite
                 Resource: !GetAtt ScanFileSystem.Arn
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
 
   ScannerLayer:
     Type: AWS::Lambda::LayerVersion
@@ -954,7 +1124,7 @@ Resources:
   ScannerLambda:
     Type: AWS::Lambda::Function
     DependsOn:
-      - SGWaitForScanner1
+      - ServiceGatewayASG
       - ImageBuild
       - EFSMountTarget1
       - EFSMountTarget2
@@ -983,13 +1153,7 @@ Resources:
         Variables:
           S3_CLEAN_BUCKET: !Ref CleanBucket
           S3_QUARANTINE_BUCKET: !Ref QuarantineBucket
-          SG_ADDRESS: !If
-            - DeploySG3
-            - !Sub "${ServiceGateway1.PrivateIp}:443,${ServiceGateway2.PrivateIp}:443,${ServiceGateway3.PrivateIp}:443"
-            - !If
-              - DeploySG2
-              - !Sub "${ServiceGateway1.PrivateIp}:443,${ServiceGateway2.PrivateIp}:443"
-              - !Sub "${ServiceGateway1.PrivateIp}:443"
+          SG_DISCOVERY_TAG: !Sub "appliance-v1fs:stack=${AWS::StackName}"
           SG_CA_CERT_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert"
           V1FS_API_KEY_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key"
           AUDIT_LOG_GROUP: !Sub scan-audit-${AWS::StackName}
@@ -1394,11 +1558,63 @@ Resources:
             {
               "type": "text",
               "x": 0, "y": 46, "width": 24, "height": 1,
+              "properties": { "markdown": "## Auto Scaling" }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 47, "width": 8, "height": 6,
+              "properties": {
+                "title": "SG Instances (ASG)",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["Custom/${AWS::StackName}", "InServiceInstances", {"label": "In Service", "stat": "Average"}]
+                ],
+                "view": "timeSeries",
+                "period": 60,
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 47, "width": 8, "height": 6,
+              "properties": {
+                "title": "Backlog Per Instance",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["Custom/${AWS::StackName}", "BacklogPerInstance", {"stat": "Average"}]
+                ],
+                "view": "timeSeries",
+                "period": 60,
+                "yAxis": {"left": {"min": 0}},
+                "annotations": {
+                  "horizontal": [{"value": 5000, "label": "Scale target"}]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 47, "width": 8, "height": 6,
+              "properties": {
+                "title": "ASG Group Size",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "ServiceGateway-${AWS::StackName}", {"label": "Desired"}],
+                  ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "ServiceGateway-${AWS::StackName}", {"label": "InService"}],
+                  ["AWS/AutoScaling", "GroupTotalInstances", "AutoScalingGroupName", "ServiceGateway-${AWS::StackName}", {"label": "Total"}]
+                ],
+                "view": "timeSeries",
+                "period": 60,
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 53, "width": 24, "height": 1,
               "properties": { "markdown": "## Recent Scans" }
             },
             {
               "type": "log",
-              "x": 0, "y": 47, "width": 24, "height": 6,
+              "x": 0, "y": 54, "width": 24, "height": 6,
               "properties": {
                 "query": "SOURCE 'scan-audit-${AWS::StackName}' | fields @timestamp, file, verdict, malware.0 as malware_name, scanDurationMs as duration_ms, size, sha256, serviceGateway | sort @timestamp desc | limit 100",
                 "region": "${AWS::Region}",
@@ -1448,7 +1664,17 @@ Resources:
                 Action:
                   - ssm:PutParameter
                   - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                  - ssm:DeleteParameter
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
+              - Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                  - autoscaling:DescribeAutoScalingGroups
+                Resource: "*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
@@ -1463,16 +1689,14 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
-          SG_INSTANCES: !If
-            - DeploySG3
-            - !Sub '["${ServiceGateway1}", "${ServiceGateway2}", "${ServiceGateway3}"]'
-            - !If
-              - DeploySG2
-              - !Sub '["${ServiceGateway1}", "${ServiceGateway2}"]'
-              - !Sub '["${ServiceGateway1}"]'
+          ASG_NAME: !Sub ServiceGateway-${AWS::StackName}
+          SG_TAG_KEY: "appliance-v1fs:stack"
+          SG_TAG_VALUE: !Ref "AWS::StackName"
           EICE_ENDPOINT_ID: !Ref EICEndpoint
           KEY_PAIR_ID: !GetAtt ServiceGatewayKeyPair.KeyPairId
           CERT_SECRET_NAME: appliance-v1fs/sg-ca-cert
+          REGISTRATION_TOKEN_SECRET: appliance-v1fs/sg-registration-token
+          HOSTNAME_PREFIX: !Ref ServiceGatewayHostname
           AWS_REGION_NAME: !Ref "AWS::Region"
 
   WatchdogSchedule:
@@ -1494,98 +1718,6 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt WatchdogSchedule.Arn
-
-  # ── Custom Resources: Registration & Scanner Detection ─────────────
-  # ── Custom Resources: SG1 (always) ──────────────────────────────────
-  SGRegistration1:
-    Type: Custom::SGRegistration
-    DependsOn:
-      - ServiceGateway1
-      - EICEndpoint
-    Properties:
-      ServiceToken: !GetAtt ProvisionerLambda.Arn
-      Action: register
-      InstanceId: !Ref ServiceGateway1
-      EndpointId: !Ref EICEndpoint
-      RegistrationToken: !Ref RegistrationToken
-      Hostname: !Sub "${ServiceGatewayHostname}-01"
-      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
-      Region: !Ref "AWS::Region"
-
-  SGWaitForScanner1:
-    Type: Custom::SGWaitForScanner
-    DependsOn: SGRegistration1
-    Properties:
-      ServiceToken: !GetAtt ProvisionerLambda.Arn
-      Action: wait-for-scanner
-      InstanceId: !Ref ServiceGateway1
-      EndpointId: !Ref EICEndpoint
-      ServiceGatewayIP: !GetAtt ServiceGateway1.PrivateIp
-      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
-      CACertSecretName: appliance-v1fs/sg-ca-cert
-      Region: !Ref "AWS::Region"
-
-  # ── Custom Resources: SG2 (conditional) ────────────────────────────
-  SGRegistration2:
-    Type: Custom::SGRegistration
-    Condition: DeploySG2
-    DependsOn:
-      - ServiceGateway2
-      - EICEndpoint
-    Properties:
-      ServiceToken: !GetAtt ProvisionerLambda.Arn
-      Action: register
-      InstanceId: !Ref ServiceGateway2
-      EndpointId: !Ref EICEndpoint
-      RegistrationToken: !Ref RegistrationToken
-      Hostname: !Sub "${ServiceGatewayHostname}-02"
-      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
-      Region: !Ref "AWS::Region"
-
-  SGWaitForScanner2:
-    Type: Custom::SGWaitForScanner
-    Condition: DeploySG2
-    DependsOn: SGRegistration2
-    Properties:
-      ServiceToken: !GetAtt ProvisionerLambda.Arn
-      Action: wait-for-scanner
-      InstanceId: !Ref ServiceGateway2
-      EndpointId: !Ref EICEndpoint
-      ServiceGatewayIP: !GetAtt ServiceGateway2.PrivateIp
-      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
-      CACertSecretName: appliance-v1fs/sg-ca-cert
-      Region: !Ref "AWS::Region"
-
-  # ── Custom Resources: SG3 (conditional) ────────────────────────────
-  SGRegistration3:
-    Type: Custom::SGRegistration
-    Condition: DeploySG3
-    DependsOn:
-      - ServiceGateway3
-      - EICEndpoint
-    Properties:
-      ServiceToken: !GetAtt ProvisionerLambda.Arn
-      Action: register
-      InstanceId: !Ref ServiceGateway3
-      EndpointId: !Ref EICEndpoint
-      RegistrationToken: !Ref RegistrationToken
-      Hostname: !Sub "${ServiceGatewayHostname}-03"
-      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
-      Region: !Ref "AWS::Region"
-
-  SGWaitForScanner3:
-    Type: Custom::SGWaitForScanner
-    Condition: DeploySG3
-    DependsOn: SGRegistration3
-    Properties:
-      ServiceToken: !GetAtt ProvisionerLambda.Arn
-      Action: wait-for-scanner
-      InstanceId: !Ref ServiceGateway3
-      EndpointId: !Ref EICEndpoint
-      ServiceGatewayIP: !GetAtt ServiceGateway3.PrivateIp
-      KeyPairId: !GetAtt ServiceGatewayKeyPair.KeyPairId
-      CACertSecretName: appliance-v1fs/sg-ca-cert
-      Region: !Ref "AWS::Region"
 
   # ── EC2 Instance Connect Endpoint ──────────────────────────────────
   EICSecGroup:
@@ -1624,28 +1756,9 @@ Outputs:
   PrivateSubnet2Id:
     Description: Private subnet 2
     Value: !Ref PrivateSubnet2
-  ServiceGateway1Id:
-    Description: Service Gateway 1 instance ID
-    Value: !Ref ServiceGateway1
-  ServiceGateway1PrivateIP:
-    Description: Service Gateway 1 private IP
-    Value: !GetAtt ServiceGateway1.PrivateIp
-  ServiceGateway2Id:
-    Condition: DeploySG2
-    Description: Service Gateway 2 instance ID
-    Value: !Ref ServiceGateway2
-  ServiceGateway2PrivateIP:
-    Condition: DeploySG2
-    Description: Service Gateway 2 private IP
-    Value: !GetAtt ServiceGateway2.PrivateIp
-  ServiceGateway3Id:
-    Condition: DeploySG3
-    Description: Service Gateway 3 instance ID
-    Value: !Ref ServiceGateway3
-  ServiceGateway3PrivateIP:
-    Condition: DeploySG3
-    Description: Service Gateway 3 private IP
-    Value: !GetAtt ServiceGateway3.PrivateIp
+  AutoScalingGroupName:
+    Description: Service Gateway Auto Scaling Group
+    Value: !Ref ServiceGatewayASG
   IngestBucketName:
     Description: S3 ingest bucket
     Value: !Ref IngestBucket
