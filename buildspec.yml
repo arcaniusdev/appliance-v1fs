@@ -16,7 +16,7 @@ phases:
       # ── Provisioner Lambda layer (paramiko + AWS CLI v2) ──────────
       - cd $CODEBUILD_SRC_DIR
       - mkdir -p /tmp/prov-layer/python /tmp/prov-layer/bin
-      - pip install -r lambda/provisioner/requirements.txt -t /tmp/prov-layer/python
+      - "pip install -r lambda/provisioner/requirements.txt -t /tmp/prov-layer/python --platform manylinux2014_x86_64 --only-binary=cffi,cryptography --python-version 3.12"
       - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
       - cd /tmp && unzip -q awscli.zip && ./aws/install --install-dir /tmp/prov-layer/aws-cli --bin-dir /tmp/prov-layer/bin
       # Strip unused service models to fit Lambda 250MB limit
