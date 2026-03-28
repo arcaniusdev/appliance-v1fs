@@ -14,6 +14,7 @@ phases:
       - aws s3 cp /tmp/scanner-code.zip s3://$DEPLOY_BUCKET/scanner-code.zip
 
       # ── Provisioner Lambda layer (paramiko + AWS CLI v2) ──────────
+      - cd $CODEBUILD_SRC_DIR
       - mkdir -p /tmp/prov-layer/python /tmp/prov-layer/bin
       - pip install -r lambda/provisioner/requirements.txt -t /tmp/prov-layer/python
       - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
