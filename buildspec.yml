@@ -20,16 +20,23 @@ phases:
       - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
       - cd /tmp && unzip -q awscli.zip && ./aws/install --install-dir /tmp/prov-layer/aws-cli --bin-dir /tmp/prov-layer/bin
       # Strip unused service models to fit Lambda 250MB limit
+      - BOTOCORE_DATA=$(find /tmp/prov-layer/aws-cli -type d -name "data" -path "*/botocore/*" | head -1)
+      - echo "Botocore data dir found at $BOTOCORE_DATA"
       - |
-        cd /tmp/prov-layer/aws-cli/v2/current/dist/_internal/botocore/data/
-        KEEP="ec2-instance-connect ec2 sts sso sso-oidc"
-        for dir in */; do
-          svc="${dir%/}"
-          echo "$KEEP" | grep -qw "$svc" || rm -rf "$svc"
-        done
-      - echo "Layer size after strip:" && du -sh /tmp/prov-layer/
+        if [ -n "$BOTOCORE_DATA" ] && [ -d "$BOTOCORE_DATA" ]; then
+          cd "$BOTOCORE_DATA"
+          KEEP="ec2-instance-connect ec2 sts sso sso-oidc"
+          for dir in */; do
+            svc="${dir%/}"
+            echo "$KEEP" | grep -qw "$svc" || rm -rf "$dir"
+          done
+          echo "Stripped service models"
+        else
+          echo "WARNING: botocore data dir not found, skipping strip"
+        fi
+      - du -sh /tmp/prov-layer/ || true
       - cd /tmp/prov-layer && zip -yr /tmp/provisioner-layer.zip python/ bin/ aws-cli/
-      - echo "Layer zip size:" && ls -lh /tmp/provisioner-layer.zip
+      - ls -lh /tmp/provisioner-layer.zip
       - aws s3 cp /tmp/provisioner-layer.zip s3://$DEPLOY_BUCKET/provisioner-layer.zip
 
       # ── Provisioner Lambda code ───────────────────────────────────
