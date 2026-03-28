@@ -6,19 +6,13 @@ phases:
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
   build:
     commands:
-      # Build provisioner container image
       - docker build -t $PROVISIONER_REPO lambda/provisioner/
       - docker tag $PROVISIONER_REPO:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$PROVISIONER_REPO:latest
-
-      # Build scanner Lambda layer (dependencies compiled for Amazon Linux)
       - mkdir -p /tmp/layer/python
       - pip install -r app/requirements.txt -t /tmp/layer/python --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12
       - cd /tmp/layer && zip -r /tmp/scanner-layer.zip python/
       - aws s3 cp /tmp/scanner-layer.zip s3://$DEPLOY_BUCKET/scanner-layer.zip
-
-      # Package scanner code
-      - cd $CODEBUILD_SRC_DIR
-      - cd app && zip /tmp/scanner-code.zip scanner.py
+      - cd $CODEBUILD_SRC_DIR && cd app && zip /tmp/scanner-code.zip scanner.py
       - aws s3 cp /tmp/scanner-code.zip s3://$DEPLOY_BUCKET/scanner-code.zip
   post_build:
     commands:
