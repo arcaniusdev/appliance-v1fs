@@ -367,6 +367,8 @@ Resources:
     DependsOn:
       - PrivateRoute1
       - PrivateRoute2
+      - SGLifecycleEventRule
+      - SGLifecyclePermission
     Properties:
       AutoScalingGroupName: !Sub ServiceGateway-${AWS::StackName}
       LaunchTemplate:
@@ -430,7 +432,7 @@ Resources:
           - "EC2 Instance-Terminate Lifecycle Action"
         detail:
           AutoScalingGroupName:
-            - !Ref ServiceGatewayASG
+            - !Sub ServiceGateway-${AWS::StackName}
       State: ENABLED
       Targets:
         - Arn: !GetAtt ProvisionerLambda.Arn
