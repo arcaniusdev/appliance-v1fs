@@ -601,7 +601,7 @@ Resources:
         - Key: Name
           Value: !Sub DeployBucket-${AWS::StackName}
 
-  ImageBuildProject:
+  CodeBuildProject:
     Type: AWS::CodeBuild::Project
     DependsOn: DeployBucket
     Properties:
@@ -622,7 +622,7 @@ Resources:
       Artifacts:
         Type: NO_ARTIFACTS
 
-  ImageBuildTriggerRole:
+  CodeBuildTriggerRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -643,7 +643,7 @@ Resources:
                 Action:
                   - codebuild:StartBuild
                   - codebuild:BatchGetBuilds
-                Resource: !GetAtt ImageBuildProject.Arn
+                Resource: !GetAtt CodeBuildProject.Arn
               - Effect: Allow
                 Action:
                   - s3:ListBucket
@@ -654,13 +654,13 @@ Resources:
                   - !GetAtt DeployBucket.Arn
                   - !Sub "${DeployBucket.Arn}/*"
 
-  ImageBuildTrigger:
+  CodeBuildTrigger:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub image-build-trigger-${AWS::StackName}
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt ImageBuildTriggerRole.Arn
+      Role: !GetAtt CodeBuildTriggerRole.Arn
       Timeout: 900
       Code:
         ZipFile: |
@@ -719,12 +719,12 @@ Resources:
               req.add_header("Content-Length", str(len(body)))
               urllib.request.urlopen(req)
 
-  ImageBuild:
-    Type: Custom::ImageBuild
+  CodeBuild:
+    Type: Custom::CodeBuild
     DependsOn: DeployBucket
     Properties:
-      ServiceToken: !GetAtt ImageBuildTrigger.Arn
-      ProjectName: !Ref ImageBuildProject
+      ServiceToken: !GetAtt CodeBuildTrigger.Arn
+      ProjectName: !Ref CodeBuildProject
       DeployBucket: !Ref DeployBucket
 
   # ── S3 Buckets ──────────────────────────────────────────────────────
@@ -1117,7 +1117,7 @@ Resources:
 
   ScannerLayer:
     Type: AWS::Lambda::LayerVersion
-    DependsOn: ImageBuild
+    DependsOn: CodeBuild
     Properties:
       LayerName: !Sub scanner-deps-${AWS::StackName}
       Content:
@@ -1128,7 +1128,7 @@ Resources:
 
   ProvisionerLayer:
     Type: AWS::Lambda::LayerVersion
-    DependsOn: ImageBuild
+    DependsOn: CodeBuild
     Properties:
       LayerName: !Sub provisioner-deps-${AWS::StackName}
       Content:
@@ -1141,7 +1141,7 @@ Resources:
     Type: AWS::Lambda::Function
     DependsOn:
       - ServiceGatewayASG
-      - ImageBuild
+      - CodeBuild
       - EFSMountTarget1
       - EFSMountTarget2
     Properties:
@@ -1695,7 +1695,7 @@ Resources:
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
-    DependsOn: ImageBuild
+    DependsOn: CodeBuild
     Properties:
       FunctionName: !Sub provisioner-${AWS::StackName}
       Runtime: python3.12
