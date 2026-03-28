@@ -367,7 +367,7 @@ Resources:
     DependsOn:
       - PrivateRoute1
       - PrivateRoute2
-      - SGLifecycleEventRule
+      - SGLifecycleSubscription
       - SGLifecyclePermission
     Properties:
       AutoScalingGroupName: !Sub ServiceGateway-${AWS::StackName}
@@ -387,10 +387,14 @@ Resources:
           LifecycleTransition: "autoscaling:EC2_INSTANCE_LAUNCHING"
           HeartbeatTimeout: 1800
           DefaultResult: ABANDON
+          NotificationTargetARN: !Ref SGLifecycleTopic
+          RoleARN: !GetAtt SGLifecycleNotificationRole.Arn
         - LifecycleHookName: SGTerminationHook
           LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
           HeartbeatTimeout: 300
           DefaultResult: CONTINUE
+          NotificationTargetARN: !Ref SGLifecycleTopic
+          RoleARN: !GetAtt SGLifecycleNotificationRole.Arn
       Tags:
         - Key: Name
           Value: !Sub ServiceGateway-${AWS::StackName}
@@ -418,33 +422,45 @@ Resources:
           Statistic: Average
         TargetValue: 5000
 
-  # ── ASG Lifecycle Event → Provisioner ────────────────────────────
-  SGLifecycleEventRule:
-    Type: AWS::Events::Rule
+  # ── ASG Lifecycle Notification → Provisioner ─────────────────────
+  SGLifecycleTopic:
+    Type: AWS::SNS::Topic
     Properties:
-      Name: !Sub sg-lifecycle-${AWS::StackName}
-      Description: Trigger provisioner on ASG instance launch/terminate
-      EventPattern:
-        source:
-          - aws.autoscaling
-        detail-type:
-          - "EC2 Instance-Launch Lifecycle Action"
-          - "EC2 Instance-Terminate Lifecycle Action"
-        detail:
-          AutoScalingGroupName:
-            - !Sub ServiceGateway-${AWS::StackName}
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt ProvisionerLambda.Arn
-          Id: ProvisionerLifecycle
+      TopicName: !Sub sg-lifecycle-${AWS::StackName}
+
+  SGLifecycleSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SGLifecycleTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ProvisionerLambda.Arn
 
   SGLifecyclePermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref ProvisionerLambda
       Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt SGLifecycleEventRule.Arn
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SGLifecycleTopic
+
+  SGLifecycleNotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LifecycleNotificationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SGLifecycleTopic
 
   # ── Backlog Metric Lambda (publishes BacklogPerInstance) ──────────
   BacklogMetricRole:

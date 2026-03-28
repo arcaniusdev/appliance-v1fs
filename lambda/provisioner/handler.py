@@ -26,7 +26,11 @@ def handler(event, context):
     Or on action key (EventBridge / direct invoke):
       - watchdog: Check SG versions, re-extract cert if changed
     """
-    # ASG lifecycle event (from EventBridge)
+    # ASG lifecycle event via SNS notification
+    if "Records" in event and event["Records"][0].get("EventSource") == "aws:sns":
+        return _handle_sns_lifecycle(event, context)
+
+    # ASG lifecycle event (direct invoke or EventBridge)
     detail_type = event.get("detail-type", "")
     if detail_type in (
         "EC2 Instance-Launch Lifecycle Action",
@@ -111,6 +115,37 @@ def _store_cert(secret_name, cert_pem, region):
     except sm.exceptions.ResourceExistsException:
         sm.put_secret_value(SecretId=secret_name, SecretString=cert_pem)
         logger.info("CA cert updated in existing secret: %s", secret_name)
+
+
+# ── SNS Lifecycle Unwrapper ───────────────────────────────────────────
+
+def _handle_sns_lifecycle(event, context):
+    """Unwrap SNS lifecycle notification and delegate to _handle_lifecycle."""
+    message = json.loads(event["Records"][0]["Sns"]["Message"])
+    # SNS lifecycle message has: LifecycleHookName, AccountId, RequestId,
+    # LifecycleTransition, AutoScalingGroupName, EC2InstanceId, LifecycleActionToken
+    transition = message.get("LifecycleTransition", "")
+    if "LAUNCHING" in transition:
+        detail_type = "EC2 Instance-Launch Lifecycle Action"
+    elif "TERMINATING" in transition:
+        detail_type = "EC2 Instance-Terminate Lifecycle Action"
+    else:
+        logger.warning("Unknown lifecycle transition: %s", transition)
+        return {"status": "skipped", "reason": f"unknown transition: {transition}"}
+
+    # Convert to the same event format _handle_lifecycle expects
+    lifecycle_event = {
+        "detail-type": detail_type,
+        "region": event["Records"][0].get("EventSubscriptionArn", "").split(":")[3] or "us-east-1",
+        "detail": {
+            "LifecycleHookName": message["LifecycleHookName"],
+            "AutoScalingGroupName": message["AutoScalingGroupName"],
+            "LifecycleActionToken": message.get("LifecycleActionToken", ""),
+            "EC2InstanceId": message["EC2InstanceId"],
+            "LifecycleTransition": transition,
+        },
+    }
+    return _handle_lifecycle(lifecycle_event, context)
 
 
 # ── Dynamic SG Discovery ─────────────────────────────────────────────
