@@ -20,9 +20,9 @@ phases:
       - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
       - cd /tmp && unzip -q awscli.zip && ./aws/install --install-dir /tmp/prov-layer/aws-cli --bin-dir /tmp/prov-layer/bin
       # Strip unused service models to fit Lambda 250MB limit
-      - BOTOCORE_DATA=$(find /tmp/prov-layer/aws-cli -type d -name "data" -path "*/botocore/*" | head -1)
-      - echo "Botocore data dir found at $BOTOCORE_DATA"
       - |
+        BOTOCORE_DATA=$(find /tmp/prov-layer/aws-cli -type d -name "data" -path "*/botocore/*" | head -1)
+        echo "Botocore data dir: $BOTOCORE_DATA"
         if [ -n "$BOTOCORE_DATA" ] && [ -d "$BOTOCORE_DATA" ]; then
           cd "$BOTOCORE_DATA"
           KEEP="ec2-instance-connect ec2 sts sso sso-oidc"
