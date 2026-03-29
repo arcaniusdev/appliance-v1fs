@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 # Find the actual AWS CLI binary in the layer's dist/ directory.
 _AWS_CLI_CANDIDATES = glob.glob("/opt/aws-cli/v2/*/dist/aws")
 AWS_CLI = next((p for p in _AWS_CLI_CANDIDATES if os.access(p, os.X_OK)), "aws")
+logger.info("AWS CLI binary resolved to: %s", AWS_CLI)
 
 
 class EICETunnel:

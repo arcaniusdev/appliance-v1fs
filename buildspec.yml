@@ -25,7 +25,7 @@ phases:
         echo "Botocore data dir: $BOTOCORE_DATA"
         if [ -n "$BOTOCORE_DATA" ] && [ -d "$BOTOCORE_DATA" ]; then
           cd "$BOTOCORE_DATA"
-          KEEP="ec2-instance-connect ec2 sts sso sso-oidc"
+          KEEP="ec2-instance-connect ec2 s3 sts sso sso-oidc"
           for dir in */; do
             svc="${dir%/}"
             echo "$KEEP" | grep -qw "$svc" || rm -rf "$dir"
