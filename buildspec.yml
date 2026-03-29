@@ -34,19 +34,11 @@ phases:
         else
           echo "WARNING: botocore data dir not found, skipping strip"
         fi
-      # Fix ALL absolute symlinks — installer creates symlinks pointing at /tmp build paths,
-      # which break when Lambda extracts the layer to /opt/
-      - |
-        find /tmp/prov-layer -type l | while read link; do
-          target=$(readlink "$link")
-          case "$target" in /tmp/*)
-            rel=$(python3 -c "import os.path; print(os.path.relpath('$target', os.path.dirname('$link')))")
-            echo "Fixing symlink: $link -> $rel (was $target)"
-            ln -sf "$rel" "$link"
-          ;; esac
-        done
+      # Remove symlinks — Lambda layer extraction doesn't preserve them.
+      # The eice_tunnel.py code finds the binary directly via glob.
+      - rm -f /tmp/prov-layer/bin/aws /tmp/prov-layer/bin/aws_completer /tmp/prov-layer/aws-cli/v2/current
       - du -sh /tmp/prov-layer/ || true
-      - cd /tmp/prov-layer && zip -yr /tmp/provisioner-layer.zip python/ bin/ aws-cli/
+      - cd /tmp/prov-layer && zip -r /tmp/provisioner-layer.zip python/ aws-cli/
       - ls -lh /tmp/provisioner-layer.zip
       - aws s3 cp /tmp/provisioner-layer.zip s3://$DEPLOY_BUCKET/provisioner-layer.zip
 

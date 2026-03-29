@@ -1,9 +1,16 @@
+import glob
 import logging
+import os
 import socket
 import subprocess
 import time
 
 logger = logging.getLogger(__name__)
+
+# Lambda layers extract to /opt but don't preserve symlinks from zips.
+# Find the actual AWS CLI binary in the layer's dist/ directory.
+_AWS_CLI_CANDIDATES = glob.glob("/opt/aws-cli/v2/*/dist/aws")
+AWS_CLI = next((p for p in _AWS_CLI_CANDIDATES if os.access(p, os.X_OK)), "aws")
 
 
 class EICETunnel:
@@ -23,7 +30,7 @@ class EICETunnel:
             self.local_port = s.getsockname()[1]
 
         cmd = [
-            "aws", "ec2-instance-connect", "open-tunnel",
+            AWS_CLI, "ec2-instance-connect", "open-tunnel",
             "--instance-id", self.instance_id,
             "--instance-connect-endpoint-id", self.endpoint_id,
             "--remote-port", str(self.remote_port),
