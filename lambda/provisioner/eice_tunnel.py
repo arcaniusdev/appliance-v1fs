@@ -4,14 +4,50 @@ import os
 import socket
 import subprocess
 import time
+import zipfile
+
+import boto3
 
 logger = logging.getLogger(__name__)
 
-# Lambda layers extract to /opt but don't preserve symlinks from zips.
-# Find the actual AWS CLI binary in the layer's dist/ directory.
-_AWS_CLI_CANDIDATES = glob.glob("/opt/aws-cli/v2/*/dist/aws")
-AWS_CLI = next((p for p in _AWS_CLI_CANDIDATES if os.access(p, os.X_OK)), "aws")
-logger.info("AWS CLI binary resolved to: %s", AWS_CLI)
+AWS_CLI_DIR = "/tmp/awscli"
+AWS_CLI = None
+
+
+def _ensure_aws_cli():
+    """Download AWS CLI from S3 to /tmp on first use (cold start)."""
+    global AWS_CLI
+    if AWS_CLI and os.access(AWS_CLI, os.X_OK):
+        return AWS_CLI
+
+    # Check if already extracted from a previous invocation
+    candidates = glob.glob(f"{AWS_CLI_DIR}/dist/aws")
+    if candidates and os.access(candidates[0], os.X_OK):
+        AWS_CLI = candidates[0]
+        logger.info("AWS CLI already at %s", AWS_CLI)
+        return AWS_CLI
+
+    # Download from the deploy bucket
+    bucket = os.environ.get("DEPLOY_BUCKET")
+    if not bucket:
+        raise RuntimeError("DEPLOY_BUCKET not set — cannot download AWS CLI")
+
+    zip_path = "/tmp/awscli-runtime.zip"
+    logger.info("Downloading AWS CLI from s3://%s/awscli-runtime.zip", bucket)
+    s3 = boto3.client("s3")
+    s3.download_file(bucket, "awscli-runtime.zip", zip_path)
+
+    os.makedirs(AWS_CLI_DIR, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(AWS_CLI_DIR)
+    os.remove(zip_path)
+
+    # Make the binary executable
+    binary = f"{AWS_CLI_DIR}/dist/aws"
+    os.chmod(binary, 0o755)
+    AWS_CLI = binary
+    logger.info("AWS CLI extracted to %s", AWS_CLI)
+    return AWS_CLI
 
 
 class EICETunnel:
@@ -25,13 +61,15 @@ class EICETunnel:
         self._proc = None
 
     def open(self, timeout: int = 60) -> int:
+        aws_cli = _ensure_aws_cli()
+
         # Find a free local port
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.local_port = s.getsockname()[1]
 
         cmd = [
-            AWS_CLI, "ec2-instance-connect", "open-tunnel",
+            aws_cli, "ec2-instance-connect", "open-tunnel",
             "--instance-id", self.instance_id,
             "--instance-connect-endpoint-id", self.endpoint_id,
             "--remote-port", str(self.remote_port),

@@ -1692,6 +1692,9 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}/awscli-runtime.zip"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
@@ -1719,6 +1722,7 @@ Resources:
           REGISTRATION_TOKEN_SECRET: appliance-v1fs/sg-registration-token
           HOSTNAME_PREFIX: !Ref ServiceGatewayHostname
           AWS_REGION_NAME: !Ref "AWS::Region"
+          DEPLOY_BUCKET: !Ref DeployBucket
 
   WatchdogSchedule:
     Type: AWS::Events::Rule

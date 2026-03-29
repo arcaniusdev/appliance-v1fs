@@ -13,33 +13,24 @@ phases:
       - cd $CODEBUILD_SRC_DIR && cd app && zip /tmp/scanner-code.zip scanner.py
       - aws s3 cp /tmp/scanner-code.zip s3://$DEPLOY_BUCKET/scanner-code.zip
 
-      # ── Provisioner Lambda layer (paramiko + AWS CLI v2) ──────────
+      # ── Provisioner Lambda layer (paramiko only) ──────────────────
       - cd $CODEBUILD_SRC_DIR
-      - mkdir -p /tmp/prov-layer/python /tmp/prov-layer/bin
+      - mkdir -p /tmp/prov-layer/python
       - "pip install -r lambda/provisioner/requirements.txt -t /tmp/prov-layer/python --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 --implementation cp"
-      - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
-      - cd /tmp && unzip -q awscli.zip && ./aws/install --install-dir /tmp/prov-layer/aws-cli --bin-dir /tmp/prov-layer/bin
-      # Strip non-essential files to reduce layer size (but NOT botocore service
-      # models — the PyInstaller binary has an internal index and breaks if they're removed)
-      - |
-        echo "Before strip:"
-        du -sh /tmp/prov-layer/aws-cli/ /tmp/prov-layer/python/ || true
-        find /tmp/prov-layer -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-        find /tmp/prov-layer -name "*.pyc" -delete 2>/dev/null || true
-        find /tmp/prov-layer -name "*.dist-info" -type d -exec rm -rf {} + 2>/dev/null || true
-        find /tmp/prov-layer/aws-cli -name "*.md" -delete 2>/dev/null || true
-        find /tmp/prov-layer/aws-cli -name "CHANGELOG*" -delete 2>/dev/null || true
-        find /tmp/prov-layer/aws-cli -type d -name examples -exec rm -rf {} + 2>/dev/null || true
-        find /tmp/prov-layer/aws-cli -type d -name tests -exec rm -rf {} + 2>/dev/null || true
-        echo "After strip:"
-        du -sh /tmp/prov-layer/aws-cli/ /tmp/prov-layer/python/ || true
-      # Remove symlinks — Lambda layer extraction doesn't preserve them.
-      # The eice_tunnel.py code finds the binary directly via glob.
-      - rm -f /tmp/prov-layer/bin/aws /tmp/prov-layer/bin/aws_completer /tmp/prov-layer/aws-cli/v2/current
-      - du -sh /tmp/prov-layer/ || true
-      - cd /tmp/prov-layer && zip -r /tmp/provisioner-layer.zip python/ aws-cli/
+      - cd /tmp/prov-layer && zip -r /tmp/provisioner-layer.zip python/
       - ls -lh /tmp/provisioner-layer.zip
       - aws s3 cp /tmp/provisioner-layer.zip s3://$DEPLOY_BUCKET/provisioner-layer.zip
+
+      # ── AWS CLI v2 binary (stored on S3, downloaded to /tmp at runtime) ──
+      - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
+      - cd /tmp && unzip -q awscli.zip && ./aws/install --install-dir /tmp/awscli-dist --bin-dir /tmp/awscli-bin
+      # Zip just the versioned dist dir (the actual PyInstaller binary + libs)
+      - |
+        VERSION=$(ls /tmp/awscli-dist/v2/ | grep -v current | head -1)
+        echo "AWS CLI version: $VERSION"
+        cd /tmp/awscli-dist/v2/$VERSION && zip -r /tmp/awscli-runtime.zip dist/
+        ls -lh /tmp/awscli-runtime.zip
+      - aws s3 cp /tmp/awscli-runtime.zip s3://$DEPLOY_BUCKET/awscli-runtime.zip
 
       # ── Provisioner Lambda code ───────────────────────────────────
       - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py ssh_helper.py eice_tunnel.py
