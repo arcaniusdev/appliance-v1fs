@@ -34,8 +34,17 @@ phases:
         else
           echo "WARNING: botocore data dir not found, skipping strip"
         fi
-      # Fix absolute symlinks — installer points at /tmp build paths, need relative for /opt in Lambda
-      - cd /tmp/prov-layer/bin && rm -f aws aws_completer && ln -sf ../aws-cli/v2/current/bin/aws aws && ln -sf ../aws-cli/v2/current/bin/aws_completer aws_completer
+      # Fix ALL absolute symlinks — installer creates symlinks pointing at /tmp build paths,
+      # which break when Lambda extracts the layer to /opt/
+      - |
+        find /tmp/prov-layer -type l | while read link; do
+          target=$(readlink "$link")
+          case "$target" in /tmp/*)
+            rel=$(python3 -c "import os.path; print(os.path.relpath('$target', os.path.dirname('$link')))")
+            echo "Fixing symlink: $link -> $rel (was $target)"
+            ln -sf "$rel" "$link"
+          ;; esac
+        done
       - du -sh /tmp/prov-layer/ || true
       - cd /tmp/prov-layer && zip -yr /tmp/provisioner-layer.zip python/ bin/ aws-cli/
       - ls -lh /tmp/provisioner-layer.zip
