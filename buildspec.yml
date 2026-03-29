@@ -19,21 +19,20 @@ phases:
       - "pip install -r lambda/provisioner/requirements.txt -t /tmp/prov-layer/python --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 --implementation cp"
       - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
       - cd /tmp && unzip -q awscli.zip && ./aws/install --install-dir /tmp/prov-layer/aws-cli --bin-dir /tmp/prov-layer/bin
-      # Strip unused service models to fit Lambda 250MB limit
+      # Strip non-essential files to reduce layer size (but NOT botocore service
+      # models — the PyInstaller binary has an internal index and breaks if they're removed)
       - |
-        BOTOCORE_DATA=$(find /tmp/prov-layer/aws-cli -type d -name "data" -path "*/botocore/*" | head -1)
-        echo "Botocore data dir: $BOTOCORE_DATA"
-        if [ -n "$BOTOCORE_DATA" ] && [ -d "$BOTOCORE_DATA" ]; then
-          cd "$BOTOCORE_DATA"
-          KEEP="ec2-instance-connect ec2 s3 sts sso sso-oidc"
-          for dir in */; do
-            svc="${dir%/}"
-            echo "$KEEP" | grep -qw "$svc" || rm -rf "$dir"
-          done
-          echo "Stripped service models"
-        else
-          echo "WARNING: botocore data dir not found, skipping strip"
-        fi
+        echo "Before strip:"
+        du -sh /tmp/prov-layer/aws-cli/ /tmp/prov-layer/python/ || true
+        find /tmp/prov-layer -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+        find /tmp/prov-layer -name "*.pyc" -delete 2>/dev/null || true
+        find /tmp/prov-layer -name "*.dist-info" -type d -exec rm -rf {} + 2>/dev/null || true
+        find /tmp/prov-layer/aws-cli -name "*.md" -delete 2>/dev/null || true
+        find /tmp/prov-layer/aws-cli -name "CHANGELOG*" -delete 2>/dev/null || true
+        find /tmp/prov-layer/aws-cli -type d -name examples -exec rm -rf {} + 2>/dev/null || true
+        find /tmp/prov-layer/aws-cli -type d -name tests -exec rm -rf {} + 2>/dev/null || true
+        echo "After strip:"
+        du -sh /tmp/prov-layer/aws-cli/ /tmp/prov-layer/python/ || true
       # Remove symlinks — Lambda layer extraction doesn't preserve them.
       # The eice_tunnel.py code finds the binary directly via glob.
       - rm -f /tmp/prov-layer/bin/aws /tmp/prov-layer/bin/aws_completer /tmp/prov-layer/aws-cli/v2/current
