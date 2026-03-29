@@ -34,6 +34,8 @@ phases:
         else
           echo "WARNING: botocore data dir not found, skipping strip"
         fi
+      # Fix absolute symlinks — installer points at /tmp build paths, need relative for /opt in Lambda
+      - cd /tmp/prov-layer/bin && rm -f aws aws_completer && ln -sf ../aws-cli/v2/current/bin/aws aws && ln -sf ../aws-cli/v2/current/bin/aws_completer aws_completer
       - du -sh /tmp/prov-layer/ || true
       - cd /tmp/prov-layer && zip -yr /tmp/provisioner-layer.zip python/ bin/ aws-cli/
       - ls -lh /tmp/provisioner-layer.zip
