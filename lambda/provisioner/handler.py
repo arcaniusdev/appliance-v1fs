@@ -336,18 +336,85 @@ def _handle_lifecycle(event, context):
 
         logger.info("Service Gateway %s registered as %s", instance_id, hostname)
 
-        # Don't wait for scanner pod here — File Security must be installed
-        # manually via Vision One console. The watchdog (every 15 min) will
-        # detect the scanner pod, extract the CA cert, and store the version.
+        # Wait for scanner pod — keeps instance running in Pending:Wait so
+        # the admin can install File Security via Vision One console.
+        # If scanner is detected, extract cert. If Lambda times out, the
+        # lifecycle hook DefaultResult=CONTINUE lets the instance proceed.
+        scanner_found = _wait_for_scanner(
+            instance_id, endpoint_id, private_key, context,
+        )
+        if scanner_found:
+            _extract_and_store_cert(
+                instance_id, endpoint_id, private_key,
+                cert_secret_name, region,
+            )
+
         _complete_lifecycle("CONTINUE")
-        logger.info("Lifecycle LAUNCH complete: %s", instance_id)
-        return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
+        logger.info("Lifecycle LAUNCH complete: %s (scanner=%s)", instance_id, scanner_found)
+        return {"status": "provisioned", "instance": instance_id, "hostname": hostname, "scanner": scanner_found}
 
     except Exception as e:
         logger.exception("Lifecycle provisioning failed for %s: %s", instance_id, e)
-        _complete_lifecycle("ABANDON")
+        # CONTINUE not ABANDON — let the instance proceed even on failure.
+        # Only registration failures reach here; the watchdog handles the rest.
+        _complete_lifecycle("CONTINUE")
         return {"status": "failed", "instance": instance_id, "error": str(e)}
 
+
+
+def _wait_for_scanner(instance_id, endpoint_id, private_key, context):
+    """Poll for scanner pod until found or Lambda is about to timeout.
+
+    Returns True if scanner detected, False if timed out. Never raises —
+    the lifecycle hook will CONTINUE regardless.
+    """
+    while context.get_remaining_time_in_millis() > 60_000:  # stop 60s before Lambda timeout
+        try:
+            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+                with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
+                    session.connect(timeout=30)
+                    session.send_command("enable", expect="# ", timeout=15)
+                    output = session.send_command("configure verify plat", expect="# ", timeout=60)
+            if "sg-sfs-scanner" in output and "Running" in output:
+                logger.info("Scanner pod detected on %s", instance_id)
+                return True
+        except Exception:
+            logger.debug("Scanner check failed on %s", instance_id, exc_info=True)
+        remaining = context.get_remaining_time_in_millis() // 1000
+        logger.info("Waiting for scanner pod on %s (%ds remaining)", instance_id, remaining)
+        time.sleep(30)
+    logger.info("Lambda timeout approaching — scanner not yet detected on %s", instance_id)
+    return False
+
+
+def _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region):
+    """Extract CA cert and store scanner version after scanner pod is detected."""
+    rsa_key = paramiko.RSAKey.generate(4096)
+    pubkey_b64 = rsa_key.get_base64()
+    for attempt in range(5):
+        try:
+            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+                client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
+                cert_pem = _extract_cert(client)
+                version = _get_scanner_version(client)
+                client.close()
+            if cert_pem:
+                logger.info("CA cert extracted from %s (%d bytes)", instance_id, len(cert_pem))
+                _store_cert(cert_secret_name, cert_pem, region)
+                if version:
+                    ssm = boto3.client("ssm", region_name=region)
+                    ssm.put_parameter(
+                        Name=f"{VERSION_PARAM_PREFIX}{instance_id}",
+                        Value=version,
+                        Type="String",
+                        Overwrite=True,
+                    )
+                    logger.info("Scanner version on %s: %s", instance_id, version)
+                return
+        except Exception:
+            logger.warning("Cert extraction attempt %d failed on %s", attempt + 1, instance_id, exc_info=True)
+        time.sleep(10)
+    logger.error("Failed to extract cert from %s after 5 attempts — watchdog will retry", instance_id)
 
 
 def _wait_for_admin_ready(host, private_key, port=22, max_attempts=12, interval=15):
