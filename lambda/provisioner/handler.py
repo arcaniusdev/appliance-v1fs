@@ -328,11 +328,9 @@ def _handle_lifecycle(event, context):
 
         logger.info("Service Gateway %s registered as %s", instance_id, hostname)
 
-        # Wait for scanner pod + extract cert
-        _lifecycle_wait_for_scanner(
-            instance_id, endpoint_id, private_key, cert_secret_name, region,
-        )
-
+        # Don't wait for scanner pod here — File Security must be installed
+        # manually via Vision One console. The watchdog (every 15 min) will
+        # detect the scanner pod, extract the CA cert, and store the version.
         _complete_lifecycle("CONTINUE")
         logger.info("Lifecycle LAUNCH complete: %s", instance_id)
         return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
@@ -342,64 +340,6 @@ def _handle_lifecycle(event, context):
         _complete_lifecycle("ABANDON")
         return {"status": "failed", "instance": instance_id, "error": str(e)}
 
-
-def _lifecycle_wait_for_scanner(instance_id, endpoint_id, private_key, cert_secret_name, region):
-    """Poll for File Security scanner pod and extract cert (lifecycle version)."""
-    for attempt in range(60):  # up to ~30 minutes
-        logger.info("Waiting for scanner pod on %s (attempt %d)", instance_id, attempt + 1)
-        try:
-            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-                with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
-                    session.connect(timeout=30)
-                    session.send_command("enable", expect="# ", timeout=15)
-                    output = session.send_command(
-                        "configure verify plat",
-                        expect="# ", timeout=60,
-                    )
-
-            if "sg-sfs-scanner" in output and "Running" in output:
-                logger.info("File Security scanner pod detected on %s", instance_id)
-                break
-        except Exception:
-            logger.warning("SSH check failed on %s (attempt %d)", instance_id, attempt, exc_info=True)
-        time.sleep(30)
-    else:
-        raise TimeoutError(f"File Security scanner not detected on {instance_id}")
-
-    # Extract cert and store version
-    rsa_key = paramiko.RSAKey.generate(4096)
-    pubkey_b64 = rsa_key.get_base64()
-
-    cert_pem = None
-    for cert_attempt in range(5):
-        try:
-            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-                client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
-                cert_pem = _extract_cert(client)
-                version = _get_scanner_version(client)
-                logger.info("Scanner version on %s: %s", instance_id, version)
-                client.close()
-
-            if cert_pem:
-                logger.info("CA cert extracted from %s (%d bytes)", instance_id, len(cert_pem))
-                break
-        except Exception:
-            logger.warning("Cert extraction attempt %d failed on %s", cert_attempt + 1, instance_id, exc_info=True)
-        time.sleep(10)
-
-    if cert_pem is None:
-        raise ConnectionError(f"Failed to extract CA cert from {instance_id}")
-
-    _store_cert(cert_secret_name, cert_pem, region)
-
-    if version:
-        ssm = boto3.client("ssm", region_name=region)
-        ssm.put_parameter(
-            Name=f"{VERSION_PARAM_PREFIX}{instance_id}",
-            Value=version,
-            Type="String",
-            Overwrite=True,
-        )
 
 
 def _wait_for_admin_ready(host, private_key, port=22, max_attempts=12, interval=15):
@@ -449,29 +389,47 @@ def _handle_watchdog(event, context):
     for instance_id in sg_instances:
         logger.info("Watchdog: checking %s", instance_id)
         try:
+            # Get stored version
+            param_name = f"{VERSION_PARAM_PREFIX}{instance_id}"
+            try:
+                stored = ssm.get_parameter(Name=param_name)["Parameter"]["Value"]
+            except ssm.exceptions.ParameterNotFound:
+                stored = ""
+
+            # First check if scanner pod is running via admin clish (no sgowner needed)
+            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+                with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
+                    session.connect(timeout=30)
+                    session.send_command("enable", expect="# ", timeout=15)
+                    plat_output = session.send_command(
+                        "configure verify plat",
+                        expect="# ", timeout=60,
+                    )
+
+            scanner_running = "sg-sfs-scanner" in plat_output and "Running" in plat_output
+
+            if not scanner_running:
+                logger.info("Watchdog: %s — scanner pod not running yet", instance_id)
+                results.append({"instance": instance_id, "action": "waiting"})
+                continue
+
+            # Scanner is running — get version and cert via sgowner
             with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
                 client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
                 current_version = _get_scanner_version(client)
 
-                # Get stored version
-                param_name = f"{VERSION_PARAM_PREFIX}{instance_id}"
-                try:
-                    stored = ssm.get_parameter(Name=param_name)["Parameter"]["Value"]
-                except ssm.exceptions.ParameterNotFound:
-                    stored = ""
-
                 if current_version != stored:
-                    logger.warning(
+                    logger.info(
                         "Watchdog: version changed on %s: %s -> %s",
-                        instance_id, stored, current_version,
+                        instance_id, stored or "(none)", current_version,
                     )
 
-                    # Re-extract CA cert
+                    # Extract and store CA cert
                     cert_pem = _extract_cert(client)
                     if cert_pem:
                         _store_cert(cert_secret_name, cert_pem, region)
                         cert_updated = True
-                        logger.info("Watchdog: CA cert re-extracted from %s", instance_id)
+                        logger.info("Watchdog: CA cert extracted from %s", instance_id)
 
                     # Update stored version
                     ssm.put_parameter(
