@@ -336,10 +336,8 @@ def _handle_lifecycle(event, context):
 
         logger.info("Service Gateway %s registered as %s", instance_id, hostname)
 
-        # Wait for scanner pod — keeps instance running in Pending:Wait so
-        # the admin can install File Security via Vision One console.
-        # If scanner is detected, extract cert. If Lambda times out, the
-        # lifecycle hook DefaultResult=CONTINUE lets the instance proceed.
+        # Wait for scanner pod — keeps instance in Pending:Wait so admin
+        # can install File Security via Vision One while the SG is running.
         scanner_found = _wait_for_scanner(
             instance_id, endpoint_id, private_key, context,
         )
@@ -348,16 +346,22 @@ def _handle_lifecycle(event, context):
                 instance_id, endpoint_id, private_key,
                 cert_secret_name, region,
             )
+            _complete_lifecycle("CONTINUE")
+            logger.info("Lifecycle LAUNCH complete: %s (scanner detected)", instance_id)
+            return {"status": "provisioned", "instance": instance_id, "hostname": hostname, "scanner": True}
 
-        _complete_lifecycle("CONTINUE")
-        logger.info("Lifecycle LAUNCH complete: %s (scanner=%s)", instance_id, scanner_found)
-        return {"status": "provisioned", "instance": instance_id, "hostname": hostname, "scanner": scanner_found}
+        # Scanner NOT found — don't complete lifecycle. Let the instance
+        # stay in Pending:Wait for the full 30-min heartbeat timeout.
+        # The watchdog (every 15 min) will detect the scanner pod and
+        # complete the lifecycle. If nobody does, DefaultResult=CONTINUE
+        # lets the instance proceed after 30 min.
+        logger.info("Lambda timeout — leaving %s in Pending:Wait for watchdog/admin", instance_id)
+        return {"status": "waiting", "instance": instance_id, "hostname": hostname, "scanner": False}
 
     except Exception as e:
         logger.exception("Lifecycle provisioning failed for %s: %s", instance_id, e)
-        # CONTINUE not ABANDON — let the instance proceed even on failure.
-        # Only registration failures reach here; the watchdog handles the rest.
-        _complete_lifecycle("CONTINUE")
+        # Registration failed — ABANDON so the ASG replaces the instance
+        _complete_lifecycle("ABANDON")
         return {"status": "failed", "instance": instance_id, "error": str(e)}
 
 
@@ -436,21 +440,47 @@ def _wait_for_admin_ready(host, private_key, port=22, max_attempts=12, interval=
 
 # ── Watchdog ─────────────────────────────────────────────────────────
 
-def _handle_watchdog(event, context):
-    """Periodic check: verify scanner versions, re-extract cert if changed.
+def _get_pending_lifecycle_instances(asg_name, region):
+    """Return instance IDs in Pending:Wait lifecycle state."""
+    asg = boto3.client("autoscaling", region_name=region)
+    resp = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+    pending = []
+    for group in resp.get("AutoScalingGroups", []):
+        for inst in group.get("Instances", []):
+            if inst["LifecycleState"] == "Pending:Wait":
+                pending.append(inst["InstanceId"])
+    # Also check warm pool
+    try:
+        wp = asg.describe_warm_pool(AutoScalingGroupName=asg_name)
+        for inst in wp.get("Instances", []):
+            if inst["LifecycleState"] == "Warmed:Pending:Wait":
+                pending.append(inst["InstanceId"])
+    except Exception:
+        pass
+    return pending
 
-    Invoked by EventBridge on a schedule. Checks each SG for version changes
-    and re-applies customizations as needed.
+
+def _handle_watchdog(event, context):
+    """Periodic check: detect scanner pods, complete pending lifecycles,
+    verify scanner versions, and re-extract cert if changed.
+
+    Invoked by EventBridge on a schedule.
     """
     region = event.get("region", os.environ.get("AWS_REGION", "us-east-1"))
     sg_instances = _discover_sg_instances(region)
     endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
     key_pair_id = os.environ.get("KEY_PAIR_ID", "")
     cert_secret_name = os.environ.get("CERT_SECRET_NAME", "appliance-v1fs/sg-ca-cert")
+    asg_name = os.environ.get("ASG_NAME", "")
 
     if not sg_instances or not endpoint_id or not key_pair_id:
         logger.warning("Watchdog: missing configuration (found %d SGs), skipping", len(sg_instances))
         return {"status": "skipped", "reason": "missing config"}
+
+    # Find instances stuck in Pending:Wait (lifecycle not yet completed)
+    pending_instances = set(_get_pending_lifecycle_instances(asg_name, region)) if asg_name else set()
+    if pending_instances:
+        logger.info("Watchdog: %d instances in Pending:Wait: %s", len(pending_instances), pending_instances)
 
     private_key = _get_ssh_key(key_pair_id, region)
     ssm = boto3.client("ssm", region_name=region)
@@ -488,7 +518,21 @@ def _handle_watchdog(event, context):
                 results.append({"instance": instance_id, "action": "waiting"})
                 continue
 
-            # Scanner is running — get version and cert via sgowner
+            # Scanner is running — complete lifecycle if instance is in Pending:Wait
+            if instance_id in pending_instances:
+                logger.info("Watchdog: completing lifecycle for %s (scanner detected)", instance_id)
+                try:
+                    asg_client = boto3.client("autoscaling", region_name=region)
+                    asg_client.complete_lifecycle_action(
+                        LifecycleHookName="SGProvisioningHook",
+                        AutoScalingGroupName=asg_name,
+                        InstanceId=instance_id,
+                        LifecycleActionResult="CONTINUE",
+                    )
+                except Exception:
+                    logger.warning("Watchdog: failed to complete lifecycle for %s", instance_id, exc_info=True)
+
+            # Get version and cert via sgowner
             with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
                 client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
                 current_version = _get_scanner_version(client)
