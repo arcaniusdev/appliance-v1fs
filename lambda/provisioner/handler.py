@@ -284,7 +284,15 @@ def _handle_lifecycle(event, context):
 
             _wait_for_admin_ready(host, private_key, port=port)
 
-            logger.info("Setting hostname to %s", hostname)
+            # Set OS hostname via sgowner — Vision One uses this, not the clish endpoint name
+            logger.info("Setting OS hostname to %s", hostname)
+            rsa_key = paramiko.RSAKey.generate(4096)
+            pubkey_b64 = rsa_key.get_base64()
+            sgowner = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
+            sgowner.exec_command(f"sudo hostnamectl set-hostname {hostname}", timeout=15)
+            sgowner.close()
+
+            # Also set the clish endpoint name
             with ClishSession(host, "admin", private_key, port=port) as session:
                 session.connect(timeout=30)
                 session.send_command("enable", expect="# ", timeout=15)
