@@ -22,7 +22,8 @@ _s3_client = None
 _ec2_client = None
 _logs_client = None
 _audit_stream_created = False
-_known_buckets = set()  # Cache of buckets we've already created/verified
+_known_buckets = {}  # Cache: bucket_name → monotonic timestamp of last verification
+BUCKET_CACHE_TTL = 300  # Re-verify bucket existence every 5 minutes
 
 # Channel refresh interval — re-discover SGs periodically
 CHANNEL_REFRESH_SECONDS = 60
@@ -171,17 +172,19 @@ def _mark_channel_failure(idx):
 # ── Bucket Management ──────────────────────────────────────────────
 
 def _ensure_bucket(s3, bucket_name):
-    """Create a bucket if it doesn't exist (cached)."""
-    if bucket_name in _known_buckets:
+    """Create a bucket if it doesn't exist. Cache verified for BUCKET_CACHE_TTL seconds."""
+    now = time.monotonic()
+    if bucket_name in _known_buckets and (now - _known_buckets[bucket_name]) < BUCKET_CACHE_TTL:
         return
     try:
-        s3.create_bucket(Bucket=bucket_name)
-        logger.info("Created bucket: %s", bucket_name)
-    except s3.exceptions.BucketAlreadyOwnedByYou:
-        pass
-    except s3.exceptions.BucketAlreadyExists:
-        pass
-    _known_buckets.add(bucket_name)
+        s3.head_bucket(Bucket=bucket_name)
+    except Exception:
+        try:
+            s3.create_bucket(Bucket=bucket_name)
+            logger.info("Created bucket: %s", bucket_name)
+        except (s3.exceptions.BucketAlreadyOwnedByYou, s3.exceptions.BucketAlreadyExists):
+            pass
+    _known_buckets[bucket_name] = now
 
 
 # ── Handler ──────────────────────────────────────────────────────────
