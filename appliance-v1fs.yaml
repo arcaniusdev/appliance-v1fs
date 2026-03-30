@@ -56,7 +56,7 @@ Parameters:
     Type: Number
     Default: 3
     MinValue: 1
-    MaxValue: 10
+    MaxValue: 3
   PMLEnabled:
     Description: Enable Predictive Machine Learning (PML) for scans
     Type: String
@@ -84,6 +84,10 @@ Parameters:
     Default: 1
     MinValue: 1
     MaxValue: 8
+
+Conditions:
+  HasAtLeast2SGs: !Not [!Equals [!Ref ServiceGatewayCount, 1]]
+  HasAtLeast3SGs: !Equals [!Ref ServiceGatewayCount, 3]
 
 Resources:
   # ── VPC ──────────────────────────────────────────────────────────────
@@ -350,85 +354,68 @@ Resources:
               - Key: appliance-v1fs:stack
                 Value: !Ref "AWS::StackName"
 
-  ServiceGatewayASG:
-    Type: AWS::AutoScaling::AutoScalingGroup
+  # ── Service Gateway EC2 Instances ────────────────────────────────
+  ServiceGateway1:
+    Type: AWS::EC2::Instance
     DependsOn:
       - PrivateRoute1
-      - PrivateRoute2
-      - SGLifecycleSubscription
-      - SGLifecyclePermission
+      - ProvisionerEventPermission
     Properties:
-      AutoScalingGroupName: !Sub ServiceGateway-${AWS::StackName}
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      MinSize: !Ref ServiceGatewayCount
-      MaxSize: !Ref ServiceGatewayCount
-      DesiredCapacity: !Ref ServiceGatewayCount
-      VPCZoneIdentifier:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
-      HealthCheckType: EC2
-      HealthCheckGracePeriod: 600
-      LifecycleHookSpecificationList:
-        - LifecycleHookName: SGProvisioningHook
-          LifecycleTransition: "autoscaling:EC2_INSTANCE_LAUNCHING"
-          HeartbeatTimeout: 7200
-          DefaultResult: CONTINUE
-          NotificationTargetARN: !Ref SGLifecycleTopic
-          RoleARN: !GetAtt SGLifecycleNotificationRole.Arn
-        - LifecycleHookName: SGTerminationHook
-          LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
-          HeartbeatTimeout: 300
-          DefaultResult: CONTINUE
-          NotificationTargetARN: !Ref SGLifecycleTopic
-          RoleARN: !GetAtt SGLifecycleNotificationRole.Arn
-      Tags:
-        - Key: Name
-          Value: !Sub ServiceGateway-${AWS::StackName}
-          PropagateAtLaunch: false
+      SubnetId: !Ref PrivateSubnet1
 
-
-
-  # ── ASG Lifecycle Notification → Provisioner ─────────────────────
-  SGLifecycleTopic:
-    Type: AWS::SNS::Topic
+  ServiceGateway2:
+    Type: AWS::EC2::Instance
+    Condition: HasAtLeast2SGs
+    DependsOn:
+      - PrivateRoute2
+      - ProvisionerEventPermission
     Properties:
-      TopicName: !Sub sg-lifecycle-${AWS::StackName}
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnet2
 
-  SGLifecycleSubscription:
-    Type: AWS::SNS::Subscription
+  ServiceGateway3:
+    Type: AWS::EC2::Instance
+    Condition: HasAtLeast3SGs
+    DependsOn:
+      - PrivateRoute1
+      - ProvisionerEventPermission
     Properties:
-      TopicArn: !Ref SGLifecycleTopic
-      Protocol: lambda
-      Endpoint: !GetAtt ProvisionerLambda.Arn
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnet1
 
-  SGLifecyclePermission:
+  # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
+  ProvisionerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub sg-provision-${AWS::StackName}
+      Description: Trigger provisioner when SG instances reach running state
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - "EC2 Instance State-change Notification"
+        detail:
+          state:
+            - running
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProvisionerLambda.Arn
+          Id: ProvisionerTarget
+
+  ProvisionerEventPermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref ProvisionerLambda
       Action: lambda:InvokeFunction
-      Principal: sns.amazonaws.com
-      SourceArn: !Ref SGLifecycleTopic
-
-  SGLifecycleNotificationRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: autoscaling.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: LifecycleNotificationPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: sns:Publish
-                Resource: !Ref SGLifecycleTopic
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ProvisionerEventRule.Arn
 
   # ── Code Build ────────────────────────────────────────────────────
   CodeBuildRole:
@@ -1004,7 +991,7 @@ Resources:
   ScannerLambda:
     Type: AWS::Lambda::Function
     DependsOn:
-      - ServiceGatewayASG
+      - ServiceGateway1
       - CodeBuild
       - EFSMountTarget1
       - EFSMountTarget2
@@ -1497,11 +1484,6 @@ Resources:
                   - ssm:DeleteParameter
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
               - Effect: Allow
-                Action:
-                  - autoscaling:CompleteLifecycleAction
-                  - autoscaling:DescribeAutoScalingGroups
-                Resource: "*"
-              - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
               - Effect: Allow
@@ -1525,7 +1507,6 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
-          ASG_NAME: !Sub ServiceGateway-${AWS::StackName}
           SG_TAG_KEY: "appliance-v1fs:stack"
           SG_TAG_VALUE: !Ref "AWS::StackName"
           EICE_ENDPOINT_ID: !Ref EICEndpoint
@@ -1593,9 +1574,9 @@ Outputs:
   PrivateSubnet2Id:
     Description: Private subnet 2
     Value: !Ref PrivateSubnet2
-  AutoScalingGroupName:
-    Description: Service Gateway Auto Scaling Group
-    Value: !Ref ServiceGatewayASG
+  ServiceGateway1Id:
+    Description: Service Gateway 1 instance ID
+    Value: !Ref ServiceGateway1
   IngestBucketName:
     Description: S3 ingest bucket
     Value: !Ref IngestBucket

@@ -17,34 +17,22 @@ VERSION_PARAM_PREFIX = "/appliance-v1fs/scanner-version/"
 
 
 def handler(event, context):
-    """ASG lifecycle hook handler + watchdog.
+    """Service Gateway provisioner.
 
-    Dispatches on detail-type (EventBridge ASG lifecycle event):
-      - EC2 Instance-Launch Lifecycle Action: Provision a new SG
-      - EC2 Instance-Terminate Lifecycle Action: Cleanup on terminate
-
-    Or on action key (EventBridge / direct invoke):
-      - watchdog: Check SG versions, re-extract cert if changed
+    Dispatches on event type:
+      - EC2 Instance State-change Notification: Provision a new SG
+      - action=watchdog: Check SG versions, re-extract cert if changed
     """
-    # ASG lifecycle event via SNS notification
-    if "Records" in event and event["Records"][0].get("EventSource") == "aws:sns":
-        return _handle_sns_lifecycle(event, context)
-
-    # ASG lifecycle event (direct invoke or EventBridge)
+    # EventBridge EC2 state change → provision new SG
     detail_type = event.get("detail-type", "")
-    if detail_type in (
-        "EC2 Instance-Launch Lifecycle Action",
-        "EC2 Instance-Terminate Lifecycle Action",
-    ):
-        return _handle_lifecycle(event, context)
+    if detail_type == "EC2 Instance State-change Notification":
+        detail = event.get("detail", {})
+        if detail.get("state") == "running":
+            return _handle_instance_running(event, context)
 
-    # Direct invoke (watchdog from EventBridge)
+    # Direct invoke (watchdog from EventBridge schedule)
     if "action" in event and event["action"] == "watchdog":
         return _handle_watchdog(event, context)
-
-    # Self-re-invoke: continue polling for scanner pod
-    if "action" in event and event["action"] == "wait-for-scanner":
-        return _handle_wait_for_scanner(event, context)
 
     logger.error("Unknown event type: %s", json.dumps(event)[:500])
 
@@ -121,37 +109,6 @@ def _store_cert(secret_name, cert_pem, region):
         logger.info("CA cert updated in existing secret: %s", secret_name)
 
 
-# ── SNS Lifecycle Unwrapper ───────────────────────────────────────────
-
-def _handle_sns_lifecycle(event, context):
-    """Unwrap SNS lifecycle notification and delegate to _handle_lifecycle."""
-    message = json.loads(event["Records"][0]["Sns"]["Message"])
-    # SNS lifecycle message has: LifecycleHookName, AccountId, RequestId,
-    # LifecycleTransition, AutoScalingGroupName, EC2InstanceId, LifecycleActionToken
-    transition = message.get("LifecycleTransition", "")
-    if "LAUNCHING" in transition:
-        detail_type = "EC2 Instance-Launch Lifecycle Action"
-    elif "TERMINATING" in transition:
-        detail_type = "EC2 Instance-Terminate Lifecycle Action"
-    else:
-        logger.warning("Unknown lifecycle transition: %s", transition)
-        return {"status": "skipped", "reason": f"unknown transition: {transition}"}
-
-    # Convert to the same event format _handle_lifecycle expects
-    lifecycle_event = {
-        "detail-type": detail_type,
-        "region": event["Records"][0].get("EventSubscriptionArn", "").split(":")[3] or "us-east-1",
-        "detail": {
-            "LifecycleHookName": message["LifecycleHookName"],
-            "AutoScalingGroupName": message["AutoScalingGroupName"],
-            "LifecycleActionToken": message.get("LifecycleActionToken", ""),
-            "EC2InstanceId": message["EC2InstanceId"],
-            "LifecycleTransition": transition,
-        },
-    }
-    return _handle_lifecycle(lifecycle_event, context)
-
-
 # ── Dynamic SG Discovery ─────────────────────────────────────────────
 
 def _discover_sg_instances(region):
@@ -221,46 +178,42 @@ def _release_hostname(instance_id, region):
         logger.warning("Failed to release hostname for %s", instance_id, exc_info=True)
 
 
-# ── ASG Lifecycle Hook ───────────────────────────────────────────────
+# ── EC2 State Change → Provision ────────────────────────────────────
 
-def _handle_lifecycle(event, context):
-    """Handle ASG lifecycle events: provision on launch, cleanup on terminate."""
-    detail = event["detail"]
-    instance_id = detail["EC2InstanceId"]
-    hook_name = detail["LifecycleHookName"]
-    asg_name = detail["AutoScalingGroupName"]
-    action_token = detail.get("LifecycleActionToken") or ""
-    detail_type = event["detail-type"]
+def _handle_instance_running(event, context):
+    """Provision a Service Gateway when it reaches running state.
+
+    Triggered by EventBridge EC2 state-change events. Filters by tag
+    to only provision instances belonging to this stack.
+    """
+    instance_id = event["detail"]["instance-id"]
     region = event.get("region", os.environ.get("AWS_REGION_NAME", "us-east-1"))
 
-    asg_client = boto3.client("autoscaling", region_name=region)
+    # Check if this instance belongs to our stack
+    tag_key = os.environ.get("SG_TAG_KEY", "appliance-v1fs:stack")
+    tag_value = os.environ.get("SG_TAG_VALUE", "")
+    ec2 = boto3.client("ec2", region_name=region)
+    resp = ec2.describe_instances(InstanceIds=[instance_id])
+    instances = [i for r in resp["Reservations"] for i in r["Instances"]]
+    if not instances:
+        return {"status": "skipped", "reason": "instance not found"}
 
-    def _complete_lifecycle(result):
-        kwargs = dict(
-            LifecycleHookName=hook_name,
-            AutoScalingGroupName=asg_name,
-            LifecycleActionResult=result,
-        )
-        if action_token:
-            kwargs["LifecycleActionToken"] = action_token
-        else:
-            kwargs["InstanceId"] = instance_id
-        asg_client.complete_lifecycle_action(**kwargs)
+    tags = {t["Key"]: t["Value"] for t in instances[0].get("Tags", [])}
+    if tags.get(tag_key) != tag_value:
+        logger.debug("Instance %s not ours (tag %s=%s), skipping",
+                      instance_id, tag_key, tags.get(tag_key))
+        return {"status": "skipped", "reason": "not our instance"}
 
-    if detail_type == "EC2 Instance-Terminate Lifecycle Action":
-        logger.info("Lifecycle TERMINATE: %s — releasing hostname", instance_id)
-        _release_hostname(instance_id, region)
-        # Clean up version SSM param
-        ssm = boto3.client("ssm", region_name=region)
-        try:
-            ssm.delete_parameter(Name=f"{VERSION_PARAM_PREFIX}{instance_id}")
-        except Exception:
-            pass
-        _complete_lifecycle("CONTINUE")
-        return {"status": "terminated", "instance": instance_id}
+    # Skip if already provisioned (hostname SSM param exists)
+    ssm = boto3.client("ssm", region_name=region)
+    try:
+        ssm.get_parameter(Name=f"/appliance-v1fs/hostname/{instance_id}")
+        logger.info("Instance %s already provisioned, skipping", instance_id)
+        return {"status": "skipped", "reason": "already provisioned"}
+    except ssm.exceptions.ParameterNotFound:
+        pass  # not yet provisioned — continue
 
-    # Launch lifecycle — full provisioning flow
-    logger.info("Lifecycle LAUNCH: %s — starting provisioning", instance_id)
+    logger.info("Provisioning Service Gateway %s", instance_id)
     endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
     key_pair_id = os.environ.get("KEY_PAIR_ID", "")
     cert_secret_name = os.environ.get("CERT_SECRET_NAME", "appliance-v1fs/sg-ca-cert")
@@ -275,20 +228,19 @@ def _handle_lifecycle(event, context):
         hostname = _assign_hostname(instance_id, region)
 
         # Tag instance with its Vision One hostname
-        ec2 = boto3.client("ec2", region_name=region)
         ec2.create_tags(Resources=[instance_id], Tags=[
             {"Key": "Name", "Value": hostname},
         ])
         logger.info("Tagged %s as %s", instance_id, hostname)
 
-        # Register the SG — retry if "Try again later" (SG registration subsystem still booting)
+        # Register the SG via EICE SSH tunnel
         with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
             host = "127.0.0.1"
             port = tunnel.local_port
 
             _wait_for_admin_ready(host, private_key, port=port)
 
-            # Set OS hostname via sgowner — Vision One uses this, not the clish endpoint name
+            # Set OS hostname via sgowner
             logger.info("Setting OS hostname to %s", hostname)
             rsa_key = paramiko.RSAKey.generate(4096)
             pubkey_b64 = rsa_key.get_base64()
@@ -296,7 +248,7 @@ def _handle_lifecycle(event, context):
             sgowner.exec_command(f"sudo hostnamectl set-hostname {hostname}", timeout=15)
             sgowner.close()
 
-            # Also set the clish endpoint name
+            # Set clish endpoint name
             with ClishSession(host, "admin", private_key, port=port) as session:
                 session.connect(timeout=30)
                 session.send_command("enable", expect="# ", timeout=15)
@@ -324,7 +276,7 @@ def _handle_lifecycle(event, context):
             else:
                 raise RuntimeError(f"Register still blocked after 10 attempts: {output[-300:]}")
 
-        # Verify registration — retry banner check up to 5 times (registration can take 30-60s)
+        # Verify registration
         banner = ""
         for verify_attempt in range(5):
             time.sleep(30)
@@ -340,141 +292,18 @@ def _handle_lifecycle(event, context):
 
         logger.info("Service Gateway %s registered as %s", instance_id, hostname)
 
-        # Wait for scanner pod — keeps instance in Pending:Wait so admin
-        # can install File Security via Vision One while the SG is running.
-        scanner_found = _wait_for_scanner(
-            instance_id, endpoint_id, private_key, context,
-        )
-        if scanner_found:
-            _extract_and_store_cert(
-                instance_id, endpoint_id, private_key,
-                cert_secret_name, region,
-            )
-            _complete_lifecycle("CONTINUE")
-            logger.info("Lifecycle LAUNCH complete: %s (scanner detected)", instance_id)
-            return {"status": "provisioned", "instance": instance_id, "hostname": hostname, "scanner": True}
+        # Extract CA cert — works before FS install (cert is from the AMI's nginx)
+        _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region)
 
-        # Scanner NOT found — send heartbeat and self-re-invoke to keep
-        # polling every 30s. The chain continues until scanner is found
-        # or the lifecycle hook expires.
-        try:
-            asg_client.record_lifecycle_action_heartbeat(
-                LifecycleHookName=hook_name,
-                AutoScalingGroupName=asg_name,
-                InstanceId=instance_id,
-            )
-            logger.info("Heartbeat sent for %s — 2 more hours in Pending:Wait", instance_id)
-        except Exception:
-            logger.warning("Failed to send heartbeat for %s", instance_id, exc_info=True)
-        _invoke_scanner_waiter(context.function_name, {
-            "action": "wait-for-scanner",
-            "instance_id": instance_id,
-            "hook_name": hook_name,
-            "asg_name": asg_name,
-            "region": region,
-        }, region)
-        return {"status": "waiting", "instance": instance_id, "hostname": hostname, "scanner": False}
+        return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
 
     except Exception as e:
-        logger.exception("Lifecycle provisioning failed for %s: %s", instance_id, e)
-        # Registration failed — ABANDON so the ASG replaces the instance
-        _complete_lifecycle("ABANDON")
+        logger.exception("Provisioning failed for %s: %s", instance_id, e)
         return {"status": "failed", "instance": instance_id, "error": str(e)}
 
 
-
-def _wait_for_scanner(instance_id, endpoint_id, private_key, context):
-    """Poll for scanner pod until found or Lambda is about to timeout.
-
-    Returns True if scanner detected, False if timed out. Never raises —
-    the lifecycle hook will CONTINUE regardless.
-    """
-    while context.get_remaining_time_in_millis() > 60_000:  # stop 60s before Lambda timeout
-        try:
-            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-                with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
-                    session.connect(timeout=30)
-                    session.send_command("enable", expect="# ", timeout=15)
-                    output = session.send_command("configure verify plat", expect="# ", timeout=60)
-            if "sg-sfs-scanner" in output and "Running" in output:
-                logger.info("Scanner pod detected on %s", instance_id)
-                return True
-        except Exception:
-            logger.debug("Scanner check failed on %s", instance_id, exc_info=True)
-        remaining = context.get_remaining_time_in_millis() // 1000
-        logger.info("Waiting for scanner pod on %s (%ds remaining)", instance_id, remaining)
-        time.sleep(30)
-    logger.info("Lambda timeout approaching — scanner not yet detected on %s", instance_id)
-    return False
-
-
-def _invoke_scanner_waiter(function_name, payload, region):
-    """Async self-invoke to continue polling for scanner pod."""
-    lambda_client = boto3.client("lambda", region_name=region)
-    lambda_client.invoke(
-        FunctionName=function_name,
-        InvocationType="Event",
-        Payload=json.dumps(payload),
-    )
-    logger.info("Self-re-invoked wait-for-scanner for %s", payload["instance_id"])
-
-
-def _handle_wait_for_scanner(event, context):
-    """Continue polling for scanner pod via chained self-invocation.
-
-    Maintains the 30-second polling loop across Lambda timeouts so detection
-    doesn't fall back to the 15-minute watchdog interval.
-    """
-    instance_id = event["instance_id"]
-    hook_name = event["hook_name"]
-    asg_name = event["asg_name"]
-    region = event.get("region", os.environ.get("AWS_REGION", "us-east-1"))
-    endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
-    key_pair_id = os.environ.get("KEY_PAIR_ID", "")
-    cert_secret_name = os.environ.get("CERT_SECRET_NAME", "appliance-v1fs/sg-ca-cert")
-
-    private_key = _get_ssh_key(key_pair_id, region)
-    asg_client = boto3.client("autoscaling", region_name=region)
-
-    # Stop if instance is no longer in Pending:Wait
-    pending = _get_pending_lifecycle_instances(asg_name, region)
-    if instance_id not in pending:
-        logger.info("wait-for-scanner: %s no longer in Pending:Wait, stopping", instance_id)
-        return {"status": "stopped", "instance": instance_id, "reason": "not pending"}
-
-    # Poll for scanner pod until found or Lambda timeout
-    scanner_found = _wait_for_scanner(instance_id, endpoint_id, private_key, context)
-
-    if scanner_found:
-        _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region)
-        asg_client.complete_lifecycle_action(
-            LifecycleHookName=hook_name,
-            AutoScalingGroupName=asg_name,
-            InstanceId=instance_id,
-            LifecycleActionResult="CONTINUE",
-        )
-        logger.info("wait-for-scanner: lifecycle completed for %s", instance_id)
-        return {"status": "completed", "instance": instance_id}
-
-    # Still not found — heartbeat and re-invoke
-    try:
-        asg_client.record_lifecycle_action_heartbeat(
-            LifecycleHookName=hook_name,
-            AutoScalingGroupName=asg_name,
-            InstanceId=instance_id,
-        )
-        logger.info("wait-for-scanner: heartbeat sent for %s", instance_id)
-    except Exception:
-        logger.warning("wait-for-scanner: heartbeat failed for %s — lifecycle may have expired",
-                        instance_id, exc_info=True)
-        return {"status": "stopped", "instance": instance_id, "reason": "heartbeat failed"}
-
-    _invoke_scanner_waiter(context.function_name, event, region)
-    return {"status": "re-invoked", "instance": instance_id}
-
-
 def _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region):
-    """Extract CA cert and store scanner version after scanner pod is detected."""
+    """Extract CA cert and store it in Secrets Manager."""
     rsa_key = paramiko.RSAKey.generate(4096)
     pubkey_b64 = rsa_key.get_base64()
     for attempt in range(5):
@@ -522,21 +351,8 @@ def _wait_for_admin_ready(host, private_key, port=22, max_attempts=12, interval=
 
 # ── Watchdog ─────────────────────────────────────────────────────────
 
-def _get_pending_lifecycle_instances(asg_name, region):
-    """Return instance IDs in Pending:Wait lifecycle state."""
-    asg = boto3.client("autoscaling", region_name=region)
-    resp = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
-    pending = []
-    for group in resp.get("AutoScalingGroups", []):
-        for inst in group.get("Instances", []):
-            if inst["LifecycleState"] == "Pending:Wait":
-                pending.append(inst["InstanceId"])
-    return pending
-
-
 def _handle_watchdog(event, context):
-    """Periodic check: detect scanner pods, complete pending lifecycles,
-    verify scanner versions, and re-extract cert if changed.
+    """Periodic check: verify scanner versions and re-extract cert if changed.
 
     Invoked by EventBridge on a schedule.
     """
@@ -545,16 +361,10 @@ def _handle_watchdog(event, context):
     endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
     key_pair_id = os.environ.get("KEY_PAIR_ID", "")
     cert_secret_name = os.environ.get("CERT_SECRET_NAME", "appliance-v1fs/sg-ca-cert")
-    asg_name = os.environ.get("ASG_NAME", "")
 
     if not sg_instances or not endpoint_id or not key_pair_id:
         logger.warning("Watchdog: missing configuration (found %d SGs), skipping", len(sg_instances))
         return {"status": "skipped", "reason": "missing config"}
-
-    # Find instances stuck in Pending:Wait (lifecycle not yet completed)
-    pending_instances = set(_get_pending_lifecycle_instances(asg_name, region)) if asg_name else set()
-    if pending_instances:
-        logger.info("Watchdog: %d instances in Pending:Wait: %s", len(pending_instances), pending_instances)
 
     private_key = _get_ssh_key(key_pair_id, region)
     ssm = boto3.client("ssm", region_name=region)
@@ -575,7 +385,7 @@ def _handle_watchdog(event, context):
             except ssm.exceptions.ParameterNotFound:
                 stored = ""
 
-            # First check if scanner pod is running via admin clish (no sgowner needed)
+            # Check if scanner pod is running via admin clish
             with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
                 with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
                     session.connect(timeout=30)
@@ -591,20 +401,6 @@ def _handle_watchdog(event, context):
                 logger.info("Watchdog: %s — scanner pod not running yet", instance_id)
                 results.append({"instance": instance_id, "action": "waiting"})
                 continue
-
-            # Scanner is running — complete lifecycle if instance is in Pending:Wait
-            if instance_id in pending_instances:
-                logger.info("Watchdog: completing lifecycle for %s (scanner detected)", instance_id)
-                try:
-                    asg_client = boto3.client("autoscaling", region_name=region)
-                    asg_client.complete_lifecycle_action(
-                        LifecycleHookName="SGProvisioningHook",
-                        AutoScalingGroupName=asg_name,
-                        InstanceId=instance_id,
-                        LifecycleActionResult="CONTINUE",
-                    )
-                except Exception:
-                    logger.warning("Watchdog: failed to complete lifecycle for %s", instance_id, exc_info=True)
 
             # Get version and cert via sgowner
             with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
@@ -649,5 +445,3 @@ def _handle_watchdog(event, context):
             results.append({"instance": instance_id, "action": "error"})
 
     return {"status": "complete", "results": results}
-
-
