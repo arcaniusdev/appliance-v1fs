@@ -42,6 +42,10 @@ def handler(event, context):
     if "action" in event and event["action"] == "watchdog":
         return _handle_watchdog(event, context)
 
+    # Self-re-invoke: continue polling for scanner pod
+    if "action" in event and event["action"] == "wait-for-scanner":
+        return _handle_wait_for_scanner(event, context)
+
     logger.error("Unknown event type: %s", json.dumps(event)[:500])
 
 
@@ -350,10 +354,9 @@ def _handle_lifecycle(event, context):
             logger.info("Lifecycle LAUNCH complete: %s (scanner detected)", instance_id)
             return {"status": "provisioned", "instance": instance_id, "hostname": hostname, "scanner": True}
 
-        # Scanner NOT found — send heartbeat to reset the 2-hour timer,
-        # then exit without completing lifecycle. Instance stays in
-        # Pending:Wait for up to 2 more hours. The watchdog (every 15 min)
-        # will detect the scanner pod and complete the lifecycle.
+        # Scanner NOT found — send heartbeat and self-re-invoke to keep
+        # polling every 30s. The chain continues until scanner is found
+        # or the lifecycle hook expires.
         try:
             asg_client.record_lifecycle_action_heartbeat(
                 LifecycleHookName=hook_name,
@@ -363,7 +366,13 @@ def _handle_lifecycle(event, context):
             logger.info("Heartbeat sent for %s — 2 more hours in Pending:Wait", instance_id)
         except Exception:
             logger.warning("Failed to send heartbeat for %s", instance_id, exc_info=True)
-        logger.info("Lambda timeout — leaving %s in Pending:Wait for watchdog/admin", instance_id)
+        _invoke_scanner_waiter(context.function_name, {
+            "action": "wait-for-scanner",
+            "instance_id": instance_id,
+            "hook_name": hook_name,
+            "asg_name": asg_name,
+            "region": region,
+        }, region)
         return {"status": "waiting", "instance": instance_id, "hostname": hostname, "scanner": False}
 
     except Exception as e:
@@ -397,6 +406,71 @@ def _wait_for_scanner(instance_id, endpoint_id, private_key, context):
         time.sleep(30)
     logger.info("Lambda timeout approaching — scanner not yet detected on %s", instance_id)
     return False
+
+
+def _invoke_scanner_waiter(function_name, payload, region):
+    """Async self-invoke to continue polling for scanner pod."""
+    lambda_client = boto3.client("lambda", region_name=region)
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(payload),
+    )
+    logger.info("Self-re-invoked wait-for-scanner for %s", payload["instance_id"])
+
+
+def _handle_wait_for_scanner(event, context):
+    """Continue polling for scanner pod via chained self-invocation.
+
+    Maintains the 30-second polling loop across Lambda timeouts so detection
+    doesn't fall back to the 15-minute watchdog interval.
+    """
+    instance_id = event["instance_id"]
+    hook_name = event["hook_name"]
+    asg_name = event["asg_name"]
+    region = event.get("region", os.environ.get("AWS_REGION", "us-east-1"))
+    endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
+    key_pair_id = os.environ.get("KEY_PAIR_ID", "")
+    cert_secret_name = os.environ.get("CERT_SECRET_NAME", "appliance-v1fs/sg-ca-cert")
+
+    private_key = _get_ssh_key(key_pair_id, region)
+    asg_client = boto3.client("autoscaling", region_name=region)
+
+    # Stop if instance is no longer in Pending:Wait
+    pending = _get_pending_lifecycle_instances(asg_name, region)
+    if instance_id not in pending:
+        logger.info("wait-for-scanner: %s no longer in Pending:Wait, stopping", instance_id)
+        return {"status": "stopped", "instance": instance_id, "reason": "not pending"}
+
+    # Poll for scanner pod until found or Lambda timeout
+    scanner_found = _wait_for_scanner(instance_id, endpoint_id, private_key, context)
+
+    if scanner_found:
+        _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region)
+        asg_client.complete_lifecycle_action(
+            LifecycleHookName=hook_name,
+            AutoScalingGroupName=asg_name,
+            InstanceId=instance_id,
+            LifecycleActionResult="CONTINUE",
+        )
+        logger.info("wait-for-scanner: lifecycle completed for %s", instance_id)
+        return {"status": "completed", "instance": instance_id}
+
+    # Still not found — heartbeat and re-invoke
+    try:
+        asg_client.record_lifecycle_action_heartbeat(
+            LifecycleHookName=hook_name,
+            AutoScalingGroupName=asg_name,
+            InstanceId=instance_id,
+        )
+        logger.info("wait-for-scanner: heartbeat sent for %s", instance_id)
+    except Exception:
+        logger.warning("wait-for-scanner: heartbeat failed for %s — lifecycle may have expired",
+                        instance_id, exc_info=True)
+        return {"status": "stopped", "instance": instance_id, "reason": "heartbeat failed"}
+
+    _invoke_scanner_waiter(context.function_name, event, region)
+    return {"status": "re-invoked", "instance": instance_id}
 
 
 def _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region):
