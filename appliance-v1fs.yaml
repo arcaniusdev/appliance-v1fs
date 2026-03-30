@@ -51,23 +51,11 @@ Parameters:
     Description: Hostname prefix for Service Gateway appliances (numbered automatically)
     Type: String
     Default: FSVA-AWS
-  MinServiceGateways:
-    Description: Minimum number of Service Gateway appliances (always running)
-    Type: Number
-    Default: 1
-    MinValue: 1
-    MaxValue: 10
-  MaxServiceGateways:
-    Description: Maximum number of Service Gateway appliances (auto-scaled)
+  ServiceGatewayCount:
+    Description: Number of Service Gateway appliances (always running)
     Type: Number
     Default: 3
     MinValue: 1
-    MaxValue: 10
-  WarmPoolSize:
-    Description: Number of pre-provisioned Service Gateways kept stopped in warm pool
-    Type: Number
-    Default: 2
-    MinValue: 0
     MaxValue: 10
   PMLEnabled:
     Description: Enable Predictive Machine Learning (PML) for scans
@@ -374,9 +362,9 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      MinSize: !Ref MinServiceGateways
-      MaxSize: !Ref MaxServiceGateways
-      DesiredCapacity: !Ref MinServiceGateways
+      MinSize: !Ref ServiceGatewayCount
+      MaxSize: !Ref ServiceGatewayCount
+      DesiredCapacity: !Ref ServiceGatewayCount
       VPCZoneIdentifier:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
@@ -400,27 +388,7 @@ Resources:
           Value: !Sub ServiceGateway-${AWS::StackName}
           PropagateAtLaunch: false
 
-  ServiceGatewayWarmPool:
-    Type: AWS::AutoScaling::WarmPool
-    Properties:
-      AutoScalingGroupName: !Ref ServiceGatewayASG
-      MinSize: !Ref WarmPoolSize
-      PoolState: Stopped
-      InstanceReusePolicy:
-        ReuseOnScaleIn: true
 
-  SGScalingPolicy:
-    Type: AWS::AutoScaling::ScalingPolicy
-    Properties:
-      AutoScalingGroupName: !Ref ServiceGatewayASG
-      PolicyType: TargetTrackingScaling
-      EstimatedInstanceWarmup: 300
-      TargetTrackingConfiguration:
-        CustomizedMetricSpecification:
-          MetricName: BacklogPerInstance
-          Namespace: !Sub Custom/${AWS::StackName}
-          Statistic: Average
-        TargetValue: 5000
 
   # ── ASG Lifecycle Notification → Provisioner ─────────────────────
   SGLifecycleTopic:
@@ -461,110 +429,6 @@ Resources:
               - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref SGLifecycleTopic
-
-  # ── Backlog Metric Lambda (publishes BacklogPerInstance) ──────────
-  BacklogMetricRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: BacklogMetricPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: sqs:GetQueueAttributes
-                Resource: !GetAtt ScanQueue.Arn
-              - Effect: Allow
-                Action: autoscaling:DescribeAutoScalingGroups
-                Resource: "*"
-              - Effect: Allow
-                Action: cloudwatch:PutMetricData
-                Resource: "*"
-
-  BacklogMetricLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub backlog-metric-${AWS::StackName}
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt BacklogMetricRole.Arn
-      Timeout: 30
-      MemorySize: 128
-      Environment:
-        Variables:
-          QUEUE_URL: !Ref ScanQueue
-          ASG_NAME: !Sub ServiceGateway-${AWS::StackName}
-          METRIC_NAMESPACE: !Sub Custom/${AWS::StackName}
-      Code:
-        ZipFile: |
-          import os
-          import boto3
-
-          sqs = boto3.client("sqs")
-          asg = boto3.client("autoscaling")
-          cw = boto3.client("cloudwatch")
-
-          def handler(event, context):
-              queue_url = os.environ["QUEUE_URL"]
-              asg_name = os.environ["ASG_NAME"]
-              namespace = os.environ["METRIC_NAMESPACE"]
-
-              attrs = sqs.get_queue_attributes(
-                  QueueUrl=queue_url,
-                  AttributeNames=["ApproximateNumberOfMessages"],
-              )
-              backlog = int(attrs["Attributes"]["ApproximateNumberOfMessages"])
-
-              resp = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
-              instances = resp["AutoScalingGroups"][0]["Instances"] if resp["AutoScalingGroups"] else []
-              in_service = len([i for i in instances if i["LifecycleState"] == "InService"])
-
-              backlog_per_instance = backlog / max(in_service, 1)
-
-              cw.put_metric_data(
-                  Namespace=namespace,
-                  MetricData=[
-                      {
-                          "MetricName": "BacklogPerInstance",
-                          "Value": backlog_per_instance,
-                          "Unit": "Count",
-                      },
-                      {
-                          "MetricName": "InServiceInstances",
-                          "Value": in_service,
-                          "Unit": "Count",
-                      },
-                  ],
-              )
-              return {"backlog": backlog, "inService": in_service, "perInstance": backlog_per_instance}
-
-  BacklogMetricSchedule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub backlog-metric-${AWS::StackName}
-      Description: Publish BacklogPerInstance metric every minute for ASG scaling
-      ScheduleExpression: rate(1 minute)
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt BacklogMetricLambda.Arn
-          Id: BacklogMetricTarget
-
-  BacklogMetricPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref BacklogMetricLambda
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt BacklogMetricSchedule.Arn
 
   # ── Code Build ────────────────────────────────────────────────────
   CodeBuildRole:
@@ -1569,58 +1433,6 @@ Resources:
                 "title": "Success vs Failure Rate",
                 "period": 60,
                 "yAxis": { "left": { "label": "Count", "showUnits": false } }
-              }
-            },
-            {
-              "type": "text",
-              "x": 0, "y": 46, "width": 24, "height": 1,
-              "properties": { "markdown": "## Auto Scaling" }
-            },
-            {
-              "type": "metric",
-              "x": 0, "y": 47, "width": 8, "height": 6,
-              "properties": {
-                "title": "SG Instances (ASG)",
-                "region": "${AWS::Region}",
-                "metrics": [
-                  ["Custom/${AWS::StackName}", "InServiceInstances", {"label": "In Service", "stat": "Average"}]
-                ],
-                "view": "timeSeries",
-                "period": 60,
-                "yAxis": {"left": {"min": 0}}
-              }
-            },
-            {
-              "type": "metric",
-              "x": 8, "y": 47, "width": 8, "height": 6,
-              "properties": {
-                "title": "Backlog Per Instance",
-                "region": "${AWS::Region}",
-                "metrics": [
-                  ["Custom/${AWS::StackName}", "BacklogPerInstance", {"stat": "Average"}]
-                ],
-                "view": "timeSeries",
-                "period": 60,
-                "yAxis": {"left": {"min": 0}},
-                "annotations": {
-                  "horizontal": [{"value": 5000, "label": "Scale target"}]
-                }
-              }
-            },
-            {
-              "type": "metric",
-              "x": 16, "y": 47, "width": 8, "height": 6,
-              "properties": {
-                "title": "ASG Group Size",
-                "region": "${AWS::Region}",
-                "metrics": [
-                  ["AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "ServiceGateway-${AWS::StackName}", {"label": "Desired"}],
-                  ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "ServiceGateway-${AWS::StackName}", {"label": "InService"}],
-                  ["AWS/AutoScaling", "GroupTotalInstances", "AutoScalingGroupName", "ServiceGateway-${AWS::StackName}", {"label": "Total"}]
-                ],
-                "view": "timeSeries",
-                "period": 60,
-                "yAxis": {"left": {"min": 0}}
               }
             },
             {

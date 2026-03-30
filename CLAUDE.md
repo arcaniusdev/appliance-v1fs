@@ -11,9 +11,7 @@ Trend Micro has rebranded to **TrendAI**. Always use "TrendAI" in user-facing te
 ## Architecture
 
 ```
-S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gateway ASG (Warm Pool) → Clean or Quarantine Bucket
-                 │                │                              ↑
-                 │                │                    BacklogMetric Lambda → CloudWatch → ASG Scaling Policy
+S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gateway ASG → Clean or Quarantine Bucket
                  │                └→ (>10MB) → EFS → SG NFS Mount Point Scanner → Clean or Quarantine
                  └→ DLQ (after 5 failures) → Remediation Lambda (backoff → retry/discard)
 ```
@@ -23,7 +21,7 @@ S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gatewa
 | Resource | Purpose |
 |---|---|
 | VPC (10.2.0.0/16) | 2 public subnets, 2 private subnets, dual NAT Gateways |
-| Service Gateway ASG + Warm Pool | TrendAI appliance(s) running File Security scanner, auto-scaled via ASG with warm pool |
+| Service Gateway ASG | TrendAI appliance(s) running File Security scanner, fixed fleet size |
 | EC2 Instance Connect Endpoint | SSH access to Service Gateway via EICE tunnels |
 | Scanner Lambda (zip + layer) | Scans files via gRPC SDK, triggered by SQS |
 | SQS Queue + DLQ | S3 event notifications drive scan jobs |
@@ -35,21 +33,17 @@ S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gatewa
 | CloudWatch Alarms + SNS | DLQ alarm, queue age alarm |
 | Secrets Manager | Vision One API key, SG registration token, SG CA cert |
 | Provisioner Lambda (zip + layer) | Automates SG registration, hostname, scanner detection, cert extraction, watchdog, ASG lifecycle hooks |
-| Backlog Metric Lambda | Publishes BacklogPerInstance metric every minute for ASG target tracking |
 | Watchdog Schedule | EventBridge rule triggers provisioner every 15 min to check SG versions |
 | CodeBuild | Builds scanner + provisioner Lambda layers and code zips from GitHub |
 
-### Auto Scaling Service Gateways
+### Service Gateway Fleet
 
-SG appliances are managed by an **Auto Scaling Group with Warm Pool**:
+SG appliances are managed by an **Auto Scaling Group** with a fixed fleet size:
 
-- **ASG** scales between `MinServiceGateways` (default 1) and `MaxServiceGateways` (default 3) based on SQS queue depth
-- **Warm Pool** keeps `WarmPoolSize` (default 2) pre-provisioned SGs in `Stopped` state, ready to start in ~2-5 minutes
-- **`ReuseOnScaleIn: true`** — SGs are stopped/started, not terminated/launched, preserving File Security installation and Vision One registration
-- **Target Tracking** uses a custom `BacklogPerInstance` metric (queue depth / in-service SGs) with a target of 5000
+- **ASG** runs `ServiceGatewayCount` (default 3) SGs — Min = Max = Desired, no auto-scaling
 - **Lifecycle Hooks** trigger the provisioner Lambda on launch (registration + scanner wait) and terminate (hostname cleanup)
-- **Launch lifecycle:** Registers SG, sets OS hostname, waits for scanner pod up to Lambda timeout (~15 min), then sends heartbeat extending wait to 2 hours. DefaultResult=CONTINUE — never ABANDON (prevents launch-fail loops)
-- **Watchdog completes lifecycles:** When the watchdog detects a scanner pod on a `Pending:Wait` instance, it completes the lifecycle action so the instance transitions
+- **Launch lifecycle:** Registers SG, sets OS hostname, polls for scanner pod every 30s via chained Lambda self-re-invocation for up to 2 hours. DefaultResult=CONTINUE — never ABANDON (prevents launch-fail loops)
+- **Watchdog completes lifecycles:** When the watchdog detects a scanner pod on a `Pending:Wait` instance, it completes the lifecycle action so the instance transitions to InService
 - **Dynamic Discovery** — scanner Lambda discovers SGs via EC2 tags (`appliance-v1fs:stack`), refreshes every 5 minutes
 - Each SG is assigned a unique hostname (`FSVA-AWS-01`, `-02`, etc.) tracked in SSM parameters
 
@@ -63,14 +57,12 @@ The `ChannelsPerSG` parameter (1-8, default 2) opens multiple gRPC channels per 
 2. **Create deploy bucket** if needed: `aws s3 mb s3://appliance-v1fs-deploy-886436954261` (teardown deletes it)
 3. **Deploy stack:** Upload template to S3, then `aws cloudformation create-stack --stack-name appliance-v1fs-N` via S3 template URL (template >51KB)
 4. Stack creates all infrastructure; CodeBuild pulls from GitHub, builds scanner + provisioner layers, zips AWS CLI runtime to S3
-5. ASG launches `MinServiceGateways` instances; lifecycle hook triggers provisioner Lambda to register each SG with Vision One via EICE SSH tunnels
-6. SGs stay in `Pending:Wait` for up to **2 hours** while admin installs File Security
-7. **Manual step:** Install File Security on each SG via Vision One console (Workflow and Automation → Service Gateway Management → Manage Services) — **do this while SGs are in Pending:Wait**
-8. Provisioner or watchdog detects scanner pod, extracts CA cert, completes lifecycle → first SG goes InService
-9. Warm pool SGs launch, register, and also wait in `Pending:Wait` — install FS on them too
-10. Once all SGs have FS, warm pool instances go to Stopped (FS persists across stop/start)
-11. **Manual step:** Configure NFS mount point via Vision One console (Cloud Security → File Security → Inventory → Modify Mount Point) — use stack outputs for Server IP, path, and quarantine folder
-12. Scanner Lambda discovers running SGs via EC2 tags, creates gRPC channels → scanning begins
+5. ASG launches all `ServiceGatewayCount` instances; lifecycle hook triggers provisioner Lambda to register each SG with Vision One via EICE SSH tunnels
+6. SGs stay in `Pending:Wait` for up to **2 hours** while admin installs File Security. Provisioner polls every 30s via chained self-re-invocation
+7. **Manual step:** Install File Security on all SGs via Vision One console (Workflow and Automation → Service Gateway Management → Manage Services) — **do this while SGs are in Pending:Wait**
+8. Provisioner detects scanner pod within 30s, extracts CA cert, completes lifecycle → SGs go InService
+9. **Manual step:** Configure NFS mount point via Vision One console (Cloud Security → File Security → Inventory → Modify Mount Point) — use stack outputs for Server IP, path, and quarantine folder
+10. Scanner Lambda discovers running SGs via EC2 tags, creates gRPC channels → scanning begins
 
 **Always use `--disable-rollback`** on `create-stack` so failures can be inspected in place.
 
@@ -112,7 +104,7 @@ The scanner Lambda is a **zip deployment with a Lambda layer**, not a container 
 - **EFS mount:** `/mnt/efs` for large file scanning
 - **SQS trigger:** Batch size 1, `ReportBatchItemFailures` for fast retry
 - **SG Discovery:** Discovers running SGs dynamically via EC2 tags (`appliance-v1fs:stack`), refreshes every 5 minutes
-- **Circuit breaker:** Per-channel failure tracking with cooldown — handles ASG scale-in gracefully
+- **Circuit breaker:** Per-channel failure tracking with cooldown
 
 ### Dual-Path Scanning
 
@@ -228,9 +220,7 @@ The scanner pod exposes an ICAP service on port 1344 (documented only for the co
 | `PrimaryAZ` | us-east-1a | Primary availability zone |
 | `SecondaryAZ` | us-east-1b | Secondary availability zone |
 | `ServiceGatewayHostname` | FSVA-AWS | Hostname prefix (auto-numbered) |
-| `MinServiceGateways` | 1 | Minimum SGs always running |
-| `MaxServiceGateways` | 3 | Maximum SGs the ASG can scale to |
-| `WarmPoolSize` | 2 | Pre-provisioned SGs kept stopped in warm pool |
+| `ServiceGatewayCount` | 3 | Number of SGs always running |
 | `ServiceGatewayInstanceType` | c5.4xlarge | c5.2xlarge or c5.4xlarge |
 | `ChannelsPerSG` | 1 | gRPC channels per SG (1-8, use 2) |
 | `PMLEnabled` | true | Predictive Machine Learning for gRPC scans |
@@ -290,7 +280,7 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 - **VPC-attached Lambda ENI cleanup takes 15-20 minutes** — this is the main bottleneck during stack deletion. The scanner Lambda's ENIs in the VPC take AWS a long time to release
 - **Deploy bucket is deleted during teardown** — must recreate `appliance-v1fs-deploy-886436954261` before next deploy
 - **Lifecycle hooks: never ABANDON on scanner pod timeout** — use DefaultResult=CONTINUE and never call complete_lifecycle("ABANDON") except for registration failures. ABANDON terminates the instance and causes launch-fail loops
-- **File Security install requires running instances** — warm pool SGs in Stopped state cannot have FS installed. The lifecycle hook keeps them in Pending:Wait (running) for up to 2 hours to allow FS install
+- **File Security install requires running instances** — the lifecycle hook keeps SGs in Pending:Wait (running) for up to 2 hours to allow FS install
 
 ## Service Gateway AMI (BYOL v3.0.27)
 

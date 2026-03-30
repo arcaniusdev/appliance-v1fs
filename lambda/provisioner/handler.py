@@ -531,14 +531,6 @@ def _get_pending_lifecycle_instances(asg_name, region):
         for inst in group.get("Instances", []):
             if inst["LifecycleState"] == "Pending:Wait":
                 pending.append(inst["InstanceId"])
-    # Also check warm pool
-    try:
-        wp = asg.describe_warm_pool(AutoScalingGroupName=asg_name)
-        for inst in wp.get("Instances", []):
-            if inst["LifecycleState"] == "Warmed:Pending:Wait":
-                pending.append(inst["InstanceId"])
-    except Exception:
-        pass
     return pending
 
 
