@@ -56,9 +56,21 @@ The `ChannelsPerSG` parameter (1-8, default 2) opens multiple gRPC channels per 
 2. **Create deploy bucket** if needed: `aws s3 mb s3://appliance-v1fs-deploy-886436954261` (teardown deletes it)
 3. **Deploy stack:** Upload template to S3, then `aws cloudformation create-stack --stack-name appliance-v1fs-N` via S3 template URL (template >51KB)
 4. Stack creates all infrastructure; CodeBuild pulls from GitHub, builds scanner + provisioner layers, zips AWS CLI runtime to S3
-5. EC2 instances launch → EventBridge triggers provisioner Lambda → registers each SG with Vision One, sets hostname, extracts CA cert
-6. **Manual step:** Install File Security on all SGs via Vision One console (Workflow and Automation → Service Gateway Management → Manage Services)
-7. Scanner Lambda discovers running SGs via EC2 tags, creates gRPC channels → scanning begins
+5. EC2 instances launch → EventBridge fires EC2 state-change event → provisioner Lambda triggered for each instance
+6. Provisioner connects via EICE SSH tunnel, waits for admin readiness, sets OS hostname (from CloudFormation Name tag), sets clish endpoint name, registers SG with Vision One using registration token from Secrets Manager, verifies registration, extracts CA cert via sgowner `openssl s_client`, patches nginx `proxy-body-size` to `MaxFileSizeMB` for large file scanning, tags instance as `appliance-v1fs:provisioned=true`
+7. **Manual step:** Install File Security on all SGs via Vision One console (Workflow and Automation → Service Gateway Management → Manage Services)
+8. Scanning begins — files arriving in the ingest S3 bucket trigger SQS messages, which invoke the scanner Lambda
+
+### How Scanning Works
+
+1. S3 object-created event notification sends a message to the SQS scan queue
+2. Lambda SQS event source mapping invokes the scanner Lambda (batch size 1)
+3. Scanner Lambda discovers running SGs by calling `ec2:DescribeInstances` filtered by `appliance-v1fs:stack={StackName}` tag, caches results for 60 seconds
+4. Scanner creates gRPC channels to each SG's private IP on port 443, using the CA cert from Secrets Manager and the Vision One API key for authentication (`ChannelsPerSG` channels per SG)
+5. Scanner downloads the file from S3, selects a healthy channel (circuit breaker skips channels with 3+ consecutive failures for 60s), sends the file via `amaas.grpc.scan_buffer`
+6. Based on scan result: file is copied to the clean or quarantine S3 bucket with a `ScanResult` tag, then deleted from ingest
+7. Scan result is written to the CloudWatch audit log group
+8. If scan fails, the SQS message becomes visible again after the visibility timeout, retried up to 5 times, then sent to the DLQ
 
 **Always use `--disable-rollback`** on `create-stack` so failures can be inspected in place.
 
