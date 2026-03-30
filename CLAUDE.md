@@ -95,7 +95,7 @@ The scanner Lambda is a **zip deployment with a Lambda layer**, not a container 
 - **Code:** `scanner.py` uploaded to S3 by CodeBuild
 - **Layer:** `visionone-filesecurity` + gRPC dependencies compiled for Amazon Linux x86_64
 - **Timeout:** 900s (Lambda maximum, matches SQS visibility timeout)
-- **Memory:** 3072 MB (supports large file scanning up to 512MB via gRPC)
+- **Memory:** 3008 MB (Lambda max; supports large file scanning via gRPC)
 - **VPC-attached:** Private subnets (to reach Service Gateway on port 443)
 - **SQS trigger:** Batch size 1, `ReportBatchItemFailures` for fast retry
 - **SG Discovery:** Discovers running SGs dynamically via EC2 tags (`appliance-v1fs:stack`), refreshes every 5 minutes
