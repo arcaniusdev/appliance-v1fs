@@ -11,8 +11,8 @@ Trend Micro has rebranded to **TrendAI**. Always use "TrendAI" in user-facing te
 ## Architecture
 
 ```
-S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gateway EC2 → Clean or Quarantine Bucket
-                 └→ DLQ (after 5 failures) → Remediation Lambda (backoff → retry/discard)
+S3 (Any Enrolled Bucket) → EventBridge → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gateway EC2 → {bucket}-clean or {bucket}-quarantine
+                                          └→ DLQ (after 5 failures) → Remediation Lambda (backoff → retry/discard)
 ```
 
 ### Components
@@ -26,7 +26,7 @@ S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gatewa
 | SQS Queue + DLQ | S3 event notifications drive scan jobs |
 | DLQ Remediation Lambda | Re-queues DLQ messages with exponential backoff (60s/300s/900s) |
 | Reconciliation Lambda | Re-queues orphaned ingest files every 5 minutes |
-| S3 Buckets | Ingest (source), Clean (passed), Quarantine (malware/oversize) — DeletionPolicy: Retain |
+| S3 Ingest Bucket | Default ingest bucket with EventBridge enabled — DeletionPolicy: Retain |
 | CloudWatch Dashboard | Dashboard with queue health, scan performance, detection analysis |
 | CloudWatch Alarms + SNS | DLQ alarm, queue age alarm |
 | Secrets Manager | Vision One API key, SG registration token, SG CA cert |
@@ -59,18 +59,27 @@ The `ChannelsPerSG` parameter (1-8, default 2) opens multiple gRPC channels per 
 5. EC2 instances launch → EventBridge fires EC2 state-change event → provisioner Lambda triggered for each instance
 6. Provisioner connects via EICE SSH tunnel, waits for admin readiness, sets OS hostname (from CloudFormation Name tag), sets clish endpoint name, registers SG with Vision One using registration token from Secrets Manager, verifies registration, extracts CA cert via sgowner `openssl s_client`, patches nginx `proxy-body-size` to `MaxFileSizeMB` for large file scanning, tags instance as `appliance-v1fs:provisioned=true`
 7. **Manual step:** Install File Security on all SGs via Vision One console (Workflow and Automation → Service Gateway Management → Manage Services)
-8. Scanning begins — files arriving in the ingest S3 bucket trigger SQS messages, which invoke the scanner Lambda
+8. Scanning begins — files arriving in any EventBridge-enrolled bucket trigger SQS messages via EventBridge, which invoke the scanner Lambda. Clean/quarantine buckets are auto-created per source bucket
 
 ### How Scanning Works
 
-1. S3 object-created event notification sends a message to the SQS scan queue
+1. S3 object-created event → EventBridge → SQS scan queue (any bucket with EventBridge enabled)
 2. Lambda SQS event source mapping invokes the scanner Lambda (batch size 1)
 3. Scanner Lambda discovers running SGs by calling `ec2:DescribeInstances` filtered by `appliance-v1fs:stack={StackName}` tag, caches results for 60 seconds
 4. Scanner creates gRPC channels to each SG's private IP on port 443, using the CA cert from Secrets Manager and the Vision One API key for authentication (`ChannelsPerSG` channels per SG)
 5. Scanner downloads the file from S3, selects a healthy channel (circuit breaker skips channels with 3+ consecutive failures for 60s), sends the file via `amaas.grpc.scan_buffer`
-6. Based on scan result: file is copied to the clean or quarantine S3 bucket with a `ScanResult` tag, then deleted from ingest
+6. Based on scan result: file is copied to `{source-bucket}-clean` or `{source-bucket}-quarantine` with a `ScanResult` tag, then deleted from the source bucket. Destination buckets are auto-created on first use
 7. Scan result is written to the CloudWatch audit log group
 8. If scan fails, the SQS message becomes visible again after the visibility timeout, retried up to 5 times, then sent to the DLQ
+
+### Enrolling Additional Buckets
+
+Any S3 bucket in the same account can be enrolled for scanning by enabling EventBridge notifications:
+```bash
+aws s3api put-bucket-notification-configuration --bucket BUCKET_NAME \
+  --notification-configuration '{"EventBridgeConfiguration":{}}'
+```
+No other configuration needed — the EventBridge rule catches all S3 Object Created events. Scanned files are routed to `{BUCKET_NAME}-clean` or `{BUCKET_NAME}-quarantine` (auto-created).
 
 **Always use `--disable-rollback`** on `create-stack` so failures can be inspected in place.
 
@@ -268,7 +277,7 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 - **Vision One API is read-only for Service Gateway** — only GET endpoint exists
 - **Always ask before making Vision One API changes** — shared platform
 - **Disconnect old SGs from Vision One before registering new ones**
-- **S3 buckets have DeletionPolicy: Retain** — survive stack deletion
+- **Ingest bucket has DeletionPolicy: Retain** — survives stack deletion. Clean/quarantine buckets are auto-created by the scanner at runtime (`{source}-clean`, `{source}-quarantine`)
 - **Malware sample bucket is protected** — never delete `eks-v1fs-malware-samples-886436954261`
 - **Scanner Lambda needs `s3:ListBucket`** — without it, S3 returns AccessDenied instead of NoSuchKey for missing objects, causing infinite retries
 - **Lambda concurrency limit** — account default was 10, increased to 1000, pending increase to 3000 via Service Quotas

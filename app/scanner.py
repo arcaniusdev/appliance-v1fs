@@ -22,6 +22,7 @@ _s3_client = None
 _ec2_client = None
 _logs_client = None
 _audit_stream_created = False
+_known_buckets = set()  # Cache of buckets we've already created/verified
 
 # Channel refresh interval — re-discover SGs periodically
 CHANNEL_REFRESH_SECONDS = 60
@@ -167,12 +168,26 @@ def _mark_channel_failure(idx):
                            idx, _channel_addrs[idx], CB_COOLDOWN_SECONDS)
 
 
+# ── Bucket Management ──────────────────────────────────────────────
+
+def _ensure_bucket(s3, bucket_name):
+    """Create a bucket if it doesn't exist (cached)."""
+    if bucket_name in _known_buckets:
+        return
+    try:
+        s3.create_bucket(Bucket=bucket_name)
+        logger.info("Created bucket: %s", bucket_name)
+    except s3.exceptions.BucketAlreadyOwnedByYou:
+        pass
+    except s3.exceptions.BucketAlreadyExists:
+        pass
+    _known_buckets.add(bucket_name)
+
+
 # ── Handler ──────────────────────────────────────────────────────────
 
 def handler(event, context):
     s3 = _get_s3()
-    clean_bucket = os.environ["S3_CLEAN_BUCKET"]
-    quarantine_bucket = os.environ["S3_QUARANTINE_BUCKET"]
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
     feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
     audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
@@ -181,11 +196,15 @@ def handler(event, context):
     for sqs_record in event.get("Records", []):
         try:
             body = json.loads(sqs_record["body"])
-            for s3_event in body.get("Records", []):
-                _process_record(
-                    s3_event, s3, clean_bucket, quarantine_bucket,
-                    pml, feedback, audit_log_group,
-                )
+            # EventBridge event format: detail.bucket.name, detail.object.key
+            detail = body.get("detail", {})
+            bucket = detail.get("bucket", {}).get("name")
+            key = detail.get("object", {}).get("key")
+            size = detail.get("object", {}).get("size", 0)
+            if bucket and key:
+                _process_file(s3, bucket, key, size, pml, feedback, audit_log_group)
+            else:
+                logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
         except Exception:
             logger.exception("Failed processing SQS message %s", sqs_record.get("messageId", "?"))
             failures.append({"itemIdentifier": sqs_record["messageId"]})
@@ -195,19 +214,9 @@ def handler(event, context):
     return {"batchItemFailures": []}
 
 
-def _process_record(
-    record, s3, clean_bucket, quarantine_bucket,
-    pml, feedback, audit_log_group,
-):
-    s3_data = record.get("s3", {})
-    bucket = s3_data.get("bucket", {}).get("name")
-    key_encoded = s3_data.get("object", {}).get("key")
-    if not bucket or not key_encoded:
-        logger.error("Malformed S3 record, skipping")
-        return
-
-    key = urllib.parse.unquote_plus(key_encoded)
-    size = s3_data.get("object", {}).get("size", 0)
+def _process_file(s3, bucket, key, size, pml, feedback, audit_log_group):
+    clean_bucket = f"{bucket}-clean"
+    quarantine_bucket = f"{bucket}-quarantine"
     logger.info("Processing s3://%s/%s (%d bytes)", bucket, key, size)
 
     try:
@@ -247,6 +256,7 @@ def _process_record(
         tag = "Clean"
         logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s", bucket, key, scan_ms, sg_addr)
 
+    _ensure_bucket(s3, dest_bucket)
     s3.put_object(Bucket=dest_bucket, Key=key, Body=file_bytes, Tagging=f"ScanResult={tag}")
     s3.delete_object(Bucket=bucket, Key=key)
     _audit(audit_log_group, key, size, verdict, result, scan_ms, sg_addr)

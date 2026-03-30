@@ -591,33 +591,29 @@ Resources:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
-    DependsOn: ScanQueuePolicy
     Properties:
       NotificationConfiguration:
-        QueueConfigurations:
-          - Event: s3:ObjectCreated:*
-            Queue: !GetAtt ScanQueue.Arn
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
       Tags:
         - Key: Name
           Value: !Sub IngestBucket-${AWS::StackName}
 
-  CleanBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+  # ── EventBridge Fan-In (S3 Object Created → SQS) ──────────────────
+  ScanEventRule:
+    Type: AWS::Events::Rule
     Properties:
-      Tags:
-        - Key: Name
-          Value: !Sub CleanBucket-${AWS::StackName}
-
-  QuarantineBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      Tags:
-        - Key: Name
-          Value: !Sub QuarantineBucket-${AWS::StackName}
+      Name: !Sub scan-ingest-${AWS::StackName}
+      Description: Route S3 object-created events from any enrolled bucket to the scan queue
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "Object Created"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScanQueue.Arn
+          Id: ScanQueueTarget
 
   # ── SQS ────────────────────────────────────────────────────────────
   ScanQueue:
@@ -652,12 +648,12 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: s3.amazonaws.com
+              Service: events.amazonaws.com
             Action: sqs:SendMessage
             Resource: !GetAtt ScanQueue.Arn
             Condition:
-              ArnLike:
-                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-*"
+              ArnEquals:
+                aws:SourceArn: !GetAtt ScanEventRule.Arn
 
   # ── DLQ Remediation Lambda ─────────────────────────────────────────
   DLQRemediationRole:
@@ -883,18 +879,13 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:DeleteObject
-                  - s3:ListBucket
-                Resource:
-                  - !GetAtt IngestBucket.Arn
-                  - !Sub "${IngestBucket.Arn}/*"
-              - Effect: Allow
-                Action:
                   - s3:PutObject
                   - s3:PutObjectTagging
-                  - s3:CopyObject
-                Resource:
-                  - !Sub "${CleanBucket.Arn}/*"
-                  - !Sub "${QuarantineBucket.Arn}/*"
+                  - s3:ListBucket
+                Resource: "arn:aws:s3:::*"
+              - Effect: Allow
+                Action: s3:CreateBucket
+                Resource: "arn:aws:s3:::*"
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
@@ -955,8 +946,6 @@ Resources:
           - !Ref ScannerLambdaSecGroup
       Environment:
         Variables:
-          S3_CLEAN_BUCKET: !Ref CleanBucket
-          S3_QUARANTINE_BUCKET: !Ref QuarantineBucket
           SG_DISCOVERY_TAG: !Sub "appliance-v1fs:stack=${AWS::StackName}"
           SG_CA_CERT_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert"
           V1FS_API_KEY_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key"
@@ -1510,14 +1499,11 @@ Outputs:
     Description: Service Gateway 1 instance ID
     Value: !Ref ServiceGateway1
   IngestBucketName:
-    Description: S3 ingest bucket
+    Description: S3 ingest bucket (EventBridge enabled)
     Value: !Ref IngestBucket
-  CleanBucketName:
-    Description: S3 clean bucket
-    Value: !Ref CleanBucket
-  QuarantineBucketName:
-    Description: S3 quarantine bucket
-    Value: !Ref QuarantineBucket
+  ScanEventRuleArn:
+    Description: "EventBridge rule ARN — to enroll another bucket, enable EventBridge notifications on it: aws s3api put-bucket-notification-configuration --bucket BUCKET --notification-configuration '{\"EventBridgeConfiguration\":{}}'"
+    Value: !GetAtt ScanEventRule.Arn
   ScanQueueUrl:
     Description: SQS scan queue URL
     Value: !Ref ScanQueue
