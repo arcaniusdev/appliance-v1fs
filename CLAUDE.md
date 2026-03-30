@@ -23,7 +23,7 @@ S3 (Any Enrolled Bucket) → EventBridge → SQS Queue → Lambda Scanner → gR
 | Service Gateway EC2 Instances | TrendAI appliance(s) running File Security scanner, fixed fleet |
 | EC2 Instance Connect Endpoint | SSH access to Service Gateway via EICE tunnels |
 | Scanner Lambda (zip + layer) | Scans files via gRPC SDK, triggered by SQS |
-| SQS Queue + DLQ | S3 event notifications drive scan jobs |
+| SQS Queue + DLQ | EventBridge fan-in routes S3 events to SQS; DLQ after 5 failures |
 | DLQ Remediation Lambda | Re-queues DLQ messages with exponential backoff (60s/300s/900s) |
 | Reconciliation Lambda | Re-queues orphaned ingest files every 5 minutes |
 | S3 Ingest Bucket | Default ingest bucket with EventBridge enabled — DeletionPolicy: Retain |
@@ -244,7 +244,7 @@ aws s3 cp appliance-v1fs.yaml s3://{deploy-bucket}/template.yaml
 aws cloudformation create-stack --template-url https://s3.amazonaws.com/{deploy-bucket}/template.yaml ...
 ```
 
-**Do not upload templates to the ingest bucket** — S3 event notifications will trigger the scanner on them.
+**Do not upload templates to the ingest bucket** — EventBridge will route them to the scanner.
 
 ## BuildSpec (CodeBuild)
 
@@ -270,7 +270,7 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 
 - **Never download malware locally** — use S3 server-side copy only
 - **Never store credentials in files** — use Secrets Manager
-- **S3 event notifications encode spaces as `+`** — scanner uses `urllib.parse.unquote_plus()`
+- **EventBridge passes S3 object keys URL-encoded** — spaces as `%20`, not `+`
 - **gRPC requires `ssl_target_name_override`** — cert CN doesn't match IP
 - **gRPC max file size is `MaxFileSizeMB`** (default 500MB) — nginx body size and gRPC channel limits set from this parameter
 - **Always use `--disable-rollback`** on stack creation for debuggability
@@ -278,6 +278,8 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 - **Always ask before making Vision One API changes** — shared platform
 - **Disconnect old SGs from Vision One before registering new ones**
 - **Ingest bucket has DeletionPolicy: Retain** — survives stack deletion. Clean/quarantine buckets are auto-created by the scanner at runtime (`{source}-clean`, `{source}-quarantine`)
+- **SSM enrolled-buckets parameter** — `/appliance-v1fs/enrolled-buckets` tracks all source buckets (auto-populated by scanner, pruned by reconciliation). Cleaned up during teardown
+- **Auto-created buckets not in CloudFormation** — `{source}-clean` and `{source}-quarantine` buckets are created at runtime and must be explicitly deleted during teardown
 - **Malware sample bucket is protected** — never delete `eks-v1fs-malware-samples-886436954261`
 - **Scanner Lambda needs `s3:ListBucket`** — without it, S3 returns AccessDenied instead of NoSuchKey for missing objects, causing infinite retries
 - **Lambda concurrency limit** — account default was 10, increased to 1000, pending increase to 3000 via Service Quotas

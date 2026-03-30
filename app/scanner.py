@@ -3,7 +3,6 @@ import logging
 import os
 import random
 import time
-import urllib.parse
 
 import boto3
 import grpc
@@ -205,20 +204,49 @@ def _register_source_bucket(bucket_name):
     _registered_sources.add(bucket_name)
 
 
-def _ensure_bucket(s3, bucket_name):
-    """Create a bucket if it doesn't exist. Cache verified for BUCKET_CACHE_TTL seconds."""
+def _ensure_bucket(s3, bucket_name, grant_read_to_account=None):
+    """Create a bucket if it doesn't exist. Cache verified for BUCKET_CACHE_TTL seconds.
+
+    If grant_read_to_account is set and the bucket is newly created,
+    adds a bucket policy granting read access to that account.
+    """
     now = time.monotonic()
     if bucket_name in _known_buckets and (now - _known_buckets[bucket_name]) < BUCKET_CACHE_TTL:
         return
+    created = False
     try:
         s3.head_bucket(Bucket=bucket_name)
     except Exception:
         try:
             s3.create_bucket(Bucket=bucket_name)
             logger.info("Created bucket: %s", bucket_name)
+            created = True
         except (s3.exceptions.BucketAlreadyOwnedByYou, s3.exceptions.BucketAlreadyExists):
             pass
+    if created and grant_read_to_account:
+        _grant_bucket_read(s3, bucket_name, grant_read_to_account)
     _known_buckets[bucket_name] = now
+
+
+def _grant_bucket_read(s3, bucket_name, account_id):
+    """Grant an AWS account read access to a bucket via bucket policy."""
+    policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+            "Action": ["s3:GetObject", "s3:ListBucket"],
+            "Resource": [
+                f"arn:aws:s3:::{bucket_name}",
+                f"arn:aws:s3:::{bucket_name}/*",
+            ],
+        }],
+    })
+    try:
+        s3.put_bucket_policy(Bucket=bucket_name, Policy=policy)
+        logger.info("Granted read access on %s to account %s", bucket_name, account_id)
+    except Exception:
+        logger.warning("Failed to set bucket policy on %s", bucket_name, exc_info=True)
 
 
 # ── Handler ──────────────────────────────────────────────────────────
@@ -238,8 +266,9 @@ def handler(event, context):
             bucket = detail.get("bucket", {}).get("name")
             key = detail.get("object", {}).get("key")
             size = detail.get("object", {}).get("size", 0)
+            source_account = body.get("account", "")
             if bucket and key:
-                _process_file(s3, bucket, key, size, pml, feedback, audit_log_group)
+                _process_file(s3, bucket, key, size, source_account, pml, feedback, audit_log_group)
             else:
                 logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
         except Exception:
@@ -251,7 +280,7 @@ def handler(event, context):
     return {"batchItemFailures": []}
 
 
-def _process_file(s3, bucket, key, size, pml, feedback, audit_log_group):
+def _process_file(s3, bucket, key, size, source_account, pml, feedback, audit_log_group):
     _register_source_bucket(bucket)
     clean_bucket = f"{bucket}-clean"
     quarantine_bucket = f"{bucket}-quarantine"
@@ -294,7 +323,8 @@ def _process_file(s3, bucket, key, size, pml, feedback, audit_log_group):
         tag = "Clean"
         logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s", bucket, key, scan_ms, sg_addr)
 
-    _ensure_bucket(s3, dest_bucket)
+    grant_account = source_account if dest_bucket == clean_bucket else None
+    _ensure_bucket(s3, dest_bucket, grant_read_to_account=grant_account)
     s3.put_object(Bucket=dest_bucket, Key=key, Body=file_bytes, Tagging=f"ScanResult={tag}")
     s3.delete_object(Bucket=bucket, Key=key)
     _audit(audit_log_group, key, size, verdict, result, scan_ms, sg_addr)

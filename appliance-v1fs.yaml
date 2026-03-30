@@ -931,7 +931,9 @@ Resources:
                   - s3:ListBucket
                 Resource: "arn:aws:s3:::*"
               - Effect: Allow
-                Action: s3:CreateBucket
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutBucketPolicy
                 Resource: "arn:aws:s3:::*"
               - Effect: Allow
                 Action:
