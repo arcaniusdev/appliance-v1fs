@@ -520,9 +520,9 @@ Resources:
 
               attrs = sqs.get_queue_attributes(
                   QueueUrl=queue_url,
-                  AttributeNames=["ApproximateNumberOfMessagesVisible"],
+                  AttributeNames=["ApproximateNumberOfMessages"],
               )
-              backlog = int(attrs["Attributes"]["ApproximateNumberOfMessagesVisible"])
+              backlog = int(attrs["Attributes"]["ApproximateNumberOfMessages"])
 
               resp = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
               instances = resp["AutoScalingGroups"][0]["Instances"] if resp["AutoScalingGroups"] else []
