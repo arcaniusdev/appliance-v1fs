@@ -27,7 +27,7 @@ S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gatewa
 | DLQ Remediation Lambda | Re-queues DLQ messages with exponential backoff (60s/300s/900s) |
 | Reconciliation Lambda | Re-queues orphaned ingest files every 5 minutes |
 | S3 Buckets | Ingest (source), Clean (passed), Quarantine (malware/oversize) — DeletionPolicy: Retain |
-| CloudWatch Dashboard | 30-widget dashboard with queue health, scan performance, detection analysis |
+| CloudWatch Dashboard | Dashboard with queue health, scan performance, detection analysis |
 | CloudWatch Alarms + SNS | DLQ alarm, queue age alarm |
 | Secrets Manager | Vision One API key, SG registration token, SG CA cert |
 | Provisioner Lambda (zip + layer) | Automates SG registration, hostname, cert extraction; watchdog for version monitoring |
@@ -95,8 +95,7 @@ project/
         ├── requirements.txt         # paramiko (AWS CLI v2 downloaded from S3 at runtime)
         ├── handler.py               # EC2 provisioner + watchdog handler
         ├── ssh_helper.py            # Paramiko-based clish SSH interaction
-        ├── eice_tunnel.py           # EICE tunnel management for SSH
-        └── cfn_response.py          # CloudFormation response helper
+        └── eice_tunnel.py           # EICE tunnel management for SSH
 ```
 
 ## Scanner Lambda (Zip-Based)
@@ -110,7 +109,7 @@ The scanner Lambda is a **zip deployment with a Lambda layer**, not a container 
 - **Memory:** 3008 MB (Lambda max; supports large file scanning via gRPC)
 - **VPC-attached:** Private subnets (to reach Service Gateway on port 443)
 - **SQS trigger:** Batch size 1, `ReportBatchItemFailures` for fast retry
-- **SG Discovery:** Discovers running SGs dynamically via EC2 tags (`appliance-v1fs:stack`), refreshes every 5 minutes
+- **SG Discovery:** Discovers running SGs dynamically via EC2 tags (`appliance-v1fs:stack`), refreshes every 60 seconds
 - **Circuit breaker:** Per-channel failure tracking with cooldown
 
 ### nginx Body Size Patch
@@ -129,33 +128,61 @@ The provisioner Lambda is a zip deployment with a Lambda layer (paramiko only):
 - **Watchdog:** Runs every 15 minutes via EventBridge schedule, checks scanner versions on running instances, re-extracts cert if version changes
 
 
-## Performance (Tested)
+## Performance (Tested — Stack-15)
 
 ### c5.2xlarge (8 vCPU, 16 GB) — Optimal Instance Size
 
 The c5.4xlarge is massively overprovisioned. At peak load, scanner pod uses 26m CPU and 1.7GB memory of 16 vCPU / 32GB available. **c5.2xlarge handles the same throughput at half the cost.**
 
-### With 2 Channels Per SG (Optimal)
+### Stress Test Results (2 SGs, c5.2xlarge, 2 channels each)
 
-| Config | Throughput | Queue Backlog at 20M/day Rate |
+Tested with 163K real malware samples (50 batches × 3,258 files, mixed sizes up to 395MB).
+
+| Metric | Value |
+|---|---|
+| Peak throughput | ~253 files/sec (15,179 invocations/min) |
+| Steady-state throughput | ~170 files/sec (~14.7M files/day) |
+| Peak Lambda concurrency | 999 (hit account limit of 1,000) |
+| Errors | **0** |
+| DLQ messages | **0** |
+| Detection rate | 46.8% malicious, 53.2% clean |
+| Load balance | 49.8% / 50.2% across 2 SGs |
+
+### Scan Latency
+
+| Percentile | Latency |
+|---|---|
+| P50 | ~160ms |
+| P95 | ~5.2s |
+| P99 | ~40s |
+| Max | ~90s (large files) |
+| Min | 2-3ms (cached/small) |
+
+### Large File Scanning (nginx patched)
+
+| File Size | Scan Time | Result |
 |---|---|---|
-| 1 SG (c5.2xlarge, 2 ch) | ~110 files/sec (~9.5M/day) | Builds backlog |
-| 3 SGs (c5.2xlarge, 2 ch) | ~231 files/sec (~20M/day) | **Zero backlog** |
+| 395MB (Setup.exe) | 2.1s | Clean |
+| 58MB (sample.bin) | 9.9s | Malicious (TROJ_INJECT + GANDCRAB) |
+| 47MB (java.exe) | 7.6s | Malicious (Ransom_CRYPTRITU) |
+| 46MB (eizdfmqa.exe) | 18.5s | Malicious (Mal_BigTof) |
+| 33MB (judgement.vbs) | 10.6s | Malicious (Trojan.VBS.QAKBOT) |
 
 ### Key Performance Facts
 - Scanner pod doesn't autoscale (no HPA on virtual appliance, single replica)
-- Bottleneck is gRPC concurrency in nginx, not CPU/memory
-- `TM_AM_MAX_HANDLER: 32` concurrent scan handlers in the scanner pod
+- **Lambda concurrency is the bottleneck** at 1,000 — increase to 3,000 requested via Service Quotas
+- `TM_AM_MAX_HANDLER: 32` concurrent scan handlers per scanner pod
 - Scanner pod has 4 containers: scanner, uploader, connector, redis
-- gRPC scan cache exists (`TM_AM_SCAN_CACHE=true`) unlike earlier documentation
+- gRPC scan cache exists (`TM_AM_SCAN_CACHE=true`)
+- 2 SGs handle ~14.7M/day; 3 SGs estimated ~20M/day (with concurrency limit raised)
 
 ### Performance vs eks-v1fs
 
 | Factor | EKS | Appliance |
 |---|---|---|
-| Peak throughput ceiling | ~750K/min | ~13K/min (3 SGs, 2 ch) |
+| Peak throughput ceiling | ~750K/min | ~15K/min (2 SGs, 2 ch) |
 | Cost at 20M/day spike | ~$5,000/mo | ~$1,820/mo (3× c5.2xlarge) |
-| Cost at 2M/day baseline | ~$690/mo | ~$1,020/mo |
+| Cost at 2M/day baseline | ~$690/mo | ~$680/mo (2× c5.2xlarge) |
 | Scale-up speed | 30-60s | Instant (Lambda) |
 | Operational complexity | High | Low |
 
@@ -244,7 +271,7 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 - **S3 buckets have DeletionPolicy: Retain** — survive stack deletion
 - **Malware sample bucket is protected** — never delete `eks-v1fs-malware-samples-886436954261`
 - **Scanner Lambda needs `s3:ListBucket`** — without it, S3 returns AccessDenied instead of NoSuchKey for missing objects, causing infinite retries
-- **Lambda concurrency limit** — account default was 10, increased to 1000 via Service Quotas
+- **Lambda concurrency limit** — account default was 10, increased to 1000, pending increase to 3000 via Service Quotas
 - **CloudWatch Logs throttling** — cache the logs client and create log streams once per execution environment, not per scan
 - **Census (`TM_AM_CENSUS`) is file prevalence tracking, not Predictive Machine Learning**
 - **SQS API attribute is `ApproximateNumberOfMessages`** — not `ApproximateNumberOfMessagesVisible` (that's the CloudWatch metric name, different from the API attribute)
