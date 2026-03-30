@@ -289,6 +289,12 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 - **VPC-attached Lambda ENI cleanup takes 15-20 minutes** — this is the main bottleneck during stack deletion. The scanner Lambda's ENIs in the VPC take AWS a long time to release
 - **Deploy bucket is deleted during teardown** — must recreate `appliance-v1fs-deploy-886436954261` before next deploy
 - **File Security install requires running instances** — install FS after stack creation while SGs are running
+- **SG registration tokens expire** — generate a fresh token from Vision One console (Workflow and Automation → Service Gateway Management) for each deployment. No public API exists for SG tokens (the containerized scanner API at `/beta/fileSecurity/ctr/registration` returns `ppid: sfs` tokens, not `ppid: sgi` tokens needed for SG registration)
+- **EventBridge provisioner race condition** — EC2 instances may reach `running` state before the EventBridge rule is fully active, even with DependsOn. If provisioning doesn't trigger automatically, manually invoke the provisioner Lambda with an EC2 state-change event payload
+- **CodeBuild runs once at stack creation** — code changes pushed to GitHub after stack creation require a manual CodeBuild rebuild (`aws codebuild start-build`) followed by Lambda code update (`aws lambda update-function-code`)
+- **EventBridge only fires for new objects** — existing files in a bucket when EventBridge is enabled won't trigger scans. To backfill, copy files in place: `aws s3 cp s3://bucket/ s3://bucket/ --recursive --metadata-directive REPLACE`
+- **Lambda max memory is 3008 MB** — not 3072 (AWS rounds down to multiples of 64)
+- **Single EICE tunnel per SG** — consolidate all SSH operations (admin readiness, hostname, registration, cert extraction, nginx patch) into one tunnel to avoid repeated subprocess/WebSocket overhead
 
 ## Service Gateway AMI (BYOL v3.0.27)
 
