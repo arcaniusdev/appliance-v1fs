@@ -79,9 +79,9 @@ Parameters:
       - c5.2xlarge
       - c5.4xlarge
   ChannelsPerSG:
-    Description: Number of gRPC channels per Service Gateway (higher = more concurrent scans)
+    Description: Number of gRPC channels per Service Gateway (2 is optimal)
     Type: Number
-    Default: 1
+    Default: 2
     MinValue: 1
     MaxValue: 8
   MaxFileSizeMB:
@@ -1448,7 +1448,6 @@ Resources:
                 Action:
                   - ec2-instance-connect:OpenTunnel
                   - ec2:DescribeInstances
-                  - ec2:DescribeInstanceConnectEndpoints
                   - ec2:CreateTags
                 Resource: "*"
               - Effect: Allow

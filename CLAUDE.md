@@ -229,7 +229,7 @@ The scanner pod exposes an ICAP service on port 1344 (documented only for the co
 | `ServiceGatewayHostname` | FSVA-AWS | Hostname prefix (auto-numbered) |
 | `ServiceGatewayCount` | 3 | Number of SGs (1-3, always running) |
 | `ServiceGatewayInstanceType` | c5.4xlarge | c5.2xlarge or c5.4xlarge |
-| `ChannelsPerSG` | 1 | gRPC channels per SG (1-8, use 2) |
+| `ChannelsPerSG` | 2 | gRPC channels per SG (1-8, 2 is optimal) |
 | `MaxFileSizeMB` | 500 | Max file size in MB for gRPC scanning (nginx + channel limit) |
 | `PMLEnabled` | true | Predictive Machine Learning for gRPC scans |
 | `SmartFeedbackEnabled` | true | Scan telemetry to TrendAI |
