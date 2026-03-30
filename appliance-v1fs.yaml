@@ -759,10 +759,19 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: s3:ListBucket
-                Resource: !GetAtt IngestBucket.Arn
+                Resource: "arn:aws:s3:::*"
+              - Effect: Allow
+                Action: s3:GetBucketNotificationConfiguration
+                Resource: "arn:aws:s3:::*"
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt ScanQueue.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
 
   ReconciliationLambda:
     Type: AWS::Lambda::Function
@@ -774,7 +783,6 @@ Resources:
       Timeout: 300
       Environment:
         Variables:
-          INGEST_BUCKET: !Ref IngestBucket
           QUEUE_URL: !Ref ScanQueue
           AGE_THRESHOLD_SECONDS: "1800"
       Code:
@@ -785,30 +793,69 @@ Resources:
           logger.setLevel(logging.INFO)
           s3 = boto3.client("s3")
           sqs = boto3.client("sqs")
-          BUCKET = os.environ["INGEST_BUCKET"]
+          ssm = boto3.client("ssm")
           QUEUE_URL = os.environ["QUEUE_URL"]
           AGE_THRESHOLD = int(os.environ["AGE_THRESHOLD_SECONDS"])
+          PARAM_NAME = "/appliance-v1fs/enrolled-buckets"
 
           def handler(event, context):
+              # Read registered buckets from SSM
+              try:
+                  resp = ssm.get_parameter(Name=PARAM_NAME)
+                  registered = set(resp["Parameter"]["Value"].split(","))
+              except ssm.exceptions.ParameterNotFound:
+                  logger.info("Reconciliation: no enrolled buckets registered")
+                  return {"requeued": 0, "buckets": 0}
+
+              # Validate each bucket — prune any that no longer have EventBridge enabled
+              active = set()
+              for bucket in registered:
+                  try:
+                      config = s3.get_bucket_notification_configuration(Bucket=bucket)
+                      if config.get("EventBridgeConfiguration") is not None:
+                          active.add(bucket)
+                      else:
+                          logger.info("Reconciliation: %s no longer has EventBridge, removing", bucket)
+                  except Exception:
+                      logger.info("Reconciliation: %s inaccessible, removing", bucket)
+
+              # Update SSM if any buckets were pruned
+              if active != registered:
+                  if active:
+                      ssm.put_parameter(Name=PARAM_NAME, Value=",".join(sorted(active)),
+                                        Type="String", Overwrite=True)
+                  else:
+                      ssm.delete_parameter(Name=PARAM_NAME)
+                  logger.info("Reconciliation: pruned %d stale buckets", len(registered - active))
+
+              # Check each active bucket for orphans
               now = time.time()
-              requeued = 0
-              paginator = s3.get_paginator("list_objects_v2")
-              for page in paginator.paginate(Bucket=BUCKET):
-                  for obj in page.get("Contents", []):
-                      age = now - obj["LastModified"].timestamp()
-                      if age > AGE_THRESHOLD:
-                          event_body = {
-                              "Records": [{
-                                  "s3": {
-                                      "bucket": {"name": BUCKET},
-                                      "object": {"key": obj["Key"], "size": obj["Size"]}
+              total_requeued = 0
+              for bucket in active:
+                  requeued = 0
+                  try:
+                      paginator = s3.get_paginator("list_objects_v2")
+                      for page in paginator.paginate(Bucket=bucket):
+                          for obj in page.get("Contents", []):
+                              age = now - obj["LastModified"].timestamp()
+                              if age > AGE_THRESHOLD:
+                                  event_body = {
+                                      "source": "aws.s3",
+                                      "detail-type": "Object Created",
+                                      "detail": {
+                                          "bucket": {"name": bucket},
+                                          "object": {"key": obj["Key"], "size": obj["Size"]}
+                                      }
                                   }
-                              }]
-                          }
-                          sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(event_body))
-                          requeued += 1
-              logger.info("Reconciliation: re-queued %d orphaned files (threshold %ds)", requeued, AGE_THRESHOLD)
-              return {"requeued": requeued}
+                                  sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(event_body))
+                                  requeued += 1
+                  except Exception:
+                      logger.warning("Reconciliation: failed listing %s", bucket, exc_info=True)
+                  if requeued:
+                      logger.info("Reconciliation: re-queued %d orphans from %s", requeued, bucket)
+                  total_requeued += requeued
+              logger.info("Reconciliation: %d total orphans across %d buckets", total_requeued, len(active))
+              return {"requeued": total_requeued, "buckets": len(active)}
 
   ReconciliationSchedule:
     Type: AWS::Events::Rule
@@ -886,6 +933,11 @@ Resources:
               - Effect: Allow
                 Action: s3:CreateBucket
                 Resource: "arn:aws:s3:::*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"

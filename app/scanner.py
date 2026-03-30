@@ -20,10 +20,15 @@ _channel_cooldown = None  # Circuit breaker: cooldown expiry per channel
 _channels_built_at = 0.0  # monotonic timestamp of last channel build
 _s3_client = None
 _ec2_client = None
+_ssm_client = None
 _logs_client = None
 _audit_stream_created = False
 _known_buckets = {}  # Cache: bucket_name → monotonic timestamp of last verification
+_registered_sources = set()  # Source buckets we've already registered in SSM
 BUCKET_CACHE_TTL = 300  # Re-verify bucket existence every 5 minutes
+
+# SSM parameter for enrolled bucket registry
+ENROLLED_BUCKETS_PARAM = "/appliance-v1fs/enrolled-buckets"
 
 # Channel refresh interval — re-discover SGs periodically
 CHANNEL_REFRESH_SECONDS = 60
@@ -45,6 +50,13 @@ def _get_ec2():
     if _ec2_client is None:
         _ec2_client = boto3.client("ec2")
     return _ec2_client
+
+
+def _get_ssm():
+    global _ssm_client
+    if _ssm_client is None:
+        _ssm_client = boto3.client("ssm")
+    return _ssm_client
 
 
 def _get_logs():
@@ -171,6 +183,28 @@ def _mark_channel_failure(idx):
 
 # ── Bucket Management ──────────────────────────────────────────────
 
+def _register_source_bucket(bucket_name):
+    """Add a source bucket to the SSM enrolled-buckets registry if not already tracked."""
+    if bucket_name in _registered_sources:
+        return
+    ssm = _get_ssm()
+    try:
+        resp = ssm.get_parameter(Name=ENROLLED_BUCKETS_PARAM)
+        current = set(resp["Parameter"]["Value"].split(","))
+    except ssm.exceptions.ParameterNotFound:
+        current = set()
+    if bucket_name not in current:
+        current.add(bucket_name)
+        ssm.put_parameter(
+            Name=ENROLLED_BUCKETS_PARAM,
+            Value=",".join(sorted(current)),
+            Type="String",
+            Overwrite=True,
+        )
+        logger.info("Registered source bucket: %s", bucket_name)
+    _registered_sources.add(bucket_name)
+
+
 def _ensure_bucket(s3, bucket_name):
     """Create a bucket if it doesn't exist. Cache verified for BUCKET_CACHE_TTL seconds."""
     now = time.monotonic()
@@ -218,6 +252,7 @@ def handler(event, context):
 
 
 def _process_file(s3, bucket, key, size, pml, feedback, audit_log_group):
+    _register_source_bucket(bucket)
     clean_bucket = f"{bucket}-clean"
     quarantine_bucket = f"{bucket}-quarantine"
     logger.info("Processing s3://%s/%s (%d bytes)", bucket, key, size)
