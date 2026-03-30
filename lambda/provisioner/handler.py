@@ -350,11 +350,19 @@ def _handle_lifecycle(event, context):
             logger.info("Lifecycle LAUNCH complete: %s (scanner detected)", instance_id)
             return {"status": "provisioned", "instance": instance_id, "hostname": hostname, "scanner": True}
 
-        # Scanner NOT found — don't complete lifecycle. Let the instance
-        # stay in Pending:Wait for the full 30-min heartbeat timeout.
-        # The watchdog (every 15 min) will detect the scanner pod and
-        # complete the lifecycle. If nobody does, DefaultResult=CONTINUE
-        # lets the instance proceed after 30 min.
+        # Scanner NOT found — send heartbeat to reset the 2-hour timer,
+        # then exit without completing lifecycle. Instance stays in
+        # Pending:Wait for up to 2 more hours. The watchdog (every 15 min)
+        # will detect the scanner pod and complete the lifecycle.
+        try:
+            asg_client.record_lifecycle_action_heartbeat(
+                LifecycleHookName=hook_name,
+                AutoScalingGroupName=asg_name,
+                InstanceId=instance_id,
+            )
+            logger.info("Heartbeat sent for %s — 2 more hours in Pending:Wait", instance_id)
+        except Exception:
+            logger.warning("Failed to send heartbeat for %s", instance_id, exc_info=True)
         logger.info("Lambda timeout — leaving %s in Pending:Wait for watchdog/admin", instance_id)
         return {"status": "waiting", "instance": instance_id, "hostname": hostname, "scanner": False}
 

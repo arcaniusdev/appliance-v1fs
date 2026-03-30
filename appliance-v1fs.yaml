@@ -385,7 +385,7 @@ Resources:
       LifecycleHookSpecificationList:
         - LifecycleHookName: SGProvisioningHook
           LifecycleTransition: "autoscaling:EC2_INSTANCE_LAUNCHING"
-          HeartbeatTimeout: 1800
+          HeartbeatTimeout: 7200
           DefaultResult: CONTINUE
           NotificationTargetARN: !Ref SGLifecycleTopic
           RoleARN: !GetAtt SGLifecycleNotificationRole.Arn
