@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-AWS-deployed TrendAI Service Gateway virtual appliance(s) configured as file security scanners. Files arriving in S3 trigger a Lambda function that scans them via the File Security SDK over gRPC (files <=10MB) or via EFS mount point NFS scanning (files >10MB). The Service Gateway is a multi-purpose appliance from TrendAI (formerly Trend Micro).
+AWS-deployed TrendAI Service Gateway virtual appliance(s) configured as file security scanners. Files arriving in S3 trigger a Lambda function that scans them via the File Security SDK over gRPC. The Service Gateway is a multi-purpose appliance from TrendAI (formerly Trend Micro).
 
 ## Branding
 
@@ -12,7 +12,6 @@ Trend Micro has rebranded to **TrendAI**. Always use "TrendAI" in user-facing te
 
 ```
 S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gateway EC2 → Clean or Quarantine Bucket
-                 │                └→ (>10MB) → EFS → SG NFS Mount Point Scanner → Clean or Quarantine
                  └→ DLQ (after 5 failures) → Remediation Lambda (backoff → retry/discard)
 ```
 
@@ -28,7 +27,6 @@ S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gatewa
 | DLQ Remediation Lambda | Re-queues DLQ messages with exponential backoff (60s/300s/900s) |
 | Reconciliation Lambda | Re-queues orphaned ingest files every 5 minutes |
 | S3 Buckets | Ingest (source), Clean (passed), Quarantine (malware/oversize) — DeletionPolicy: Retain |
-| EFS Filesystem | Shared NFS mount for large file scanning (Lambda writes, SG scans) |
 | CloudWatch Dashboard | 30-widget dashboard with queue health, scan performance, detection analysis |
 | CloudWatch Alarms + SNS | DLQ alarm, queue age alarm |
 | Secrets Manager | Vision One API key, SG registration token, SG CA cert |
@@ -60,8 +58,7 @@ The `ChannelsPerSG` parameter (1-8, default 2) opens multiple gRPC channels per 
 4. Stack creates all infrastructure; CodeBuild pulls from GitHub, builds scanner + provisioner layers, zips AWS CLI runtime to S3
 5. EC2 instances launch → EventBridge triggers provisioner Lambda → registers each SG with Vision One, sets hostname, extracts CA cert
 6. **Manual step:** Install File Security on all SGs via Vision One console (Workflow and Automation → Service Gateway Management → Manage Services)
-7. **Manual step:** Configure NFS mount point via Vision One console (Cloud Security → File Security → Inventory → Modify Mount Point) — use stack outputs for Server IP, path, and quarantine folder
-8. Scanner Lambda discovers running SGs via EC2 tags, creates gRPC channels → scanning begins
+7. Scanner Lambda discovers running SGs via EC2 tags, creates gRPC channels → scanning begins
 
 **Always use `--disable-rollback`** on `create-stack` so failures can be inspected in place.
 
@@ -80,7 +77,7 @@ project/
 │   └── icap-interface-report.html   # Undocumented ICAP interface research
 ├── app/
 │   ├── requirements.txt             # visionone-filesecurity
-│   └── scanner.py                   # Lambda handler: SQS → S3 download → gRPC/EFS scan → route
+│   └── scanner.py                   # Lambda handler: SQS → S3 download → gRPC scan → route
 └── lambda/
     └── provisioner/
         ├── requirements.txt         # paramiko (AWS CLI v2 downloaded from S3 at runtime)
@@ -98,21 +95,15 @@ The scanner Lambda is a **zip deployment with a Lambda layer**, not a container 
 - **Code:** `scanner.py` uploaded to S3 by CodeBuild
 - **Layer:** `visionone-filesecurity` + gRPC dependencies compiled for Amazon Linux x86_64
 - **Timeout:** 900s (Lambda maximum, matches SQS visibility timeout)
-- **Memory:** 1024 MB
+- **Memory:** 3072 MB (supports large file scanning up to 512MB via gRPC)
 - **VPC-attached:** Private subnets (to reach Service Gateway on port 443)
-- **EFS mount:** `/mnt/efs` for large file scanning
 - **SQS trigger:** Batch size 1, `ReportBatchItemFailures` for fast retry
 - **SG Discovery:** Discovers running SGs dynamically via EC2 tags (`appliance-v1fs:stack`), refreshes every 5 minutes
 - **Circuit breaker:** Per-channel failure tracking with cooldown
 
-### Dual-Path Scanning
+### nginx Body Size Patch
 
-- **Files <=10MB:** gRPC scan (fast, ~60ms, through nginx ingress)
-- **Files >10MB:** Written to EFS, scanned by SG's NFS mount point scanner (supports PML, no size limit)
-
-### gRPC File Size Limit (~10MB)
-
-Files larger than ~10MB consistently fail with `RST_STREAM error code 2` via gRPC. The global nginx configmap has `proxy-body-size: 10m`. The scanner ingress annotation sets `proxy-body-size: 3000m` but it doesn't override the global setting for gRPC streams. **Do not attempt to scan files >10MB via gRPC.**
+The default nginx configmap has `proxy-body-size: 10m`, blocking gRPC scans >10MB. The provisioner patches this to `0` (unlimited) during initial provisioning, and the watchdog re-applies it every 15 minutes in case a scanner pod update reverts the configmap. This enables gRPC scanning of files up to 512MB (gRPC channel limit).
 
 ## Provisioner Lambda (Zip-Based)
 
@@ -125,36 +116,6 @@ The provisioner Lambda is a zip deployment with a Lambda layer (paramiko only):
 - **Hostname:** Sets OS hostname via `hostnamectl set-hostname` through sgowner SSH (Vision One uses OS hostname, not clish endpoint name)
 - **Watchdog:** Runs every 15 minutes via EventBridge schedule, checks scanner versions on running instances, re-extracts cert if version changes
 
-## EFS Mount Point Scanning (Large Files)
-
-For files >10MB, the scanner writes to EFS and the SG's File Security mount point scanner handles the scan:
-
-### EFS Setup
-- Encrypted EFS filesystem with elastic throughput
-- Mount targets in both private subnets
-- Access point at `/scan-inbox` with `quarantine` subdirectory
-- Lambda mounts at `/mnt/efs`, SG mounts via NFS4
-
-### Vision One Mount Point Configuration (Manual Step)
-
-| Field | Value |
-|---|---|
-| Protocol | NFS4 |
-| Server IP | Stack output `MountPointServer` (EFS mount target IP) |
-| Server folder path | `/scan-inbox` |
-| Scanning | Enable |
-| Predictive Machine Learning | Enable |
-| Quarantine | Enable |
-| Quarantine destination | `/scan-inbox/quarantine` |
-
-**Note:** Vision One requires an IP address, not a DNS name. The quarantine path must be a full path. No trailing whitespace in the server folder path field (causes validation errors).
-
-### Scan Flow
-1. Lambda streams file from S3 to EFS (no full memory buffering)
-2. SG mount point scanner detects new file, scans with PML
-3. If malicious: scanner moves file to `/scan-inbox/quarantine/`
-4. Lambda polls for file to appear in quarantine or stabilize in place
-5. Routes to clean or quarantine S3 bucket, deletes from EFS
 
 ## Performance (Tested)
 
@@ -262,7 +223,7 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 - **Never store credentials in files** — use Secrets Manager
 - **S3 event notifications encode spaces as `+`** — scanner uses `urllib.parse.unquote_plus()`
 - **gRPC requires `ssl_target_name_override`** — cert CN doesn't match IP
-- **gRPC max file size is ~10MB** — larger files must use EFS mount point scanning
+- **gRPC max file size is ~512MB** — limited by gRPC channel config (nginx body size patched to unlimited by provisioner)
 - **Always use `--disable-rollback`** on stack creation for debuggability
 - **Vision One API is read-only for Service Gateway** — only GET endpoint exists
 - **Always ask before making Vision One API changes** — shared platform

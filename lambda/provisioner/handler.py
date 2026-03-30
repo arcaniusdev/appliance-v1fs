@@ -235,10 +235,11 @@ def _handle_instance_running(event, context):
 
             logger.info("Service Gateway %s registered as %s", instance_id, hostname)
 
-            # Extract CA cert — works before FS install (cert is from the AMI's nginx)
+            # Extract CA cert and patch nginx for large file gRPC scanning
             sgowner = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
             cert_pem = _extract_cert(sgowner)
             version = _get_scanner_version(sgowner)
+            _patch_nginx_body_size(sgowner)
             sgowner.close()
 
             if cert_pem:
@@ -264,6 +265,27 @@ def _handle_instance_running(event, context):
     except Exception as e:
         logger.exception("Provisioning failed for %s: %s", instance_id, e)
         return {"status": "failed", "instance": instance_id, "error": str(e)}
+
+
+def _patch_nginx_body_size(sgowner_client):
+    """Patch the nginx configmap to allow large file gRPC scanning.
+
+    The default proxy-body-size of 10m blocks files >10MB. Setting it to 0
+    removes the limit, allowing gRPC scanning of files up to 512MB.
+    The watchdog re-applies this every 15 minutes in case a scanner pod
+    update reverts the configmap.
+    """
+    cmd = (
+        "sudo microk8s kubectl -n ingress patch configmap "
+        "nginx-load-balancer-microk8s-conf --type merge "
+        "-p '{\"data\":{\"proxy-body-size\":\"0\"}}' 2>&1"
+    )
+    stdin, stdout, stderr = sgowner_client.exec_command(cmd, timeout=15)
+    output = stdout.read().decode().strip()
+    if "patched" in output or "unchanged" in output:
+        logger.info("nginx proxy-body-size patched: %s", output)
+    else:
+        logger.warning("nginx patch may have failed: %s", output)
 
 
 def _wait_for_admin_ready(host, private_key, port=22, max_attempts=12, interval=15):
@@ -340,8 +362,9 @@ def _handle_watchdog(event, context):
                     results.append({"instance": instance_id, "action": "waiting"})
                     continue
 
-                # Get version and cert via sgowner (same tunnel)
+                # Get version, cert, and re-apply nginx patch via sgowner (same tunnel)
                 client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
+                _patch_nginx_body_size(client)
                 current_version = _get_scanner_version(client)
 
                 if current_version != stored:

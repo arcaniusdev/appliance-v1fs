@@ -4,7 +4,6 @@ import os
 import random
 import time
 import urllib.parse
-import uuid
 
 import boto3
 import grpc
@@ -12,15 +11,6 @@ import amaas.grpc
 
 logger = logging.getLogger("scanner")
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
-
-# gRPC file size threshold — files larger than this use EFS mount point scanning
-GRPC_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-
-# EFS mount point scanning
-EFS_MOUNT_PATH = os.environ.get("EFS_MOUNT_PATH", "/mnt/efs")
-EFS_QUARANTINE_DIR = "quarantine"
-EFS_SCAN_POLL_INTERVAL = 2  # seconds between polls
-EFS_SCAN_TIMEOUT = 300  # max seconds to wait for mount point scanner
 
 # Module-level state — persists across warm invocations
 _channels = None
@@ -32,7 +22,6 @@ _s3_client = None
 _ec2_client = None
 _logs_client = None
 _audit_stream_created = False
-_efs_initialized = False
 
 # Channel refresh interval — re-discover SGs periodically
 CHANNEL_REFRESH_SECONDS = 60
@@ -177,142 +166,9 @@ def _mark_channel_failure(idx):
                            idx, _channel_addrs[idx], CB_COOLDOWN_SECONDS)
 
 
-# ── EFS Mount Point Scanning ────────────────────────────────────────
-
-def _ensure_efs_dirs():
-    """Create the quarantine subdirectory on EFS if it doesn't exist."""
-    global _efs_initialized
-    if _efs_initialized:
-        return
-    quarantine_path = os.path.join(EFS_MOUNT_PATH, EFS_QUARANTINE_DIR)
-    os.makedirs(quarantine_path, exist_ok=True)
-    _efs_initialized = True
-
-
-def _scan_via_efs(s3, bucket, key, size, clean_bucket, quarantine_bucket, audit_log_group):
-    """Scan a large file via EFS mount point (NFS scanning by the Service Gateway).
-
-    Flow:
-    1. Download file from S3 to EFS /mnt/efs/{unique_id}_{filename}
-    2. SG's mount point scanner detects the new file and scans it
-    3. If malicious: scanner moves file to /mnt/efs/quarantine/
-    4. If clean: file remains at original path
-    5. Poll until file disappears from original path or appears in quarantine
-    6. Route to appropriate S3 bucket and clean up EFS
-    """
-    _ensure_efs_dirs()
-
-    filename = os.path.basename(key)
-    scan_id = uuid.uuid4().hex[:12]
-    efs_filename = f"{scan_id}_{filename}"
-    efs_path = os.path.join(EFS_MOUNT_PATH, efs_filename)
-    quarantine_path = os.path.join(EFS_MOUNT_PATH, EFS_QUARANTINE_DIR, efs_filename)
-
-    # Download from S3 directly to EFS (streaming, no memory buffering)
-    logger.info("EFS scan: downloading s3://%s/%s to %s", bucket, key, efs_path)
-    scan_start = time.monotonic()
-    try:
-        resp = s3.get_object(Bucket=bucket, Key=key)
-        with open(efs_path, "wb") as f:
-            for chunk in resp["Body"].iter_chunks(chunk_size=1024 * 1024):
-                f.write(chunk)
-    except s3.exceptions.NoSuchKey:
-        logger.warning("s3://%s/%s gone, skipping", bucket, key)
-        return
-    except Exception:
-        # Clean up partial file
-        try:
-            os.unlink(efs_path)
-        except OSError:
-            pass
-        raise
-
-    download_ms = int((time.monotonic() - scan_start) * 1000)
-    logger.info("EFS scan: downloaded %d bytes in %dms, waiting for scanner", size, download_ms)
-
-    # Poll for scan completion
-    # The mount point scanner will either:
-    # - Move the file to quarantine/ (malicious)
-    # - Leave it in place (clean) — we detect this by file mtime stabilizing
-    verdict = None
-    poll_start = time.monotonic()
-
-    while time.monotonic() - poll_start < EFS_SCAN_TIMEOUT:
-        time.sleep(EFS_SCAN_POLL_INTERVAL)
-
-        # Check if file was moved to quarantine
-        if os.path.exists(quarantine_path):
-            verdict = "malicious"
-            logger.warning("EFS scan: MALICIOUS (quarantined) %s", efs_filename)
-            break
-
-        # Check if file still exists at original path
-        if not os.path.exists(efs_path):
-            # File disappeared but not in quarantine — scanner may have moved it elsewhere
-            verdict = "malicious"
-            logger.warning("EFS scan: file disappeared (assumed malicious) %s", efs_filename)
-            break
-
-        # File still at original path — check if scan is complete
-        # The scanner modifies the file's access time during scanning.
-        # If the file hasn't been accessed in the last poll interval, scan is likely done.
-        try:
-            stat = os.stat(efs_path)
-            age_since_modify = time.time() - stat.st_mtime
-            # If file hasn't been modified for 2x poll interval, consider scan complete
-            if age_since_modify > EFS_SCAN_POLL_INTERVAL * 3 and (time.monotonic() - poll_start) > 10:
-                verdict = "clean"
-                logger.info("EFS scan: CLEAN (stable) %s after %.0fs", efs_filename, time.monotonic() - poll_start)
-                break
-        except OSError:
-            pass
-
-    scan_ms = int((time.monotonic() - scan_start) * 1000)
-
-    if verdict is None:
-        logger.error("EFS scan: timeout after %ds for %s", EFS_SCAN_TIMEOUT, efs_filename)
-        verdict = "clean"  # Default to clean on timeout to avoid blocking
-
-    # Route to S3
-    result = {"scanResult": 1 if verdict == "malicious" else 0}
-
-    if verdict == "malicious":
-        tag = "Malware"
-        # Upload from quarantine path (or original if it disappeared)
-        src_path = quarantine_path if os.path.exists(quarantine_path) else None
-        if src_path:
-            with open(src_path, "rb") as f:
-                s3.put_object(Bucket=quarantine_bucket, Key=key, Body=f, Tagging="ScanResult=Malware")
-        else:
-            # File gone entirely — copy from S3 ingest to quarantine via server-side copy
-            s3.copy_object(
-                Bucket=quarantine_bucket, Key=key,
-                CopySource={"Bucket": bucket, "Key": key},
-                Tagging="ScanResult=Malware", TaggingDirective="REPLACE",
-            )
-    else:
-        tag = "Clean"
-        with open(efs_path, "rb") as f:
-            s3.put_object(Bucket=clean_bucket, Key=key, Body=f, Tagging="ScanResult=Clean")
-
-    # Delete from ingest
-    s3.delete_object(Bucket=bucket, Key=key)
-
-    # Clean up EFS
-    for p in [efs_path, quarantine_path]:
-        try:
-            os.unlink(p)
-        except OSError:
-            pass
-
-    _audit(audit_log_group, key, size, verdict, result, scan_ms, "EFS-mount")
-    logger.info("EFS scan: %s %s scan=%dms (download=%dms)", verdict.upper(), key, scan_ms, download_ms)
-
-
 # ── Handler ──────────────────────────────────────────────────────────
 
 def handler(event, context):
-    _ensure_efs_dirs()
     s3 = _get_s3()
     clean_bucket = os.environ["S3_CLEAN_BUCKET"]
     quarantine_bucket = os.environ["S3_QUARANTINE_BUCKET"]
@@ -353,12 +209,6 @@ def _process_record(
     size = s3_data.get("object", {}).get("size", 0)
     logger.info("Processing s3://%s/%s (%d bytes)", bucket, key, size)
 
-    # Large files → EFS mount point scanning (NFS, supports PML, no size limit)
-    if size > GRPC_MAX_FILE_SIZE:
-        _scan_via_efs(s3, bucket, key, size, clean_bucket, quarantine_bucket, audit_log_group)
-        return
-
-    # Small files → gRPC (fast, through nginx ingress)
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
         file_bytes = resp["Body"].read()
