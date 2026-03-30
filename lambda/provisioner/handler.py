@@ -176,7 +176,7 @@ def _handle_instance_running(event, context):
 
         private_key = _get_ssh_key(key_pair_id, region)
 
-        # Register the SG via EICE SSH tunnel
+        # Single EICE tunnel for the entire provisioning flow
         with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
             host = "127.0.0.1"
             port = tunnel.local_port
@@ -200,6 +200,7 @@ def _handle_instance_running(event, context):
                     expect="# ", timeout=30,
                 )
 
+            # Register with Vision One
             output = ""
             for reg_attempt in range(10):
                 logger.info("Registering Service Gateway (attempt %d/10)", reg_attempt + 1)
@@ -219,24 +220,39 @@ def _handle_instance_running(event, context):
             else:
                 raise RuntimeError(f"Register still blocked after 10 attempts: {output[-300:]}")
 
-        # Verify registration
-        banner = ""
-        for verify_attempt in range(5):
-            time.sleep(30)
-            logger.info("Verifying registration via banner (attempt %d/5)", verify_attempt + 1)
-            with EICETunnel(instance_id, endpoint_id, remote_port=22) as vtunnel:
-                with ClishSession("127.0.0.1", "admin", private_key, port=vtunnel.local_port) as session:
+            # Verify registration
+            banner = ""
+            for verify_attempt in range(5):
+                time.sleep(30)
+                logger.info("Verifying registration via banner (attempt %d/5)", verify_attempt + 1)
+                with ClishSession(host, "admin", private_key, port=port) as session:
                     banner = session.connect(timeout=30)
-            if "Status: Registered" in banner:
-                break
+                if "Status: Registered" in banner:
+                    break
 
-        if "Status: Registered" not in banner:
-            raise RuntimeError(f"Registration verification failed after retries. Banner: {banner[-500:]}")
+            if "Status: Registered" not in banner:
+                raise RuntimeError(f"Registration verification failed after retries. Banner: {banner[-500:]}")
 
-        logger.info("Service Gateway %s registered as %s", instance_id, hostname)
+            logger.info("Service Gateway %s registered as %s", instance_id, hostname)
 
-        # Extract CA cert — works before FS install (cert is from the AMI's nginx)
-        _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region)
+            # Extract CA cert — works before FS install (cert is from the AMI's nginx)
+            sgowner = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
+            cert_pem = _extract_cert(sgowner)
+            version = _get_scanner_version(sgowner)
+            sgowner.close()
+
+            if cert_pem:
+                logger.info("CA cert extracted from %s (%d bytes)", instance_id, len(cert_pem))
+                _store_cert(cert_secret_name, cert_pem, region)
+            if version:
+                ssm = boto3.client("ssm", region_name=region)
+                ssm.put_parameter(
+                    Name=f"{VERSION_PARAM_PREFIX}{instance_id}",
+                    Value=version,
+                    Type="String",
+                    Overwrite=True,
+                )
+                logger.info("Scanner version on %s: %s", instance_id, version)
 
         # Mark as provisioned so we don't re-provision on restart
         ec2.create_tags(Resources=[instance_id], Tags=[
@@ -248,36 +264,6 @@ def _handle_instance_running(event, context):
     except Exception as e:
         logger.exception("Provisioning failed for %s: %s", instance_id, e)
         return {"status": "failed", "instance": instance_id, "error": str(e)}
-
-
-def _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region):
-    """Extract CA cert and store it in Secrets Manager."""
-    rsa_key = paramiko.RSAKey.generate(4096)
-    pubkey_b64 = rsa_key.get_base64()
-    for attempt in range(5):
-        try:
-            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-                client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
-                cert_pem = _extract_cert(client)
-                version = _get_scanner_version(client)
-                client.close()
-            if cert_pem:
-                logger.info("CA cert extracted from %s (%d bytes)", instance_id, len(cert_pem))
-                _store_cert(cert_secret_name, cert_pem, region)
-                if version:
-                    ssm = boto3.client("ssm", region_name=region)
-                    ssm.put_parameter(
-                        Name=f"{VERSION_PARAM_PREFIX}{instance_id}",
-                        Value=version,
-                        Type="String",
-                        Overwrite=True,
-                    )
-                    logger.info("Scanner version on %s: %s", instance_id, version)
-                return
-        except Exception:
-            logger.warning("Cert extraction attempt %d failed on %s", attempt + 1, instance_id, exc_info=True)
-        time.sleep(10)
-    logger.error("Failed to extract cert from %s after 5 attempts — watchdog will retry", instance_id)
 
 
 def _wait_for_admin_ready(host, private_key, port=22, max_attempts=12, interval=15):
@@ -333,9 +319,13 @@ def _handle_watchdog(event, context):
             except ssm.exceptions.ParameterNotFound:
                 stored = ""
 
-            # Check if scanner pod is running via admin clish
+            # Single tunnel per SG for all checks
             with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-                with ClishSession("127.0.0.1", "admin", private_key, port=tunnel.local_port) as session:
+                host = "127.0.0.1"
+                port = tunnel.local_port
+
+                # Check if scanner pod is running via admin clish
+                with ClishSession(host, "admin", private_key, port=port) as session:
                     session.connect(timeout=30)
                     session.send_command("enable", expect="# ", timeout=15)
                     plat_output = session.send_command(
@@ -343,15 +333,14 @@ def _handle_watchdog(event, context):
                         expect="# ", timeout=60,
                     )
 
-            scanner_running = "sg-sfs-scanner" in plat_output and "Running" in plat_output
+                scanner_running = "sg-sfs-scanner" in plat_output and "Running" in plat_output
 
-            if not scanner_running:
-                logger.info("Watchdog: %s — scanner pod not running yet", instance_id)
-                results.append({"instance": instance_id, "action": "waiting"})
-                continue
+                if not scanner_running:
+                    logger.info("Watchdog: %s — scanner pod not running yet", instance_id)
+                    results.append({"instance": instance_id, "action": "waiting"})
+                    continue
 
-            # Get version and cert via sgowner
-            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+                # Get version and cert via sgowner (same tunnel)
                 client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
                 current_version = _get_scanner_version(client)
 
@@ -361,14 +350,12 @@ def _handle_watchdog(event, context):
                         instance_id, stored or "(none)", current_version,
                     )
 
-                    # Extract and store CA cert
                     cert_pem = _extract_cert(client)
                     if cert_pem:
                         _store_cert(cert_secret_name, cert_pem, region)
                         cert_updated = True
                         logger.info("Watchdog: CA cert extracted from %s", instance_id)
 
-                    # Update stored version
                     ssm.put_parameter(
                         Name=param_name,
                         Value=current_version,
