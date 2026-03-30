@@ -103,7 +103,7 @@ The scanner Lambda is a **zip deployment with a Lambda layer**, not a container 
 
 ### nginx Body Size Patch
 
-The default nginx configmap has `proxy-body-size: 10m`, blocking gRPC scans >10MB. The provisioner patches this to `0` (unlimited) during initial provisioning, and the watchdog re-applies it every 15 minutes in case a scanner pod update reverts the configmap. This enables gRPC scanning of files up to 512MB (gRPC channel limit).
+The default nginx configmap has `proxy-body-size: 10m`, blocking gRPC scans >10MB. The provisioner patches this to match the `MaxFileSizeMB` parameter (default 500MB) during initial provisioning, and the watchdog re-applies it every 15 minutes in case a scanner pod update reverts the configmap. The same parameter controls the gRPC channel limits in the scanner Lambda.
 
 ## Provisioner Lambda (Zip-Based)
 
@@ -182,6 +182,7 @@ The scanner pod exposes an ICAP service on port 1344 (documented only for the co
 | `ServiceGatewayCount` | 3 | Number of SGs (1-3, always running) |
 | `ServiceGatewayInstanceType` | c5.4xlarge | c5.2xlarge or c5.4xlarge |
 | `ChannelsPerSG` | 1 | gRPC channels per SG (1-8, use 2) |
+| `MaxFileSizeMB` | 500 | Max file size in MB for gRPC scanning (nginx + channel limit) |
 | `PMLEnabled` | true | Predictive Machine Learning for gRPC scans |
 | `SmartFeedbackEnabled` | true | Scan telemetry to TrendAI |
 
@@ -223,7 +224,7 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 - **Never store credentials in files** — use Secrets Manager
 - **S3 event notifications encode spaces as `+`** — scanner uses `urllib.parse.unquote_plus()`
 - **gRPC requires `ssl_target_name_override`** — cert CN doesn't match IP
-- **gRPC max file size is ~512MB** — limited by gRPC channel config (nginx body size patched to unlimited by provisioner)
+- **gRPC max file size is `MaxFileSizeMB`** (default 500MB) — nginx body size and gRPC channel limits set from this parameter
 - **Always use `--disable-rollback`** on stack creation for debuggability
 - **Vision One API is read-only for Service Gateway** — only GET endpoint exists
 - **Always ask before making Vision One API changes** — shared platform

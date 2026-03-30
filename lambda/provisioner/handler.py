@@ -270,15 +270,15 @@ def _handle_instance_running(event, context):
 def _patch_nginx_body_size(sgowner_client):
     """Patch the nginx configmap to allow large file gRPC scanning.
 
-    The default proxy-body-size of 10m blocks files >10MB. Setting it to 0
-    removes the limit, allowing gRPC scanning of files up to 512MB.
-    The watchdog re-applies this every 15 minutes in case a scanner pod
-    update reverts the configmap.
+    The default proxy-body-size of 10m blocks files >10MB. This patches it
+    to match the MaxFileSizeMB template parameter. The watchdog re-applies
+    every 15 minutes in case a scanner pod update reverts the configmap.
     """
+    max_size = os.environ.get("MAX_FILE_SIZE_MB", "500")
     cmd = (
         "sudo microk8s kubectl -n ingress patch configmap "
         "nginx-load-balancer-microk8s-conf --type merge "
-        "-p '{\"data\":{\"proxy-body-size\":\"0\"}}' 2>&1"
+        f"-p '{{\"data\":{{\"proxy-body-size\":\"{max_size}m\"}}}}' 2>&1"
     )
     stdin, stdout, stderr = sgowner_client.exec_command(cmd, timeout=15)
     output = stdout.read().decode().strip()

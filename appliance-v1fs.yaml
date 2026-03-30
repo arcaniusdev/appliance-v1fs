@@ -84,6 +84,12 @@ Parameters:
     Default: 1
     MinValue: 1
     MaxValue: 8
+  MaxFileSizeMB:
+    Description: Maximum file size in MB for gRPC scanning (nginx and gRPC channel limit)
+    Type: Number
+    Default: 500
+    MinValue: 10
+    MaxValue: 2048
 
 Conditions:
   HasAtLeast2SGs: !Not [!Equals [!Ref ServiceGatewayCount, 1]]
@@ -958,6 +964,7 @@ Resources:
           PML_ENABLED: !Ref PMLEnabled
           FEEDBACK_ENABLED: !Ref SmartFeedbackEnabled
           CHANNELS_PER_SG: !Ref ChannelsPerSG
+          MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
           LOG_LEVEL: INFO
 
   ScannerEventSourceMapping:
@@ -1440,6 +1447,7 @@ Resources:
           REGISTRATION_TOKEN_SECRET: appliance-v1fs/sg-registration-token
           AWS_REGION_NAME: !Ref "AWS::Region"
           DEPLOY_BUCKET: !Ref DeployBucket
+          MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
 
   WatchdogSchedule:
     Type: AWS::Events::Rule

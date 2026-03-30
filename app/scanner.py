@@ -97,10 +97,11 @@ def _build_channels():
     composite = grpc.composite_channel_credentials(channel_creds, call_creds)
 
     tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
+    max_file_bytes = int(os.environ.get("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
     options = [
         ("grpc.ssl_target_name_override", tls_override),
-        ("grpc.max_send_message_length", 512 * 1024 * 1024),
-        ("grpc.max_receive_message_length", 512 * 1024 * 1024),
+        ("grpc.max_send_message_length", max_file_bytes),
+        ("grpc.max_receive_message_length", max_file_bytes),
         ("grpc.keepalive_time_ms", 30_000),
         ("grpc.keepalive_timeout_ms", 10_000),
         ("grpc.keepalive_permit_without_calls", 1),
