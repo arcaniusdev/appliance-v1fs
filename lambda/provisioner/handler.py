@@ -130,54 +130,6 @@ def _discover_sg_instances(region):
     ]
 
 
-def _assign_hostname(instance_id, region):
-    """Assign a unique hostname to a new SG using atomic SSM claims."""
-    prefix = os.environ.get("HOSTNAME_PREFIX", "FSVA-AWS")
-    ssm = boto3.client("ssm", region_name=region)
-
-    # Try to atomically claim a hostname number using PutParameter with Overwrite=False
-    for num in range(1, 100):
-        hostname = f"{prefix}-{num:02d}"
-        claim_param = f"/appliance-v1fs/hostname-claim/{num:02d}"
-        try:
-            ssm.put_parameter(
-                Name=claim_param,
-                Value=instance_id,
-                Type="String",
-                Overwrite=False,  # fails if already exists — atomic claim
-            )
-            # Claimed successfully — also store reverse mapping for cleanup
-            ssm.put_parameter(
-                Name=f"/appliance-v1fs/hostname/{instance_id}",
-                Value=hostname,
-                Type="String",
-                Overwrite=True,
-            )
-            logger.info("Assigned hostname %s to %s", hostname, instance_id)
-            return hostname
-        except ssm.exceptions.ParameterAlreadyExists:
-            continue  # number already claimed, try next
-
-    raise RuntimeError("No available hostname numbers (1-99 exhausted)")
-
-
-def _release_hostname(instance_id, region):
-    """Release hostname assignment for a terminated SG."""
-    ssm = boto3.client("ssm", region_name=region)
-    try:
-        resp = ssm.get_parameter(Name=f"/appliance-v1fs/hostname/{instance_id}")
-        hostname = resp["Parameter"]["Value"]
-        # Extract number from hostname (e.g., "FSVA-AWS-01" → "01")
-        num = hostname.rsplit("-", 1)[-1]
-        ssm.delete_parameter(Name=f"/appliance-v1fs/hostname-claim/{num}")
-        ssm.delete_parameter(Name=f"/appliance-v1fs/hostname/{instance_id}")
-        logger.info("Released hostname %s for %s", hostname, instance_id)
-    except ssm.exceptions.ParameterNotFound:
-        logger.debug("No hostname param found for %s", instance_id)
-    except Exception:
-        logger.warning("Failed to release hostname for %s", instance_id, exc_info=True)
-
-
 # ── EC2 State Change → Provision ────────────────────────────────────
 
 def _handle_instance_running(event, context):
@@ -204,16 +156,14 @@ def _handle_instance_running(event, context):
                       instance_id, tag_key, tags.get(tag_key))
         return {"status": "skipped", "reason": "not our instance"}
 
-    # Skip if already provisioned (hostname SSM param exists)
-    ssm = boto3.client("ssm", region_name=region)
-    try:
-        ssm.get_parameter(Name=f"/appliance-v1fs/hostname/{instance_id}")
+    # Skip if already provisioned
+    if tags.get("appliance-v1fs:provisioned") == "true":
         logger.info("Instance %s already provisioned, skipping", instance_id)
         return {"status": "skipped", "reason": "already provisioned"}
-    except ssm.exceptions.ParameterNotFound:
-        pass  # not yet provisioned — continue
 
-    logger.info("Provisioning Service Gateway %s", instance_id)
+    # Hostname comes from the Name tag set by CloudFormation
+    hostname = tags.get("Name", instance_id)
+    logger.info("Provisioning Service Gateway %s as %s", instance_id, hostname)
     endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
     key_pair_id = os.environ.get("KEY_PAIR_ID", "")
     cert_secret_name = os.environ.get("CERT_SECRET_NAME", "appliance-v1fs/sg-ca-cert")
@@ -225,13 +175,6 @@ def _handle_instance_running(event, context):
         token = sm.get_secret_value(SecretId=token_secret)["SecretString"]
 
         private_key = _get_ssh_key(key_pair_id, region)
-        hostname = _assign_hostname(instance_id, region)
-
-        # Tag instance with its Vision One hostname
-        ec2.create_tags(Resources=[instance_id], Tags=[
-            {"Key": "Name", "Value": hostname},
-        ])
-        logger.info("Tagged %s as %s", instance_id, hostname)
 
         # Register the SG via EICE SSH tunnel
         with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
@@ -294,6 +237,11 @@ def _handle_instance_running(event, context):
 
         # Extract CA cert — works before FS install (cert is from the AMI's nginx)
         _extract_and_store_cert(instance_id, endpoint_id, private_key, cert_secret_name, region)
+
+        # Mark as provisioned so we don't re-provision on restart
+        ec2.create_tags(Resources=[instance_id], Tags=[
+            {"Key": "appliance-v1fs:provisioned", "Value": "true"},
+        ])
 
         return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
 

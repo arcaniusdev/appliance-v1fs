@@ -349,8 +349,6 @@ Resources:
         TagSpecifications:
           - ResourceType: instance
             Tags:
-              - Key: Name
-                Value: !Sub ServiceGateway-${AWS::StackName}
               - Key: appliance-v1fs:stack
                 Value: !Ref "AWS::StackName"
 
@@ -365,6 +363,9 @@ Resources:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
       SubnetId: !Ref PrivateSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-01
 
   ServiceGateway2:
     Type: AWS::EC2::Instance
@@ -377,6 +378,9 @@ Resources:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
       SubnetId: !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-02
 
   ServiceGateway3:
     Type: AWS::EC2::Instance
@@ -389,6 +393,9 @@ Resources:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
       SubnetId: !Ref PrivateSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-03
 
   # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
   ProvisionerEventRule:
@@ -1513,7 +1520,6 @@ Resources:
           KEY_PAIR_ID: !GetAtt ServiceGatewayKeyPair.KeyPairId
           CERT_SECRET_NAME: appliance-v1fs/sg-ca-cert
           REGISTRATION_TOKEN_SECRET: appliance-v1fs/sg-registration-token
-          HOSTNAME_PREFIX: !Ref ServiceGatewayHostname
           AWS_REGION_NAME: !Ref "AWS::Region"
           DEPLOY_BUCKET: !Ref DeployBucket
 

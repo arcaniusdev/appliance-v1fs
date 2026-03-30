@@ -46,7 +46,7 @@ SG appliances are plain **EC2 instances** (no ASG, no auto-scaling, no auto-repl
 - **Watchdog** runs every 15 minutes — checks scanner versions, re-extracts cert on version change
 - **No auto-replacement** — if an SG dies, CloudWatch alarm notifies; admin decides what to do
 - **Dynamic Discovery** — scanner Lambda discovers SGs via EC2 tags (`appliance-v1fs:stack`), refreshes every 60 seconds
-- Each SG is assigned a unique hostname (`FSVA-AWS-01`, `-02`, etc.) tracked in SSM parameters
+- Each SG gets a unique hostname from its CloudFormation Name tag (`FSVA-AWS-01`, `-02`, `-03`)
 
 ### Multi-Channel gRPC
 
@@ -274,7 +274,6 @@ The AWS CLI v2 binary **cannot be bundled in a Lambda layer** due to multiple is
 - **CloudWatch Logs throttling** — cache the logs client and create log streams once per execution environment, not per scan
 - **Census (`TM_AM_CENSUS`) is file prevalence tracking, not Predictive Machine Learning**
 - **SQS API attribute is `ApproximateNumberOfMessages`** — not `ApproximateNumberOfMessagesVisible` (that's the CloudWatch metric name, different from the API attribute)
-- **SSM hostname claims persist across stack deletions** — `/appliance-v1fs/hostname-claim/*` and `/appliance-v1fs/hostname/*` must be cleaned up during teardown or hostnames will increment across stacks
 - **VPC-attached Lambda ENI cleanup takes 15-20 minutes** — this is the main bottleneck during stack deletion. The scanner Lambda's ENIs in the VPC take AWS a long time to release
 - **Deploy bucket is deleted during teardown** — must recreate `appliance-v1fs-deploy-886436954261` before next deploy
 - **File Security install requires running instances** — install FS after stack creation while SGs are running
