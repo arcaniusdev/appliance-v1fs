@@ -3,3 +3,4 @@ CLAUDE.md
 sp-api-open-*.json
 docs/
 .DS_Store
+*.pyc

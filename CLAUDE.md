@@ -11,7 +11,7 @@ Trend Micro has rebranded to **TrendAI**. Always use "TrendAI" in user-facing te
 ## Architecture
 
 ```
-S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gateway ASG → Clean or Quarantine Bucket
+S3 (Ingest) → SQS Queue → Lambda Scanner → gRPC/TLS:443 → Service Gateway EC2 → Clean or Quarantine Bucket
                  │                └→ (>10MB) → EFS → SG NFS Mount Point Scanner → Clean or Quarantine
                  └→ DLQ (after 5 failures) → Remediation Lambda (backoff → retry/discard)
 ```
@@ -84,7 +84,7 @@ project/
 └── lambda/
     └── provisioner/
         ├── requirements.txt         # paramiko (AWS CLI v2 downloaded from S3 at runtime)
-        ├── handler.py               # ASG lifecycle + watchdog handler
+        ├── handler.py               # EC2 provisioner + watchdog handler
         ├── ssh_helper.py            # Paramiko-based clish SSH interaction
         ├── eice_tunnel.py           # EICE tunnel management for SSH
         └── cfn_response.py          # CloudFormation response helper

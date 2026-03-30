@@ -304,7 +304,7 @@ def _handle_watchdog(event, context):
 
     Invoked by EventBridge on a schedule.
     """
-    region = event.get("region", os.environ.get("AWS_REGION", "us-east-1"))
+    region = event.get("region", os.environ.get("AWS_REGION_NAME", "us-east-1"))
     sg_instances = _discover_sg_instances(region)
     endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
     key_pair_id = os.environ.get("KEY_PAIR_ID", "")

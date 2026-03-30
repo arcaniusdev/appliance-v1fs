@@ -333,7 +333,7 @@ Resources:
         - Key: Name
           Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
 
-  # ── Service Gateway Auto Scaling ──────────────────────────────────
+  # ── Service Gateway ──────────────────────────────────────────────
   ServiceGatewayLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -1474,9 +1474,6 @@ Resources:
                   - secretsmanager:PutSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
               - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
-              - Effect: Allow
                 Action:
                   - ec2-instance-connect:OpenTunnel
                   - ec2:DescribeInstances
@@ -1487,8 +1484,6 @@ Resources:
                 Action:
                   - ssm:PutParameter
                   - ssm:GetParameter
-                  - ssm:GetParametersByPath
-                  - ssm:DeleteParameter
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue

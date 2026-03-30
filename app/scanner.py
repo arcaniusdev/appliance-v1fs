@@ -34,7 +34,7 @@ _logs_client = None
 _audit_stream_created = False
 _efs_initialized = False
 
-# Channel refresh interval — re-discover SGs periodically to pick up ASG changes
+# Channel refresh interval — re-discover SGs periodically
 CHANNEL_REFRESH_SECONDS = 60
 
 # Circuit breaker settings
@@ -64,7 +64,7 @@ def _get_logs():
 
 
 def _discover_sg_addresses():
-    """Discover running Service Gateway IPs via EC2 tags (ASG-managed)."""
+    """Discover running Service Gateway IPs via EC2 tags."""
     tag_spec = os.environ.get("SG_DISCOVERY_TAG", "")
     if not tag_spec:
         raise RuntimeError("SG_DISCOVERY_TAG not set")
