@@ -90,6 +90,15 @@ Parameters:
     Default: 500
     MinValue: 10
     MaxValue: 2048
+  OrgId:
+    Description: AWS Organization ID — enables cross-account scanning for org members (leave empty for single-account)
+    Type: String
+    Default: ""
+  RescanAfterDays:
+    Description: Re-scan files whose last scan is older than this many days
+    Type: Number
+    Default: 30
+    MinValue: 1
 
 Conditions:
   HasAtLeast2SGs: !Not [!Equals [!Ref ServiceGatewayCount, 1]]
@@ -599,6 +608,15 @@ Resources:
         - Key: Name
           Value: !Sub IngestBucket-${AWS::StackName}
 
+  QuarantineBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub QuarantineBucket-${AWS::StackName}
+
   # ── EventBridge Fan-In (S3 Object Created → SQS) ──────────────────
   ScanEventRule:
     Type: AWS::Events::Rule
@@ -758,10 +776,10 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: s3:ListBucket
-                Resource: "arn:aws:s3:::*"
-              - Effect: Allow
-                Action: s3:GetBucketNotificationConfiguration
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketNotificationConfiguration
+                  - s3:GetObjectTagging
                 Resource: "arn:aws:s3:::*"
               - Effect: Allow
                 Action: sqs:SendMessage
@@ -772,6 +790,9 @@ Resources:
                   - ssm:PutParameter
                   - ssm:DeleteParameter
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/appliance-v1fs-scanner-access"
 
   ReconciliationLambda:
     Type: AWS::Lambda::Function
@@ -780,89 +801,134 @@ Resources:
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt ReconciliationRole.Arn
-      Timeout: 300
+      Timeout: 900
       Environment:
         Variables:
           QUEUE_URL: !Ref ScanQueue
-          AGE_THRESHOLD_SECONDS: "1800"
+          RESCAN_AFTER_DAYS: !Ref RescanAfterDays
+          SCANNER_ACCOUNT_ID: !Ref "AWS::AccountId"
+          CROSS_ACCOUNT_BUCKETS_PARAM: /appliance-v1fs/cross-account-buckets
       Code:
         ZipFile: |
-          import boto3, json, os, time, logging
+          import boto3, json, os, logging
+          from datetime import datetime, timezone, timedelta
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
           s3 = boto3.client("s3")
           sqs = boto3.client("sqs")
           ssm = boto3.client("ssm")
+          sts = boto3.client("sts")
           QUEUE_URL = os.environ["QUEUE_URL"]
-          AGE_THRESHOLD = int(os.environ["AGE_THRESHOLD_SECONDS"])
-          PARAM_NAME = "/appliance-v1fs/enrolled-buckets"
+          RESCAN_DAYS = int(os.environ["RESCAN_AFTER_DAYS"])
+          SCANNER_ACCOUNT = os.environ["SCANNER_ACCOUNT_ID"]
+          XACCT_PARAM = os.environ["CROSS_ACCOUNT_BUCKETS_PARAM"]
+          ENROLLED_PARAM = "/appliance-v1fs/enrolled-buckets"
+          BACKFILLED_PARAM = "/appliance-v1fs/backfilled-buckets"
+
+          def _get_ssm_json(name, default):
+              try:
+                  return json.loads(ssm.get_parameter(Name=name)["Parameter"]["Value"])
+              except (ssm.exceptions.ParameterNotFound, json.JSONDecodeError):
+                  return default
+
+          def _get_ssm_csv(name):
+              try:
+                  return set(ssm.get_parameter(Name=name)["Parameter"]["Value"].split(","))
+              except ssm.exceptions.ParameterNotFound:
+                  return set()
+
+          def _assume_role(account_id):
+              role = f"arn:aws:iam::{account_id}:role/appliance-v1fs-scanner-access"
+              creds = sts.assume_role(RoleArn=role, RoleSessionName="reconciliation")["Credentials"]
+              return boto3.client("s3",
+                  aws_access_key_id=creds["AccessKeyId"],
+                  aws_secret_access_key=creds["SecretAccessKey"],
+                  aws_session_token=creds["SessionToken"])
+
+          def _queue(bucket, key, size, account):
+              body = {"source": "aws.s3", "detail-type": "Object Created", "account": account,
+                      "detail": {"bucket": {"name": bucket}, "object": {"key": key, "size": size}}}
+              sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(body))
+
+          def _scan_bucket(s3c, bucket, account, is_new, cutoff):
+              queued = 0
+              paginator = s3c.get_paginator("list_objects_v2")
+              for page in paginator.paginate(Bucket=bucket):
+                  for obj in page.get("Contents", []):
+                      if not is_new and obj["LastModified"].replace(tzinfo=timezone.utc) > cutoff:
+                          continue
+                      try:
+                          resp = s3c.get_object_tagging(Bucket=bucket, Key=obj["Key"])
+                          tags = {t["Key"]: t["Value"] for t in resp.get("TagSet", [])}
+                      except Exception:
+                          tags = {}
+                      needs_scan = False
+                      if "ScanResult" not in tags:
+                          needs_scan = True
+                      elif "ScanTimestamp" in tags:
+                          try:
+                              ts = datetime.fromisoformat(tags["ScanTimestamp"])
+                              if ts < cutoff:
+                                  needs_scan = True
+                          except (ValueError, TypeError):
+                              needs_scan = True
+                      if needs_scan:
+                          _queue(bucket, obj["Key"], obj.get("Size", 0), account)
+                          queued += 1
+              return queued
 
           def handler(event, context):
-              # Read registered buckets from SSM
-              try:
-                  resp = ssm.get_parameter(Name=PARAM_NAME)
-                  registered = set(resp["Parameter"]["Value"].split(","))
-              except ssm.exceptions.ParameterNotFound:
-                  logger.info("Reconciliation: no enrolled buckets registered")
-                  return {"requeued": 0, "buckets": 0}
+              cutoff = datetime.now(timezone.utc) - timedelta(days=RESCAN_DAYS)
+              backfilled = set(_get_ssm_json(BACKFILLED_PARAM, []))
+              total = 0
 
-              # Validate each bucket — prune any that no longer have EventBridge enabled
-              active = set()
-              for bucket in registered:
+              # Same-account buckets
+              enrolled = _get_ssm_csv(ENROLLED_PARAM)
+              for bucket in enrolled:
+                  key = f"{SCANNER_ACCOUNT}:{bucket}"
+                  is_new = key not in backfilled
                   try:
-                      config = s3.get_bucket_notification_configuration(Bucket=bucket)
-                      if config.get("EventBridgeConfiguration") is not None:
-                          active.add(bucket)
-                      else:
-                          logger.info("Reconciliation: %s no longer has EventBridge, removing", bucket)
+                      q = _scan_bucket(s3, bucket, SCANNER_ACCOUNT, is_new, cutoff)
+                      total += q
+                      if is_new:
+                          backfilled.add(key)
+                      logger.info("Reconciliation: %s queued=%d new=%s", bucket, q, is_new)
                   except Exception:
-                      logger.info("Reconciliation: %s inaccessible, removing", bucket)
+                      logger.warning("Reconciliation: failed %s", bucket, exc_info=True)
 
-              # Update SSM if any buckets were pruned
-              if active != registered:
-                  if active:
-                      ssm.put_parameter(Name=PARAM_NAME, Value=",".join(sorted(active)),
-                                        Type="String", Overwrite=True)
-                  else:
-                      ssm.delete_parameter(Name=PARAM_NAME)
-                  logger.info("Reconciliation: pruned %d stale buckets", len(registered - active))
-
-              # Check each active bucket for orphans
-              now = time.time()
-              total_requeued = 0
-              for bucket in active:
-                  requeued = 0
+              # Cross-account buckets
+              xacct = _get_ssm_json(XACCT_PARAM, {})
+              for account_id, buckets in xacct.items():
                   try:
-                      paginator = s3.get_paginator("list_objects_v2")
-                      for page in paginator.paginate(Bucket=bucket):
-                          for obj in page.get("Contents", []):
-                              age = now - obj["LastModified"].timestamp()
-                              if age > AGE_THRESHOLD:
-                                  event_body = {
-                                      "source": "aws.s3",
-                                      "detail-type": "Object Created",
-                                      "detail": {
-                                          "bucket": {"name": bucket},
-                                          "object": {"key": obj["Key"], "size": obj["Size"]}
-                                      }
-                                  }
-                                  sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(event_body))
-                                  requeued += 1
+                      xacct_s3 = _assume_role(account_id)
                   except Exception:
-                      logger.warning("Reconciliation: failed listing %s", bucket, exc_info=True)
-                  if requeued:
-                      logger.info("Reconciliation: re-queued %d orphans from %s", requeued, bucket)
-                  total_requeued += requeued
-              logger.info("Reconciliation: %d total orphans across %d buckets", total_requeued, len(active))
-              return {"requeued": total_requeued, "buckets": len(active)}
+                      logger.warning("Reconciliation: failed assuming role for %s", account_id, exc_info=True)
+                      continue
+                  for bucket in buckets:
+                      key = f"{account_id}:{bucket}"
+                      is_new = key not in backfilled
+                      try:
+                          q = _scan_bucket(xacct_s3, bucket, account_id, is_new, cutoff)
+                          total += q
+                          if is_new:
+                              backfilled.add(key)
+                          logger.info("Reconciliation: %s:%s queued=%d new=%s", account_id, bucket, q, is_new)
+                      except Exception:
+                          logger.warning("Reconciliation: failed %s:%s", account_id, bucket, exc_info=True)
+
+              # Persist backfilled set
+              ssm.put_parameter(Name=BACKFILLED_PARAM, Value=json.dumps(sorted(backfilled)),
+                                Type="String", Overwrite=True)
+              logger.info("Reconciliation: total queued=%d", total)
+              return {"queued": total}
 
   ReconciliationSchedule:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub reconciliation-${AWS::StackName}
-      Description: Re-queue orphaned files in the ingest bucket every 5 minutes
-      ScheduleExpression: rate(5 minutes)
+      Description: Backfill unscanned files and re-scan stale files across all enrolled buckets
+      ScheduleExpression: "rate(1 day)"
       State: ENABLED
       Targets:
         - Arn: !GetAtt ReconciliationLambda.Arn
@@ -875,6 +941,207 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt ReconciliationSchedule.Arn
+
+  # ── Cross-Account EventBridge Bus Policy ────────────────────────────
+  OrgBusPolicyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrgBusPolicyPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: organizations:DescribeOrganization
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - events:PutPermission
+                  - events:RemovePermission
+                  - events:DescribeEventBus
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+
+  OrgBusPolicyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub org-bus-policy-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt OrgBusPolicyRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3, json, logging
+          from urllib.request import urlopen, Request
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          events = boto3.client("events")
+          SID = "AllowOrgAccounts"
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      try:
+                          events.remove_permission(EventBusName="default", StatementId=SID)
+                          logger.info("Removed org bus policy")
+                      except Exception:
+                          pass
+                      _respond(event, context, "SUCCESS", {"OrgId": ""})
+                      return
+                  override = event["ResourceProperties"].get("OrgIdOverride", "")
+                  org_id = override
+                  if not org_id:
+                      try:
+                          org = boto3.client("organizations").describe_organization()
+                          org_id = org["Organization"]["Id"]
+                          logger.info("Discovered OrgId: %s", org_id)
+                      except Exception:
+                          logger.info("Account is not in an organization")
+                  if org_id:
+                      events.put_permission(
+                          EventBusName="default", Action="events:PutEvents",
+                          Principal="*", StatementId=SID,
+                          Condition={"Type": "StringEquals", "Key": "aws:PrincipalOrgID", "Value": org_id},
+                      )
+                      logger.info("Set org bus policy for %s", org_id)
+                  else:
+                      try:
+                          events.remove_permission(EventBusName="default", StatementId=SID)
+                      except Exception:
+                          pass
+                      logger.info("No org — bus policy not set")
+                  _respond(event, context, "SUCCESS", {"OrgId": org_id})
+              except Exception as e:
+                  logger.exception("OrgBusPolicy failed")
+                  _respond(event, context, "FAILED", reason=str(e))
+
+          def _respond(event, context, status, data=None, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+              req = Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("Content-Type", "")
+              req.add_header("Content-Length", str(len(body)))
+              urlopen(req)
+
+  OrgBusPolicyResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt OrgBusPolicyLambda.Arn
+      OrgIdOverride: !Ref OrgId
+
+  # ── Pre-Populated Enrollment Template ──────────────────────────────
+  EnrollmentTemplateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EnrollmentTemplatePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}"
+
+  EnrollmentTemplateLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: CodeBuild
+    Properties:
+      FunctionName: !Sub enrollment-template-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt EnrollmentTemplateRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, logging
+          from urllib.request import urlopen, Request
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3 = boto3.client("s3")
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      _respond(event, context, "SUCCESS")
+                      return
+                  props = event["ResourceProperties"]
+                  bucket = props["DeployBucket"]
+                  account_id = props["ScannerAccountId"]
+                  role_arn = props["ScannerLambdaRoleArn"]
+                  # Read raw enrollment template
+                  resp = s3.get_object(Bucket=bucket, Key="enrollment.yaml")
+                  template = resp["Body"].read().decode("utf-8")
+                  # Replace parameter defaults with actual values
+                  template = template.replace(
+                      'AllowedPattern: "[0-9]{12}"',
+                      f'AllowedPattern: "[0-9]{{12}}"\n    Default: "{account_id}"',
+                  )
+                  template = template.replace(
+                      "  ScannerLambdaRoleArn:\n    Description: ARN of the scanner Lambda execution role (from scanner stack outputs)\n    Type: String",
+                      f"  ScannerLambdaRoleArn:\n    Description: ARN of the scanner Lambda execution role (from scanner stack outputs)\n    Type: String\n    Default: \"{role_arn}\"",
+                  )
+                  # Upload pre-populated version
+                  s3.put_object(Bucket=bucket, Key="enrollment-prepopulated.yaml",
+                                Body=template.encode("utf-8"), ContentType="text/yaml")
+                  logger.info("Uploaded pre-populated enrollment template to s3://%s/enrollment-prepopulated.yaml", bucket)
+                  _respond(event, context, "SUCCESS", {"TemplateURL": f"https://s3.amazonaws.com/{bucket}/enrollment-prepopulated.yaml"})
+              except Exception as e:
+                  logger.exception("Failed to generate enrollment template")
+                  _respond(event, context, "FAILED", reason=str(e))
+
+          def _respond(event, context, status, data=None, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+              req = Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("Content-Type", "")
+              req.add_header("Content-Length", str(len(body)))
+              urlopen(req)
+
+  EnrollmentTemplateResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: CodeBuild
+    Properties:
+      ServiceToken: !GetAtt EnrollmentTemplateLambda.Arn
+      DeployBucket: !Ref DeployBucket
+      ScannerAccountId: !Ref "AWS::AccountId"
+      ScannerLambdaRoleArn: !GetAtt ScannerLambdaRole.Arn
 
   # ── CloudWatch Audit Log ───────────────────────────────────────────
   AuditLogGroup:
@@ -931,8 +1198,8 @@ Resources:
                   - s3:ListBucket
                 Resource: "arn:aws:s3:::*"
               - Effect: Allow
-                Action: s3:CreateBucket
-                Resource: "arn:aws:s3:::*"
+                Action: sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/appliance-v1fs-scanner-access"
               - Effect: Allow
                 Action:
                   - ssm:GetParameter
@@ -1006,6 +1273,9 @@ Resources:
           FEEDBACK_ENABLED: !Ref SmartFeedbackEnabled
           CHANNELS_PER_SG: !Ref ChannelsPerSG
           MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
+          SCANNER_ACCOUNT_ID: !Ref "AWS::AccountId"
+          QUARANTINE_BUCKET: !Ref QuarantineBucket
+          CUSTOMER_LOG_GROUP: v1fs-scan-audit
           LOG_LEVEL: INFO
 
   ScannerEventSourceMapping:
@@ -1403,13 +1673,38 @@ Resources:
             {
               "type": "text",
               "x": 0, "y": 53, "width": 24, "height": 1,
+              "properties": { "markdown": "## Cross-Account" }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 54, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | stats count(*) as scans by sourceAccount | sort scans desc",
+                "region": "${AWS::Region}",
+                "title": "Scans by Source Account",
+                "view": "bar"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12, "y": 54, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | filter verdict = 'malicious' | stats count(*) as detections by sourceAccount | sort detections desc",
+                "region": "${AWS::Region}",
+                "title": "Detections by Source Account",
+                "view": "bar"
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 60, "width": 24, "height": 1,
               "properties": { "markdown": "## Recent Scans" }
             },
             {
               "type": "log",
-              "x": 0, "y": 54, "width": 24, "height": 6,
+              "x": 0, "y": 61, "width": 24, "height": 6,
               "properties": {
-                "query": "SOURCE 'scan-audit-${AWS::StackName}' | fields @timestamp, file, verdict, malware.0 as malware_name, scanDurationMs as duration_ms, size, sha256, serviceGateway | sort @timestamp desc | limit 100",
+                "query": "SOURCE 'scan-audit-${AWS::StackName}' | fields @timestamp, sourceAccount, bucket, file, verdict, malware.0 as malware_name, scanDurationMs as duration_ms, size, sha256, serviceGateway | sort @timestamp desc | limit 100",
                 "region": "${AWS::Region}",
                 "title": "Latest Scan Results",
                 "view": "table"
@@ -1448,6 +1743,7 @@ Resources:
                 Action:
                   - ec2-instance-connect:OpenTunnel
                   - ec2:DescribeInstances
+                  - ec2:DescribeInstanceConnectEndpoints
                   - ec2:CreateTags
                 Resource: "*"
               - Effect: Allow
@@ -1573,3 +1869,15 @@ Outputs:
   AuditLogGroupName:
     Description: CloudWatch log group for scan audit trail
     Value: !Ref AuditLogGroup
+  QuarantineBucketName:
+    Description: Central quarantine bucket for malicious files
+    Value: !Ref QuarantineBucket
+  ScannerLambdaRoleArn:
+    Description: Scanner Lambda execution role ARN (for enrollment template trust policy)
+    Value: !GetAtt ScannerLambdaRole.Arn
+  ScannerAccountId:
+    Description: Scanner account ID (for enrollment template parameter)
+    Value: !Ref "AWS::AccountId"
+  EnrollmentTemplateURL:
+    Description: Pre-populated enrollment template — download and deploy in customer accounts
+    Value: !GetAtt EnrollmentTemplateResource.TemplateURL

@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: TrendAI File Scanner - Cross-Account Enrollment
+
+Parameters:
+  ScannerAccountId:
+    Description: AWS account ID where the scanner appliance runs
+    Type: String
+    AllowedPattern: "[0-9]{12}"
+  ScannerLambdaRoleArn:
+    Description: ARN of the scanner Lambda execution role (from scanner stack outputs)
+    Type: String
+  ScanTagKey:
+    Description: S3 bucket tag key that triggers scanning enrollment
+    Type: String
+    Default: "v1fs:scan"
+
+Resources:
+  # ── Cross-Account IAM Role for Scanner Lambda ─────────────────────
+  ScannerAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: appliance-v1fs-scanner-access
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref ScannerLambdaRoleArn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ScanAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:PutObjectTagging
+                  - s3:GetObjectTagging
+                  - s3:ListBucket
+                Resource: "arn:aws:s3:::*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ScanAuditLogGroup.Arn
+
+  # ── EventBridge Forwarding to Scanner Account ─────────────────────
+  EventBridgeForwardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEventsToScannerAccount
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${ScannerAccountId}:event-bus/default"
+
+  ForwardScanEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub forward-to-scanner-${AWS::StackName}
+      Description: Forward S3 Object Created events to the scanner account for scanning
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "Object Created"
+      State: ENABLED
+      Targets:
+        - Arn: !Sub "arn:aws:events:${AWS::Region}:${ScannerAccountId}:event-bus/default"
+          Id: ScannerAccountBus
+          RoleArn: !GetAtt EventBridgeForwardRole.Arn
+
+  # ── Tag Watcher Lambda ────────────────────────────────────────────
+  TagWatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TagWatcherPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketNotificationConfiguration
+                  - s3:PutBucketNotificationConfiguration
+                  - s3:GetBucketTagging
+                Resource: "arn:aws:s3:::*"
+
+  TagWatcherLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub tag-watcher-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TagWatcherRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SCAN_TAG_KEY: !Ref ScanTagKey
+      Code:
+        ZipFile: |
+          import boto3, os, logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3 = boto3.client("s3")
+          TAG_KEY = os.environ["SCAN_TAG_KEY"]
+
+          def handler(event, context):
+              detail = event.get("detail", {})
+              params = detail.get("requestParameters", {})
+              bucket = params.get("bucketName")
+              if not bucket:
+                  return
+              # Check current tags on the bucket
+              try:
+                  resp = s3.get_bucket_tagging(Bucket=bucket)
+                  tags = {t["Key"]: t["Value"] for t in resp.get("TagSet", [])}
+              except s3.exceptions.ClientError:
+                  tags = {}
+              scan_enabled = tags.get(TAG_KEY, "").lower() == "true"
+              # Get current notification config
+              config = s3.get_bucket_notification_configuration(Bucket=bucket)
+              config.pop("ResponseMetadata", None)
+              has_eb = "EventBridgeConfiguration" in config
+              if scan_enabled and not has_eb:
+                  config["EventBridgeConfiguration"] = {}
+                  s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=config)
+                  logger.info("Enabled EventBridge on bucket %s", bucket)
+              elif not scan_enabled and has_eb:
+                  config.pop("EventBridgeConfiguration", None)
+                  s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=config)
+                  logger.info("Disabled EventBridge on bucket %s", bucket)
+
+  TagWatcherEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub tag-watcher-${AWS::StackName}
+      Description: Trigger tag watcher when S3 bucket tags change
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventName:
+            - PutBucketTagging
+            - DeleteBucketTagging
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TagWatcherLambda.Arn
+          Id: TagWatcherTarget
+
+  TagWatcherPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TagWatcherLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TagWatcherEventRule.Arn
+
+  # ── Audit Log Group & Dashboard ───────────────────────────────────
+  ScanAuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: v1fs-scan-audit
+      RetentionInDays: 90
+
+  CustomerDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub v1fs-scan-dashboard-${AWS::StackName}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": { "markdown": "# TrendAI File Scanner — Scan Dashboard" }
+            },
+            {
+              "type": "log", "x": 0, "y": 1, "width": 5, "height": 4,
+              "properties": {
+                "title": "Scans (1h)",
+                "query": "SOURCE 'v1fs-scan-audit' | stats count(*) as scans",
+                "region": "${AWS::Region}", "view": "singleValue", "period": 3600
+              }
+            },
+            {
+              "type": "log", "x": 5, "y": 1, "width": 5, "height": 4,
+              "properties": {
+                "title": "Scans (24h)",
+                "query": "SOURCE 'v1fs-scan-audit' | stats count(*) as scans",
+                "region": "${AWS::Region}", "view": "singleValue", "period": 86400
+              }
+            },
+            {
+              "type": "log", "x": 10, "y": 1, "width": 5, "height": 4,
+              "properties": {
+                "title": "Scans (7d)",
+                "query": "SOURCE 'v1fs-scan-audit' | stats count(*) as scans",
+                "region": "${AWS::Region}", "view": "singleValue", "period": 604800
+              }
+            },
+            {
+              "type": "log", "x": 15, "y": 1, "width": 5, "height": 4,
+              "properties": {
+                "title": "Detections (30d)",
+                "query": "SOURCE 'v1fs-scan-audit' | filter verdict = 'malicious' | stats count(*) as detections",
+                "region": "${AWS::Region}", "view": "singleValue", "period": 2592000
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 5, "width": 12, "height": 6,
+              "properties": {
+                "title": "Scan Rate (scans/min)",
+                "query": "SOURCE 'v1fs-scan-audit' | stats count(*) as scans by bin(1m)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 5, "width": 12, "height": 6,
+              "properties": {
+                "title": "Verdict Breakdown",
+                "query": "SOURCE 'v1fs-scan-audit' | stats count(*) as total by verdict",
+                "region": "${AWS::Region}", "view": "pie"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 11, "width": 12, "height": 6,
+              "properties": {
+                "title": "Malicious Detections Over Time",
+                "query": "SOURCE 'v1fs-scan-audit' | filter verdict = 'malicious' | stats count(*) as detections by bin(5m)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 11, "width": 12, "height": 6,
+              "properties": {
+                "title": "Top Malware (25)",
+                "query": "SOURCE 'v1fs-scan-audit' | filter verdict = 'malicious' | stats count(*) as detections by malware.0 as malware_name | sort detections desc | limit 25",
+                "region": "${AWS::Region}", "view": "table"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 17, "width": 12, "height": 6,
+              "properties": {
+                "title": "Scan Duration (ms)",
+                "query": "SOURCE 'v1fs-scan-audit' | filter scanDurationMs > 0 | stats avg(scanDurationMs) as avg_ms, pct(scanDurationMs, 50) as p50, pct(scanDurationMs, 90) as p90, pct(scanDurationMs, 99) as p99 by bin(5m)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 17, "width": 12, "height": 6,
+              "properties": {
+                "title": "File Size (KB)",
+                "query": "SOURCE 'v1fs-scan-audit' | stats avg(size)/1024 as avg_kb, pct(size, 90)/1024 as p90_kb, max(size)/1024 as max_kb by bin(5m)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 23, "width": 12, "height": 6,
+              "properties": {
+                "title": "Scans by Service Gateway",
+                "query": "SOURCE 'v1fs-scan-audit' | stats count(*) as scans by serviceGateway | sort scans desc",
+                "region": "${AWS::Region}", "view": "bar"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 23, "width": 12, "height": 6,
+              "properties": {
+                "title": "Scans by Bucket",
+                "query": "SOURCE 'v1fs-scan-audit' | stats count(*) as scans by bucket | sort scans desc",
+                "region": "${AWS::Region}", "view": "bar"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 29, "width": 24, "height": 6,
+              "properties": {
+                "title": "Recent Detections",
+                "query": "SOURCE 'v1fs-scan-audit' | filter verdict = 'malicious' | fields @timestamp, file, bucket, malware.0 as malware_name, scanDurationMs as duration_ms, size, sha256 | sort @timestamp desc | limit 100",
+                "region": "${AWS::Region}", "view": "table"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 35, "width": 24, "height": 6,
+              "properties": {
+                "title": "Recent Scans",
+                "query": "SOURCE 'v1fs-scan-audit' | fields @timestamp, file, bucket, verdict, malware.0 as malware_name, scanDurationMs as duration_ms, size | sort @timestamp desc | limit 100",
+                "region": "${AWS::Region}", "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ScannerAccessRoleArn:
+    Description: Cross-account role ARN assumed by the scanner Lambda
+    Value: !GetAtt ScannerAccessRole.Arn
+  EnrolledAccountId:
+    Description: This account's ID
+    Value: !Ref "AWS::AccountId"
+  ScanTagKey:
+    Description: Tag S3 buckets with this key set to 'true' to enable scanning
+    Value: !Ref ScanTagKey
+  DashboardURL:
+    Description: CloudWatch dashboard for scan results
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/v1fs-scan-dashboard-${AWS::StackName}"

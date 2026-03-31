@@ -35,3 +35,6 @@ phases:
       # ── Provisioner Lambda code ───────────────────────────────────
       - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py ssh_helper.py eice_tunnel.py
       - aws s3 cp /tmp/provisioner-code.zip s3://$DEPLOY_BUCKET/provisioner-code.zip
+
+      # ── Enrollment template (raw, pre-populated by custom resource after stack creation)
+      - aws s3 cp $CODEBUILD_SRC_DIR/enrollment.yaml s3://$DEPLOY_BUCKET/enrollment.yaml

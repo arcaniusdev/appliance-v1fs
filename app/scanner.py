@@ -3,6 +3,8 @@ import logging
 import os
 import random
 import time
+from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import boto3
 import grpc
@@ -21,13 +23,23 @@ _s3_client = None
 _ec2_client = None
 _ssm_client = None
 _logs_client = None
+_sts_client = None
 _audit_stream_created = False
-_known_buckets = {}  # Cache: bucket_name → monotonic timestamp of last verification
 _registered_sources = set()  # Source buckets we've already registered in SSM
-BUCKET_CACHE_TTL = 300  # Re-verify bucket existence every 5 minutes
 
-# SSM parameter for enrolled bucket registry
+# Cross-account support
+SCANNER_ACCOUNT_ID = os.environ.get("SCANNER_ACCOUNT_ID", "")
+QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
+CUSTOMER_LOG_GROUP = os.environ.get("CUSTOMER_LOG_GROUP", "v1fs-scan-audit")
+CROSS_ACCOUNT_ROLE_NAME = "appliance-v1fs-scanner-access"
+_cross_account_creds = {}  # Cache: account_id → (creds_dict, expiry_monotonic)
+_cross_account_s3_clients = {}  # Cache: account_id → s3_client
+_cross_account_logs_clients = {}  # Cache: account_id → logs_client
+_registered_cross_account = set()  # Cross-account buckets already registered in SSM
+
+# SSM parameters
 ENROLLED_BUCKETS_PARAM = "/appliance-v1fs/enrolled-buckets"
+CROSS_ACCOUNT_BUCKETS_PARAM = "/appliance-v1fs/cross-account-buckets"
 
 # Channel refresh interval — re-discover SGs periodically
 CHANNEL_REFRESH_SECONDS = 60
@@ -63,6 +75,57 @@ def _get_logs():
     if _logs_client is None:
         _logs_client = boto3.client("logs")
     return _logs_client
+
+
+def _get_sts():
+    global _sts_client
+    if _sts_client is None:
+        _sts_client = boto3.client("sts")
+    return _sts_client
+
+
+def _get_cross_account_creds(account_id):
+    """Assume cross-account role and cache temporary credentials."""
+    now = time.monotonic()
+    if account_id in _cross_account_creds:
+        creds, expiry = _cross_account_creds[account_id]
+        if now < expiry:
+            return creds
+
+    role_arn = f"arn:aws:iam::{account_id}:role/{CROSS_ACCOUNT_ROLE_NAME}"
+    resp = _get_sts().assume_role(
+        RoleArn=role_arn,
+        RoleSessionName=f"scanner-{account_id}",
+        DurationSeconds=3600,
+    )
+    creds = {
+        "aws_access_key_id": resp["Credentials"]["AccessKeyId"],
+        "aws_secret_access_key": resp["Credentials"]["SecretAccessKey"],
+        "aws_session_token": resp["Credentials"]["SessionToken"],
+    }
+    # Cache with 55-minute expiry (5 min before 1-hour STS expiry)
+    _cross_account_creds[account_id] = (creds, now + 3300)
+    # Invalidate any cached clients so they get recreated with new creds
+    _cross_account_s3_clients.pop(account_id, None)
+    _cross_account_logs_clients.pop(account_id, None)
+    logger.info("Assumed role %s for account %s", role_arn, account_id)
+    return creds
+
+
+def _get_cross_account_s3(account_id):
+    """Return an S3 client for a cross-account role."""
+    if account_id not in _cross_account_s3_clients:
+        creds = _get_cross_account_creds(account_id)
+        _cross_account_s3_clients[account_id] = boto3.client("s3", **creds)
+    return _cross_account_s3_clients[account_id]
+
+
+def _get_cross_account_logs(account_id):
+    """Return a CloudWatch Logs client for a cross-account role."""
+    if account_id not in _cross_account_logs_clients:
+        creds = _get_cross_account_creds(account_id)
+        _cross_account_logs_clients[account_id] = boto3.client("logs", **creds)
+    return _cross_account_logs_clients[account_id]
 
 
 def _discover_sg_addresses():
@@ -204,26 +267,35 @@ def _register_source_bucket(bucket_name):
     _registered_sources.add(bucket_name)
 
 
-def _ensure_bucket(s3, bucket_name):
-    """Create a bucket if it doesn't exist. Cache verified for BUCKET_CACHE_TTL seconds."""
-    now = time.monotonic()
-    if bucket_name in _known_buckets and (now - _known_buckets[bucket_name]) < BUCKET_CACHE_TTL:
+def _register_cross_account_bucket(account_id, bucket_name):
+    """Register a cross-account bucket in SSM for reconciliation tracking."""
+    key = f"{account_id}:{bucket_name}"
+    if key in _registered_cross_account:
         return
+    ssm = _get_ssm()
     try:
-        s3.head_bucket(Bucket=bucket_name)
-    except Exception:
-        try:
-            s3.create_bucket(Bucket=bucket_name)
-            logger.info("Created bucket: %s", bucket_name)
-        except (s3.exceptions.BucketAlreadyOwnedByYou, s3.exceptions.BucketAlreadyExists):
-            pass
-    _known_buckets[bucket_name] = now
+        resp = ssm.get_parameter(Name=CROSS_ACCOUNT_BUCKETS_PARAM)
+        buckets = json.loads(resp["Parameter"]["Value"])
+    except (ssm.exceptions.ParameterNotFound, json.JSONDecodeError):
+        buckets = {}
+    account_buckets = set(buckets.get(account_id, []))
+    if bucket_name not in account_buckets:
+        account_buckets.add(bucket_name)
+        buckets[account_id] = sorted(account_buckets)
+        ssm.put_parameter(
+            Name=CROSS_ACCOUNT_BUCKETS_PARAM,
+            Value=json.dumps(buckets),
+            Type="String",
+            Overwrite=True,
+        )
+        logger.info("Registered cross-account bucket: %s:%s", account_id, bucket_name)
+    _registered_cross_account.add(key)
 
 
 # ── Handler ──────────────────────────────────────────────────────────
 
 def handler(event, context):
-    s3 = _get_s3()
+    local_s3 = _get_s3()
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
     feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
     audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
@@ -237,8 +309,20 @@ def handler(event, context):
             bucket = detail.get("bucket", {}).get("name")
             key = detail.get("object", {}).get("key")
             size = detail.get("object", {}).get("size", 0)
+            source_account = body.get("account", SCANNER_ACCOUNT_ID)
+
             if bucket and key:
-                _process_file(s3, bucket, key, size, pml, feedback, audit_log_group)
+                is_cross_account = (
+                    source_account
+                    and SCANNER_ACCOUNT_ID
+                    and source_account != SCANNER_ACCOUNT_ID
+                )
+                source_s3 = _get_cross_account_s3(source_account) if is_cross_account else local_s3
+                _process_file(
+                    source_s3, local_s3, bucket, key, size,
+                    source_account, is_cross_account,
+                    pml, feedback, audit_log_group,
+                )
             else:
                 logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
         except Exception:
@@ -250,16 +334,19 @@ def handler(event, context):
     return {"batchItemFailures": []}
 
 
-def _process_file(s3, bucket, key, size, pml, feedback, audit_log_group):
-    _register_source_bucket(bucket)
-    clean_bucket = f"{bucket}-clean"
-    quarantine_bucket = f"{bucket}-quarantine"
-    logger.info("Processing s3://%s/%s (%d bytes)", bucket, key, size)
+def _process_file(source_s3, local_s3, bucket, key, size,
+                   source_account, is_cross_account,
+                   pml, feedback, audit_log_group):
+    if is_cross_account:
+        _register_cross_account_bucket(source_account, bucket)
+    else:
+        _register_source_bucket(bucket)
+    logger.info("Processing s3://%s/%s (%d bytes) account=%s", bucket, key, size, source_account)
 
     try:
-        resp = s3.get_object(Bucket=bucket, Key=key)
+        resp = source_s3.get_object(Bucket=bucket, Key=key)
         file_bytes = resp["Body"].read()
-    except s3.exceptions.NoSuchKey:
+    except source_s3.exceptions.NoSuchKey:
         logger.warning("s3://%s/%s gone, skipping", bucket, key)
         return
 
@@ -277,57 +364,94 @@ def _process_file(s3, bucket, key, size, pml, feedback, audit_log_group):
     scan_ms = int((time.monotonic() - scan_start) * 1000)
     result = json.loads(result_json)
     is_malicious = result.get("scanResult", 0) > 0
+    scan_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if is_malicious:
-        dest_bucket = quarantine_bucket
-        verdict = "malicious"
-        tag = "Malware"
         malware_names = [m.get("malwareName", "") for m in result.get("foundMalwares", [])]
         logger.warning(
-            "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s",
-            bucket, key, malware_names, scan_ms, sg_addr,
+            "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s account=%s",
+            bucket, key, malware_names, scan_ms, sg_addr, source_account,
         )
+        # Move to central quarantine bucket with metadata tags
+        quarantine_key = f"{source_account}/{bucket}/{key}"
+        tags = urlencode({
+            "ScanResult": "Malware",
+            "ScanTimestamp": scan_ts,
+            "SourceAccount": source_account,
+            "SourceBucket": bucket,
+        })
+        local_s3.put_object(
+            Bucket=QUARANTINE_BUCKET, Key=quarantine_key,
+            Body=file_bytes, Tagging=tags,
+        )
+        source_s3.delete_object(Bucket=bucket, Key=key)
+        verdict = "malicious"
     else:
-        dest_bucket = clean_bucket
+        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s account=%s",
+                     bucket, key, scan_ms, sg_addr, source_account)
+        # Tag clean file in place — leave it in the source bucket
+        source_s3.put_object_tagging(
+            Bucket=bucket, Key=key,
+            Tagging={"TagSet": [
+                {"Key": "ScanResult", "Value": "Clean"},
+                {"Key": "ScanTimestamp", "Value": scan_ts},
+            ]},
+        )
         verdict = "clean"
-        tag = "Clean"
-        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s", bucket, key, scan_ms, sg_addr)
 
-    _ensure_bucket(s3, dest_bucket)
-    s3.put_object(Bucket=dest_bucket, Key=key, Body=file_bytes, Tagging=f"ScanResult={tag}")
-    s3.delete_object(Bucket=bucket, Key=key)
-    _audit(audit_log_group, key, size, verdict, result, scan_ms, sg_addr)
+    _audit(audit_log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, source_account)
     del file_bytes
 
 
-def _audit(log_group, key, size, verdict, result, scan_ms, sg_addr):
+_customer_audit_streams = set()  # Tracks which cross-account log streams we've created
+
+
+def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, source_account):
     global _audit_stream_created
     if not log_group:
         return
+    stream = f"scanner-{os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown')}"
+    entry = {
+        "timestamp": time.time(),
+        "file": key,
+        "bucket": bucket,
+        "sourceAccount": source_account,
+        "size": size,
+        "verdict": verdict,
+        "scanResult": result.get("scanResult", -1),
+        "sha256": result.get("fileSHA256", ""),
+        "malware": [m.get("malwareName", "") for m in result.get("foundMalwares", [])],
+        "scanId": result.get("scanId", ""),
+        "scanDurationMs": scan_ms,
+        "serviceGateway": sg_addr,
+    }
+    log_event = [{"timestamp": int(time.time() * 1000), "message": json.dumps(entry)}]
+
+    # Write to scanner-account audit log
     try:
         logs = _get_logs()
-        stream = f"scanner-{os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown')}"
         if not _audit_stream_created:
             try:
                 logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
-            except (logs.exceptions.ResourceAlreadyExistsException, Exception):
+            except Exception:
                 pass
             _audit_stream_created = True
-        entry = {
-            "timestamp": time.time(),
-            "file": key,
-            "size": size,
-            "verdict": verdict,
-            "scanResult": result.get("scanResult", -1),
-            "sha256": result.get("fileSHA256", ""),
-            "malware": [m.get("malwareName", "") for m in result.get("foundMalwares", [])],
-            "scanId": result.get("scanId", ""),
-            "scanDurationMs": scan_ms,
-            "serviceGateway": sg_addr,
-        }
-        logs.put_log_events(
-            logGroupName=log_group, logStreamName=stream,
-            logEvents=[{"timestamp": int(time.time() * 1000), "message": json.dumps(entry)}],
-        )
+        logs.put_log_events(logGroupName=log_group, logStreamName=stream, logEvents=log_event)
     except Exception:
-        logger.warning("Audit write failed", exc_info=True)
+        logger.warning("Audit write failed (scanner account)", exc_info=True)
+
+    # Write to customer-account audit log for cross-account scans
+    if source_account and SCANNER_ACCOUNT_ID and source_account != SCANNER_ACCOUNT_ID:
+        try:
+            xacct_logs = _get_cross_account_logs(source_account)
+            if source_account not in _customer_audit_streams:
+                try:
+                    xacct_logs.create_log_stream(
+                        logGroupName=CUSTOMER_LOG_GROUP, logStreamName=stream)
+                except Exception:
+                    pass
+                _customer_audit_streams.add(source_account)
+            xacct_logs.put_log_events(
+                logGroupName=CUSTOMER_LOG_GROUP, logStreamName=stream, logEvents=log_event)
+        except Exception:
+            logger.warning("Audit write failed (customer account %s)", source_account, exc_info=True)
