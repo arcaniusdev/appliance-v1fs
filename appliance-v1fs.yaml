@@ -635,9 +635,11 @@ Resources:
   # ── S3 Buckets ──────────────────────────────────────────────────────
   SourceBucket:
     Type: AWS::S3::Bucket
+    DependsOn: ReplicationRole
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      BucketName: !Sub "source-${AWS::StackName}"
       VersioningConfiguration:
         Status: Enabled
       ReplicationConfiguration:
@@ -646,7 +648,7 @@ Resources:
           - Id: replicate-to-scan-bucket
             Status: Enabled
             Destination:
-              Bucket: !GetAtt ScanBucket.Arn
+              Bucket: !Sub "arn:aws:s3:::scan-${AWS::StackName}"
               StorageClass: STANDARD
       Tags:
         - Key: Name
@@ -673,6 +675,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      BucketName: !Sub "scan-${AWS::StackName}"
       VersioningConfiguration:
         Status: Enabled
       NotificationConfiguration:
@@ -701,19 +704,19 @@ Resources:
                 Action:
                   - s3:GetReplicationConfiguration
                   - s3:ListBucket
-                Resource: !GetAtt SourceBucket.Arn
+                Resource: !Sub "arn:aws:s3:::source-${AWS::StackName}"
               - Effect: Allow
                 Action:
                   - s3:GetObjectVersionForReplication
                   - s3:GetObjectVersionAcl
                   - s3:GetObjectVersionTagging
-                Resource: !Sub "${SourceBucket.Arn}/*"
+                Resource: !Sub "arn:aws:s3:::source-${AWS::StackName}/*"
               - Effect: Allow
                 Action:
                   - s3:ReplicateObject
                   - s3:ReplicateDelete
                   - s3:ReplicateTags
-                Resource: !Sub "${ScanBucket.Arn}/*"
+                Resource: !Sub "arn:aws:s3:::scan-${AWS::StackName}/*"
 
   QuarantineBucket:
     Type: AWS::S3::Bucket
