@@ -633,17 +633,87 @@ Resources:
       DeployBucket: !Ref DeployBucket
 
   # ── S3 Buckets ──────────────────────────────────────────────────────
-  IngestBucket:
+  SourceBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      ReplicationConfiguration:
+        Role: !GetAtt ReplicationRole.Arn
+        Rules:
+          - Id: replicate-to-scan-bucket
+            Status: Enabled
+            Destination:
+              Bucket: !GetAtt ScanBucket.Arn
+              StorageClass: STANDARD
+      Tags:
+        - Key: Name
+          Value: !Sub SourceBucket-${AWS::StackName}
+
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyMalwareAccess
+            Effect: Deny
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${SourceBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "s3:ExistingObjectTag/ScanResult": "Malware"
+
+  ScanBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
       NotificationConfiguration:
         EventBridgeConfiguration:
           EventBridgeEnabled: true
       Tags:
         - Key: Name
-          Value: !Sub IngestBucket-${AWS::StackName}
+          Value: !Sub ScanBucket-${AWS::StackName}
+
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReplicationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetReplicationConfiguration
+                  - s3:ListBucket
+                Resource: !GetAtt SourceBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                Resource: !Sub "${SourceBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                Resource: !Sub "${ScanBucket.Arn}/*"
 
   QuarantineBucket:
     Type: AWS::S3::Bucket
@@ -659,12 +729,16 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub scan-ingest-${AWS::StackName}
-      Description: Route S3 object-created events from any enrolled bucket to the scan queue
+      Description: Route S3 object-created events from the scan bucket to the scan queue
       EventPattern:
         source:
           - aws.s3
         detail-type:
           - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref ScanBucket
       State: ENABLED
       Targets:
         - Arn: !GetAtt ScanQueue.Arn
@@ -1229,21 +1303,16 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:DeleteObject
-                  - s3:PutObject
-                  - s3:PutObjectTagging
-                  - s3:ListBucket
-                Resource: "arn:aws:s3:::*"
+                Resource: !Sub "${ScanBucket.Arn}/*"
+              - Effect: Allow
+                Action: s3:PutObjectTagging
+                Resource: !Sub "${SourceBucket.Arn}/*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${QuarantineBucket.Arn}/*"
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${DeployBucket}/*"
-              - Effect: Allow
-                Action: sts:AssumeRole
-                Resource: "arn:aws:iam::*:role/appliance-v1fs-scanner-access"
-              - Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                  - ssm:PutParameter
-                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
@@ -1256,6 +1325,9 @@ Resources:
               - Effect: Allow
                 Action: ec2:DescribeInstances
                 Resource: "*"
+              - Effect: Allow
+                Action: autoscaling:CompleteLifecycleAction
+                Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/worker-asg-${AWS::StackName}"
 
   WorkerInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -1305,6 +1377,7 @@ Resources:
             SQS_QUEUE_URL=${ScanQueue}
             SQS_VISIBILITY_TIMEOUT=300
             MAX_CONCURRENT_SCANS=${WorkerConcurrency}
+            ASG_NAME=worker-asg-${AWS::StackName}
             SG_DISCOVERY_TAG=appliance-v1fs:stack=${AWS::StackName}
             SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert
             V1FS_API_KEY_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key
@@ -1314,6 +1387,7 @@ Resources:
             CHANNELS_PER_SG=${ChannelsPerSG}
             MAX_FILE_SIZE_MB=${MaxFileSizeMB}
             SCANNER_ACCOUNT_ID=${AWS::AccountId}
+            SOURCE_BUCKET=${SourceBucket}
             QUARANTINE_BUCKET=${QuarantineBucket}
             CUSTOMER_LOG_GROUP=v1fs-scan-audit
             LOG_LEVEL=INFO
@@ -1364,12 +1438,22 @@ Resources:
           Value: !Sub Worker-${AWS::StackName}
           PropagateAtLaunch: false
 
+  WorkerTerminationHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      LifecycleHookName: WorkerTerminationHook
+      AutoScalingGroupName: !Ref WorkerASG
+      LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+      HeartbeatTimeout: 330
+      DefaultResult: CONTINUE
+
   WorkerScaleOutPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
       AutoScalingGroupName: !Ref WorkerASG
       PolicyType: StepScaling
       AdjustmentType: ChangeInCapacity
+      EstimatedInstanceWarmup: 120
       StepAdjustments:
         - MetricIntervalLowerBound: 0
           MetricIntervalUpperBound: 1000
@@ -1403,6 +1487,7 @@ Resources:
       AutoScalingGroupName: !Ref WorkerASG
       PolicyType: StepScaling
       AdjustmentType: ChangeInCapacity
+      EstimatedInstanceWarmup: 300
       StepAdjustments:
         - MetricIntervalUpperBound: 0
           ScalingAdjustment: -1
@@ -1994,9 +2079,12 @@ Outputs:
   ServiceGateway1Id:
     Description: Service Gateway 1 instance ID
     Value: !Ref ServiceGateway1
-  IngestBucketName:
-    Description: S3 ingest bucket (EventBridge enabled)
-    Value: !Ref IngestBucket
+  SourceBucketName:
+    Description: S3 source bucket (files arrive here, malware access denied via bucket policy)
+    Value: !Ref SourceBucket
+  ScanBucketName:
+    Description: S3 scan bucket (replicated from source, EventBridge triggers scanning)
+    Value: !Ref ScanBucket
   ScanEventRuleArn:
     Description: "EventBridge rule ARN — to enroll another bucket, enable EventBridge notifications on it: aws s3api put-bucket-notification-configuration --bucket BUCKET --notification-configuration '{\"EventBridgeConfiguration\":{}}'"
     Value: !GetAtt ScanEventRule.Arn

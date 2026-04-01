@@ -30,27 +30,11 @@ _channels_built_at = 0.0  # monotonic timestamp of last channel build
 _channels_lock = threading.Lock()  # Protects channel rebuild
 _s3_client = None
 _ec2_client = None
-_ssm_client = None
 _logs_client = None
-_sts_client = None
 _audit_stream_created = False
-_registered_sources = set()  # Source buckets we've already registered in SSM
-_register_lock = threading.Lock()  # Protects SSM registration
 
-# Cross-account support
 SCANNER_ACCOUNT_ID = os.environ.get("SCANNER_ACCOUNT_ID", "")
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
-CUSTOMER_LOG_GROUP = os.environ.get("CUSTOMER_LOG_GROUP", "v1fs-scan-audit")
-CROSS_ACCOUNT_ROLE_NAME = "appliance-v1fs-scanner-access"
-_cross_account_creds = {}  # Cache: account_id -> (creds_dict, expiry_monotonic)
-_cross_account_s3_clients = {}  # Cache: account_id -> s3_client
-_cross_account_logs_clients = {}  # Cache: account_id -> logs_client
-_cross_account_lock = threading.Lock()  # Protects cross-account caches
-_registered_cross_account = set()  # Cross-account buckets already registered in SSM
-
-# SSM parameters
-ENROLLED_BUCKETS_PARAM = "/appliance-v1fs/enrolled-buckets"
-CROSS_ACCOUNT_BUCKETS_PARAM = "/appliance-v1fs/cross-account-buckets"
 
 # Channel refresh interval — re-discover SGs periodically
 CHANNEL_REFRESH_SECONDS = 60
@@ -77,73 +61,12 @@ def _get_ec2():
     return _ec2_client
 
 
-def _get_ssm():
-    global _ssm_client
-    if _ssm_client is None:
-        _ssm_client = boto3.client("ssm")
-    return _ssm_client
-
-
 def _get_logs():
     global _logs_client
     if _logs_client is None:
         _logs_client = boto3.client("logs")
     return _logs_client
 
-
-def _get_sts():
-    global _sts_client
-    if _sts_client is None:
-        _sts_client = boto3.client("sts")
-    return _sts_client
-
-
-def _get_cross_account_creds(account_id):
-    """Assume cross-account role and cache temporary credentials."""
-    now = time.monotonic()
-    with _cross_account_lock:
-        if account_id in _cross_account_creds:
-            creds, expiry = _cross_account_creds[account_id]
-            if now < expiry:
-                return creds
-
-    role_arn = f"arn:aws:iam::{account_id}:role/{CROSS_ACCOUNT_ROLE_NAME}"
-    resp = _get_sts().assume_role(
-        RoleArn=role_arn,
-        RoleSessionName=f"scanner-{account_id}",
-        DurationSeconds=3600,
-    )
-    creds = {
-        "aws_access_key_id": resp["Credentials"]["AccessKeyId"],
-        "aws_secret_access_key": resp["Credentials"]["SecretAccessKey"],
-        "aws_session_token": resp["Credentials"]["SessionToken"],
-    }
-    with _cross_account_lock:
-        # Cache with 55-minute expiry (5 min before 1-hour STS expiry)
-        _cross_account_creds[account_id] = (creds, now + 3300)
-        # Invalidate any cached clients so they get recreated with new creds
-        _cross_account_s3_clients.pop(account_id, None)
-        _cross_account_logs_clients.pop(account_id, None)
-    logger.info("Assumed role %s for account %s", role_arn, account_id)
-    return creds
-
-
-def _get_cross_account_s3(account_id):
-    """Return an S3 client for a cross-account role."""
-    with _cross_account_lock:
-        if account_id not in _cross_account_s3_clients:
-            creds = _get_cross_account_creds(account_id)
-            _cross_account_s3_clients[account_id] = boto3.client("s3", **creds)
-        return _cross_account_s3_clients[account_id]
-
-
-def _get_cross_account_logs(account_id):
-    """Return a CloudWatch Logs client for a cross-account role."""
-    with _cross_account_lock:
-        if account_id not in _cross_account_logs_clients:
-            creds = _get_cross_account_creds(account_id)
-            _cross_account_logs_clients[account_id] = boto3.client("logs", **creds)
-        return _cross_account_logs_clients[account_id]
 
 
 def _discover_sg_addresses():
@@ -266,77 +189,20 @@ def _mark_channel_failure(idx):
                            idx, _channel_addrs[idx], CB_COOLDOWN_SECONDS)
 
 
-# -- Bucket Management -------------------------------------------------------
-
-def _register_source_bucket(bucket_name):
-    """Add a source bucket to the SSM enrolled-buckets registry if not already tracked."""
-    if bucket_name in _registered_sources:
-        return
-    with _register_lock:
-        if bucket_name in _registered_sources:
-            return
-        ssm = _get_ssm()
-        try:
-            resp = ssm.get_parameter(Name=ENROLLED_BUCKETS_PARAM)
-            current = set(resp["Parameter"]["Value"].split(","))
-        except ssm.exceptions.ParameterNotFound:
-            current = set()
-        if bucket_name not in current:
-            current.add(bucket_name)
-            ssm.put_parameter(
-                Name=ENROLLED_BUCKETS_PARAM,
-                Value=",".join(sorted(current)),
-                Type="String",
-                Overwrite=True,
-            )
-            logger.info("Registered source bucket: %s", bucket_name)
-        _registered_sources.add(bucket_name)
-
-
-def _register_cross_account_bucket(account_id, bucket_name):
-    """Register a cross-account bucket in SSM for reconciliation tracking."""
-    key = f"{account_id}:{bucket_name}"
-    if key in _registered_cross_account:
-        return
-    with _register_lock:
-        if key in _registered_cross_account:
-            return
-        ssm = _get_ssm()
-        try:
-            resp = ssm.get_parameter(Name=CROSS_ACCOUNT_BUCKETS_PARAM)
-            buckets = json.loads(resp["Parameter"]["Value"])
-        except (ssm.exceptions.ParameterNotFound, json.JSONDecodeError):
-            buckets = {}
-        account_buckets = set(buckets.get(account_id, []))
-        if bucket_name not in account_buckets:
-            account_buckets.add(bucket_name)
-            buckets[account_id] = sorted(account_buckets)
-            ssm.put_parameter(
-                Name=CROSS_ACCOUNT_BUCKETS_PARAM,
-                Value=json.dumps(buckets),
-                Type="String",
-                Overwrite=True,
-            )
-            logger.info("Registered cross-account bucket: %s:%s", account_id, bucket_name)
-        _registered_cross_account.add(key)
-
 
 # -- Core Scan Logic ----------------------------------------------------------
 
-def _process_file(source_s3, local_s3, bucket, key, size,
-                   source_account, is_cross_account,
-                   pml, feedback, audit_log_group):
-    if is_cross_account:
-        _register_cross_account_bucket(source_account, bucket)
-    else:
-        _register_source_bucket(bucket)
-    logger.info("Processing s3://%s/%s (%d bytes) account=%s", bucket, key, size, source_account)
+SOURCE_BUCKET = os.environ.get("SOURCE_BUCKET", "")
+
+
+def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
+    logger.info("Processing s3://%s/%s (%d bytes)", scan_bucket, key, size)
 
     try:
-        resp = source_s3.get_object(Bucket=bucket, Key=key)
+        resp = s3.get_object(Bucket=scan_bucket, Key=key)
         file_bytes = resp["Body"].read()
-    except source_s3.exceptions.NoSuchKey:
-        logger.warning("s3://%s/%s gone, skipping", bucket, key)
+    except s3.exceptions.NoSuchKey:
+        logger.warning("s3://%s/%s gone, skipping", scan_bucket, key)
         return
 
     channel, sg_addr, ch_idx = _get_channel()
@@ -358,41 +224,42 @@ def _process_file(source_s3, local_s3, bucket, key, size,
     if is_malicious:
         malware_names = [m.get("malwareName", "") for m in result.get("foundMalwares", [])]
         logger.warning(
-            "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s account=%s",
-            bucket, key, malware_names, scan_ms, sg_addr, source_account,
+            "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s",
+            scan_bucket, key, malware_names, scan_ms, sg_addr,
         )
-        # Move to central quarantine bucket with metadata tags
-        quarantine_key = f"{source_account}/{bucket}/{key}"
-        tags = urlencode({
-            "ScanResult": "Malware",
-            "ScanTimestamp": scan_ts,
-            "SourceAccount": source_account,
-            "SourceBucket": bucket,
-        })
-        local_s3.put_object(
-            Bucket=QUARANTINE_BUCKET, Key=quarantine_key,
-            Body=file_bytes, Tagging=tags,
-        )
-        source_s3.delete_object(Bucket=bucket, Key=key)
-        verdict = "malicious"
-    else:
-        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s account=%s",
-                     bucket, key, scan_ms, sg_addr, source_account)
-        # Tag clean file in place — leave it in the source bucket
-        source_s3.put_object_tagging(
-            Bucket=bucket, Key=key,
+        # Tag the source object to block access via bucket policy
+        s3.put_object_tagging(
+            Bucket=SOURCE_BUCKET, Key=key,
             Tagging={"TagSet": [
-                {"Key": "ScanResult", "Value": "Clean"},
+                {"Key": "ScanResult", "Value": "Malware"},
                 {"Key": "ScanTimestamp", "Value": scan_ts},
             ]},
         )
+        # Copy to quarantine bucket with metadata
+        quarantine_key = f"{SOURCE_BUCKET}/{key}"
+        tags = urlencode({
+            "ScanResult": "Malware",
+            "ScanTimestamp": scan_ts,
+            "SourceBucket": SOURCE_BUCKET,
+        })
+        s3.put_object(
+            Bucket=QUARANTINE_BUCKET, Key=quarantine_key,
+            Body=file_bytes, Tagging=tags,
+        )
+        verdict = "malicious"
+    else:
+        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s",
+                     scan_bucket, key, scan_ms, sg_addr)
         verdict = "clean"
 
-    _audit(audit_log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, source_account)
+    # Delete the staging copy — scan is done, source bucket has the original
+    s3.delete_object(Bucket=scan_bucket, Key=key)
+
+    _audit(audit_log_group, scan_bucket, key, size, verdict, result, scan_ms, sg_addr,
+           SCANNER_ACCOUNT_ID)
     del file_bytes
 
 
-_customer_audit_streams = set()  # Tracks which cross-account log streams we've created
 _audit_lock = threading.Lock()
 
 
@@ -405,7 +272,7 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
         "timestamp": time.time(),
         "file": key,
         "bucket": bucket,
-        "sourceAccount": source_account,
+        "sourceBucket": SOURCE_BUCKET,
         "size": size,
         "verdict": verdict,
         "scanResult": result.get("scanResult", -1),
@@ -417,7 +284,6 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
     }
     log_event = [{"timestamp": int(time.time() * 1000), "message": json.dumps(entry)}]
 
-    # Write to scanner-account audit log
     try:
         logs = _get_logs()
         with _audit_lock:
@@ -429,24 +295,7 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
                 _audit_stream_created = True
         logs.put_log_events(logGroupName=log_group, logStreamName=stream, logEvents=log_event)
     except Exception:
-        logger.warning("Audit write failed (scanner account)", exc_info=True)
-
-    # Write to customer-account audit log for cross-account scans
-    if source_account and SCANNER_ACCOUNT_ID and source_account != SCANNER_ACCOUNT_ID:
-        try:
-            xacct_logs = _get_cross_account_logs(source_account)
-            with _audit_lock:
-                if source_account not in _customer_audit_streams:
-                    try:
-                        xacct_logs.create_log_stream(
-                            logGroupName=CUSTOMER_LOG_GROUP, logStreamName=stream)
-                    except Exception:
-                        pass
-                    _customer_audit_streams.add(source_account)
-            xacct_logs.put_log_events(
-                logGroupName=CUSTOMER_LOG_GROUP, logStreamName=stream, logEvents=log_event)
-        except Exception:
-            logger.warning("Audit write failed (customer account %s)", source_account, exc_info=True)
+        logger.warning("Audit write failed", exc_info=True)
 
 
 # -- SQS Message Processing --------------------------------------------------
@@ -480,7 +329,7 @@ def _process_message(sqs, queue_url, message, visibility_timeout):
     )
     heartbeat_thread.start()
 
-    local_s3 = _get_s3()
+    s3 = _get_s3()
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
     feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
     audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
@@ -489,29 +338,16 @@ def _process_message(sqs, queue_url, message, visibility_timeout):
         body = json.loads(message["Body"])
         # EventBridge event format: detail.bucket.name, detail.object.key
         detail = body.get("detail", {})
-        bucket = detail.get("bucket", {}).get("name")
+        scan_bucket = detail.get("bucket", {}).get("name")
         key = detail.get("object", {}).get("key")
         size = detail.get("object", {}).get("size", 0)
-        source_account = body.get("account", SCANNER_ACCOUNT_ID)
 
-        if not bucket or not key:
+        if not scan_bucket or not key:
             logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
-            # Delete malformed message so it doesn't block the queue
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
             return
 
-        is_cross_account = (
-            source_account
-            and SCANNER_ACCOUNT_ID
-            and source_account != SCANNER_ACCOUNT_ID
-        )
-        source_s3 = _get_cross_account_s3(source_account) if is_cross_account else local_s3
-
-        _process_file(
-            source_s3, local_s3, bucket, key, size,
-            source_account, is_cross_account,
-            pml, feedback, audit_log_group,
-        )
+        _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group)
         # Success — delete message from queue
         sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
@@ -530,6 +366,43 @@ def _process_message(sqs, queue_url, message, visibility_timeout):
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=5)
+
+
+# -- ASG Lifecycle -----------------------------------------------------------
+
+def _complete_lifecycle_action():
+    """Signal ASG that this instance is ready to terminate."""
+    try:
+        token_url = "http://169.254.169.254/latest/api/token"
+        import urllib.request
+        req = urllib.request.Request(token_url, method="PUT",
+                                     headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"})
+        token = urllib.request.urlopen(req, timeout=2).read().decode()
+        meta_headers = {"X-aws-ec2-metadata-token": token}
+        instance_id = urllib.request.urlopen(
+            urllib.request.Request("http://169.254.169.254/latest/meta-data/instance-id",
+                                   headers=meta_headers), timeout=2).read().decode()
+    except Exception:
+        logger.info("Not running on EC2 or IMDS unavailable — skipping lifecycle completion")
+        return
+
+    asg_name = os.environ.get("ASG_NAME")
+    if not asg_name:
+        logger.info("ASG_NAME not set — skipping lifecycle completion")
+        return
+
+    try:
+        autoscaling = boto3.client("autoscaling")
+        autoscaling.complete_lifecycle_action(
+            LifecycleHookName="WorkerTerminationHook",
+            AutoScalingGroupName=asg_name,
+            InstanceId=instance_id,
+            LifecycleActionResult="CONTINUE",
+        )
+        logger.info("Lifecycle action completed for %s", instance_id)
+    except Exception:
+        logger.warning("Failed to complete lifecycle action — ASG will time out and CONTINUE",
+                       exc_info=True)
 
 
 # -- Main Entry Point --------------------------------------------------------
@@ -598,6 +471,7 @@ def main():
             if exc:
                 logger.error("Worker thread raised during shutdown: %s", exc)
 
+    _complete_lifecycle_action()
     logger.info("Shutdown complete")
 
 
