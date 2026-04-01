@@ -381,6 +381,25 @@ Resources:
           Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
 
   # ── Service Gateway ──────────────────────────────────────────────
+  ServiceGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ServiceGatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ServiceGatewayRole
+
   ServiceGatewayLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -389,6 +408,8 @@ Resources:
         ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
         InstanceType: !Ref ServiceGatewayInstanceType
         KeyName: !Ref ServiceGatewayKeyPair
+        IamInstanceProfile:
+          Arn: !GetAtt ServiceGatewayInstanceProfile.Arn
         SecurityGroupIds:
           - !Ref ServiceGatewaySecGroup
         MetadataOptions:
@@ -1290,6 +1311,8 @@ Resources:
             Principal:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
         - PolicyName: WorkerPolicy
           PolicyDocument:

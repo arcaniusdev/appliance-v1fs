@@ -235,6 +235,9 @@ def _handle_instance_running(event, context):
 
             logger.info("Service Gateway %s registered as %s", instance_id, hostname)
 
+            # Wait for File Security scanner pod to be running
+            _wait_for_scanner_pod(host, private_key, port=port)
+
             # Extract CA cert and patch nginx for large file gRPC scanning
             sgowner = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
             cert_pem = _extract_cert(sgowner)
@@ -286,6 +289,28 @@ def _patch_nginx_body_size(sgowner_client):
         logger.info("nginx proxy-body-size patched: %s", output)
     else:
         logger.warning("nginx patch may have failed: %s", output)
+
+
+def _wait_for_scanner_pod(host, private_key, port=22, max_attempts=20, interval=15):
+    """Poll until the File Security scanner pod is running on the SG."""
+    for attempt in range(max_attempts):
+        logger.info("Waiting for scanner pod (attempt %d/%d)", attempt + 1, max_attempts)
+        try:
+            with ClishSession(host, "admin", private_key, port=port) as session:
+                session.connect(timeout=30)
+                session.send_command("enable", expect="# ", timeout=15)
+                output = session.send_command(
+                    "configure verify plat",
+                    expect="# ", timeout=60,
+                )
+                if "sg-sfs-scanner" in output and "Running" in output:
+                    logger.info("Scanner pod is running")
+                    return
+                logger.info("Scanner pod not ready yet: %s", output[-300:])
+        except Exception:
+            logger.debug("Scanner pod check failed", exc_info=True)
+        time.sleep(interval)
+    raise TimeoutError("Scanner pod not running after %d attempts" % max_attempts)
 
 
 def _wait_for_admin_ready(host, private_key, port=22, max_attempts=12, interval=15):
