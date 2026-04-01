@@ -2,7 +2,11 @@ import json
 import logging
 import os
 import random
+import signal
+import socket
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
@@ -12,13 +16,18 @@ import amaas.grpc
 
 logger = logging.getLogger("scanner")
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+)
 
-# Module-level state — persists across warm invocations
+# Module-level state — shared across worker threads (read-heavy, write-rare)
 _channels = None
 _channel_addrs = None
 _channel_failures = None  # Circuit breaker: failure count per channel
 _channel_cooldown = None  # Circuit breaker: cooldown expiry per channel
 _channels_built_at = 0.0  # monotonic timestamp of last channel build
+_channels_lock = threading.Lock()  # Protects channel rebuild
 _s3_client = None
 _ec2_client = None
 _ssm_client = None
@@ -26,15 +35,17 @@ _logs_client = None
 _sts_client = None
 _audit_stream_created = False
 _registered_sources = set()  # Source buckets we've already registered in SSM
+_register_lock = threading.Lock()  # Protects SSM registration
 
 # Cross-account support
 SCANNER_ACCOUNT_ID = os.environ.get("SCANNER_ACCOUNT_ID", "")
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 CUSTOMER_LOG_GROUP = os.environ.get("CUSTOMER_LOG_GROUP", "v1fs-scan-audit")
 CROSS_ACCOUNT_ROLE_NAME = "appliance-v1fs-scanner-access"
-_cross_account_creds = {}  # Cache: account_id → (creds_dict, expiry_monotonic)
-_cross_account_s3_clients = {}  # Cache: account_id → s3_client
-_cross_account_logs_clients = {}  # Cache: account_id → logs_client
+_cross_account_creds = {}  # Cache: account_id -> (creds_dict, expiry_monotonic)
+_cross_account_s3_clients = {}  # Cache: account_id -> s3_client
+_cross_account_logs_clients = {}  # Cache: account_id -> logs_client
+_cross_account_lock = threading.Lock()  # Protects cross-account caches
 _registered_cross_account = set()  # Cross-account buckets already registered in SSM
 
 # SSM parameters
@@ -47,6 +58,9 @@ CHANNEL_REFRESH_SECONDS = 60
 # Circuit breaker settings
 CB_FAILURE_THRESHOLD = 3  # failures before marking channel unhealthy
 CB_COOLDOWN_SECONDS = 60  # seconds to skip an unhealthy channel
+
+# Shutdown coordination
+_shutdown_event = threading.Event()
 
 
 def _get_s3():
@@ -87,10 +101,11 @@ def _get_sts():
 def _get_cross_account_creds(account_id):
     """Assume cross-account role and cache temporary credentials."""
     now = time.monotonic()
-    if account_id in _cross_account_creds:
-        creds, expiry = _cross_account_creds[account_id]
-        if now < expiry:
-            return creds
+    with _cross_account_lock:
+        if account_id in _cross_account_creds:
+            creds, expiry = _cross_account_creds[account_id]
+            if now < expiry:
+                return creds
 
     role_arn = f"arn:aws:iam::{account_id}:role/{CROSS_ACCOUNT_ROLE_NAME}"
     resp = _get_sts().assume_role(
@@ -103,29 +118,32 @@ def _get_cross_account_creds(account_id):
         "aws_secret_access_key": resp["Credentials"]["SecretAccessKey"],
         "aws_session_token": resp["Credentials"]["SessionToken"],
     }
-    # Cache with 55-minute expiry (5 min before 1-hour STS expiry)
-    _cross_account_creds[account_id] = (creds, now + 3300)
-    # Invalidate any cached clients so they get recreated with new creds
-    _cross_account_s3_clients.pop(account_id, None)
-    _cross_account_logs_clients.pop(account_id, None)
+    with _cross_account_lock:
+        # Cache with 55-minute expiry (5 min before 1-hour STS expiry)
+        _cross_account_creds[account_id] = (creds, now + 3300)
+        # Invalidate any cached clients so they get recreated with new creds
+        _cross_account_s3_clients.pop(account_id, None)
+        _cross_account_logs_clients.pop(account_id, None)
     logger.info("Assumed role %s for account %s", role_arn, account_id)
     return creds
 
 
 def _get_cross_account_s3(account_id):
     """Return an S3 client for a cross-account role."""
-    if account_id not in _cross_account_s3_clients:
-        creds = _get_cross_account_creds(account_id)
-        _cross_account_s3_clients[account_id] = boto3.client("s3", **creds)
-    return _cross_account_s3_clients[account_id]
+    with _cross_account_lock:
+        if account_id not in _cross_account_s3_clients:
+            creds = _get_cross_account_creds(account_id)
+            _cross_account_s3_clients[account_id] = boto3.client("s3", **creds)
+        return _cross_account_s3_clients[account_id]
 
 
 def _get_cross_account_logs(account_id):
     """Return a CloudWatch Logs client for a cross-account role."""
-    if account_id not in _cross_account_logs_clients:
-        creds = _get_cross_account_creds(account_id)
-        _cross_account_logs_clients[account_id] = boto3.client("logs", **creds)
-    return _cross_account_logs_clients[account_id]
+    with _cross_account_lock:
+        if account_id not in _cross_account_logs_clients:
+            creds = _get_cross_account_creds(account_id)
+            _cross_account_logs_clients[account_id] = boto3.client("logs", **creds)
+        return _cross_account_logs_clients[account_id]
 
 
 def _discover_sg_addresses():
@@ -156,49 +174,54 @@ def _discover_sg_addresses():
 def _build_channels():
     global _channels, _channel_addrs, _channel_failures, _channel_cooldown, _channels_built_at
 
-    sm = boto3.client("secretsmanager")
-    api_key = sm.get_secret_value(
-        SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
-    )["SecretString"]
-    ca_cert = sm.get_secret_value(
-        SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
-    )["SecretString"].encode("utf-8")
+    with _channels_lock:
+        # Double-check after acquiring lock
+        if _channels is not None and (time.monotonic() - _channels_built_at <= CHANNEL_REFRESH_SECONDS):
+            return
 
-    call_creds = grpc.metadata_call_credentials(
-        lambda context, callback: callback(
-            [("authorization", f"Bearer {api_key}")], None
+        sm = boto3.client("secretsmanager")
+        api_key = sm.get_secret_value(
+            SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
+        )["SecretString"]
+        ca_cert = sm.get_secret_value(
+            SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
+        )["SecretString"].encode("utf-8")
+
+        call_creds = grpc.metadata_call_credentials(
+            lambda context, callback: callback(
+                [("authorization", f"Bearer {api_key}")], None
+            )
         )
-    )
-    channel_creds = grpc.ssl_channel_credentials(root_certificates=ca_cert)
-    composite = grpc.composite_channel_credentials(channel_creds, call_creds)
+        channel_creds = grpc.ssl_channel_credentials(root_certificates=ca_cert)
+        composite = grpc.composite_channel_credentials(channel_creds, call_creds)
 
-    tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
-    max_file_bytes = int(os.environ.get("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
-    options = [
-        ("grpc.ssl_target_name_override", tls_override),
-        ("grpc.max_send_message_length", max_file_bytes),
-        ("grpc.max_receive_message_length", max_file_bytes),
-        ("grpc.keepalive_time_ms", 30_000),
-        ("grpc.keepalive_timeout_ms", 10_000),
-        ("grpc.keepalive_permit_without_calls", 1),
-    ]
+        tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
+        max_file_bytes = int(os.environ.get("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
+        options = [
+            ("grpc.ssl_target_name_override", tls_override),
+            ("grpc.max_send_message_length", max_file_bytes),
+            ("grpc.max_receive_message_length", max_file_bytes),
+            ("grpc.keepalive_time_ms", 30_000),
+            ("grpc.keepalive_timeout_ms", 10_000),
+            ("grpc.keepalive_permit_without_calls", 1),
+        ]
 
-    addrs = _discover_sg_addresses()
-    channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
-    channels = []
-    channel_addrs = []
-    for addr in addrs:
-        for c in range(channels_per_sg):
-            ch = grpc.secure_channel(addr, composite, options=options)
-            channels.append(ch)
-            channel_addrs.append(addr)
-        logger.info("Created %d gRPC channel(s) to %s", channels_per_sg, addr)
+        addrs = _discover_sg_addresses()
+        channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
+        channels = []
+        channel_addrs = []
+        for addr in addrs:
+            for c in range(channels_per_sg):
+                ch = grpc.secure_channel(addr, composite, options=options)
+                channels.append(ch)
+                channel_addrs.append(addr)
+            logger.info("Created %d gRPC channel(s) to %s", channels_per_sg, addr)
 
-    _channels = channels
-    _channel_addrs = channel_addrs
-    _channel_failures = [0] * len(channels)
-    _channel_cooldown = [0.0] * len(channels)
-    _channels_built_at = time.monotonic()
+        _channels = channels
+        _channel_addrs = channel_addrs
+        _channel_failures = [0] * len(channels)
+        _channel_cooldown = [0.0] * len(channels)
+        _channels_built_at = time.monotonic()
 
 
 def _get_channel():
@@ -243,28 +266,31 @@ def _mark_channel_failure(idx):
                            idx, _channel_addrs[idx], CB_COOLDOWN_SECONDS)
 
 
-# ── Bucket Management ──────────────────────────────────────────────
+# -- Bucket Management -------------------------------------------------------
 
 def _register_source_bucket(bucket_name):
     """Add a source bucket to the SSM enrolled-buckets registry if not already tracked."""
     if bucket_name in _registered_sources:
         return
-    ssm = _get_ssm()
-    try:
-        resp = ssm.get_parameter(Name=ENROLLED_BUCKETS_PARAM)
-        current = set(resp["Parameter"]["Value"].split(","))
-    except ssm.exceptions.ParameterNotFound:
-        current = set()
-    if bucket_name not in current:
-        current.add(bucket_name)
-        ssm.put_parameter(
-            Name=ENROLLED_BUCKETS_PARAM,
-            Value=",".join(sorted(current)),
-            Type="String",
-            Overwrite=True,
-        )
-        logger.info("Registered source bucket: %s", bucket_name)
-    _registered_sources.add(bucket_name)
+    with _register_lock:
+        if bucket_name in _registered_sources:
+            return
+        ssm = _get_ssm()
+        try:
+            resp = ssm.get_parameter(Name=ENROLLED_BUCKETS_PARAM)
+            current = set(resp["Parameter"]["Value"].split(","))
+        except ssm.exceptions.ParameterNotFound:
+            current = set()
+        if bucket_name not in current:
+            current.add(bucket_name)
+            ssm.put_parameter(
+                Name=ENROLLED_BUCKETS_PARAM,
+                Value=",".join(sorted(current)),
+                Type="String",
+                Overwrite=True,
+            )
+            logger.info("Registered source bucket: %s", bucket_name)
+        _registered_sources.add(bucket_name)
 
 
 def _register_cross_account_bucket(account_id, bucket_name):
@@ -272,67 +298,30 @@ def _register_cross_account_bucket(account_id, bucket_name):
     key = f"{account_id}:{bucket_name}"
     if key in _registered_cross_account:
         return
-    ssm = _get_ssm()
-    try:
-        resp = ssm.get_parameter(Name=CROSS_ACCOUNT_BUCKETS_PARAM)
-        buckets = json.loads(resp["Parameter"]["Value"])
-    except (ssm.exceptions.ParameterNotFound, json.JSONDecodeError):
-        buckets = {}
-    account_buckets = set(buckets.get(account_id, []))
-    if bucket_name not in account_buckets:
-        account_buckets.add(bucket_name)
-        buckets[account_id] = sorted(account_buckets)
-        ssm.put_parameter(
-            Name=CROSS_ACCOUNT_BUCKETS_PARAM,
-            Value=json.dumps(buckets),
-            Type="String",
-            Overwrite=True,
-        )
-        logger.info("Registered cross-account bucket: %s:%s", account_id, bucket_name)
-    _registered_cross_account.add(key)
-
-
-# ── Handler ──────────────────────────────────────────────────────────
-
-def handler(event, context):
-    local_s3 = _get_s3()
-    pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
-    feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
-    audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
-
-    failures = []
-    for sqs_record in event.get("Records", []):
+    with _register_lock:
+        if key in _registered_cross_account:
+            return
+        ssm = _get_ssm()
         try:
-            body = json.loads(sqs_record["body"])
-            # EventBridge event format: detail.bucket.name, detail.object.key
-            detail = body.get("detail", {})
-            bucket = detail.get("bucket", {}).get("name")
-            key = detail.get("object", {}).get("key")
-            size = detail.get("object", {}).get("size", 0)
-            source_account = body.get("account", SCANNER_ACCOUNT_ID)
+            resp = ssm.get_parameter(Name=CROSS_ACCOUNT_BUCKETS_PARAM)
+            buckets = json.loads(resp["Parameter"]["Value"])
+        except (ssm.exceptions.ParameterNotFound, json.JSONDecodeError):
+            buckets = {}
+        account_buckets = set(buckets.get(account_id, []))
+        if bucket_name not in account_buckets:
+            account_buckets.add(bucket_name)
+            buckets[account_id] = sorted(account_buckets)
+            ssm.put_parameter(
+                Name=CROSS_ACCOUNT_BUCKETS_PARAM,
+                Value=json.dumps(buckets),
+                Type="String",
+                Overwrite=True,
+            )
+            logger.info("Registered cross-account bucket: %s:%s", account_id, bucket_name)
+        _registered_cross_account.add(key)
 
-            if bucket and key:
-                is_cross_account = (
-                    source_account
-                    and SCANNER_ACCOUNT_ID
-                    and source_account != SCANNER_ACCOUNT_ID
-                )
-                source_s3 = _get_cross_account_s3(source_account) if is_cross_account else local_s3
-                _process_file(
-                    source_s3, local_s3, bucket, key, size,
-                    source_account, is_cross_account,
-                    pml, feedback, audit_log_group,
-                )
-            else:
-                logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
-        except Exception:
-            logger.exception("Failed processing SQS message %s", sqs_record.get("messageId", "?"))
-            failures.append({"itemIdentifier": sqs_record["messageId"]})
 
-    if failures:
-        return {"batchItemFailures": failures}
-    return {"batchItemFailures": []}
-
+# -- Core Scan Logic ----------------------------------------------------------
 
 def _process_file(source_s3, local_s3, bucket, key, size,
                    source_account, is_cross_account,
@@ -404,13 +393,14 @@ def _process_file(source_s3, local_s3, bucket, key, size,
 
 
 _customer_audit_streams = set()  # Tracks which cross-account log streams we've created
+_audit_lock = threading.Lock()
 
 
 def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, source_account):
     global _audit_stream_created
     if not log_group:
         return
-    stream = f"scanner-{os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown')}"
+    stream = f"scanner-{socket.gethostname()}"
     entry = {
         "timestamp": time.time(),
         "file": key,
@@ -430,12 +420,13 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
     # Write to scanner-account audit log
     try:
         logs = _get_logs()
-        if not _audit_stream_created:
-            try:
-                logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
-            except Exception:
-                pass
-            _audit_stream_created = True
+        with _audit_lock:
+            if not _audit_stream_created:
+                try:
+                    logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
+                except Exception:
+                    pass
+                _audit_stream_created = True
         logs.put_log_events(logGroupName=log_group, logStreamName=stream, logEvents=log_event)
     except Exception:
         logger.warning("Audit write failed (scanner account)", exc_info=True)
@@ -444,14 +435,179 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
     if source_account and SCANNER_ACCOUNT_ID and source_account != SCANNER_ACCOUNT_ID:
         try:
             xacct_logs = _get_cross_account_logs(source_account)
-            if source_account not in _customer_audit_streams:
-                try:
-                    xacct_logs.create_log_stream(
-                        logGroupName=CUSTOMER_LOG_GROUP, logStreamName=stream)
-                except Exception:
-                    pass
-                _customer_audit_streams.add(source_account)
+            with _audit_lock:
+                if source_account not in _customer_audit_streams:
+                    try:
+                        xacct_logs.create_log_stream(
+                            logGroupName=CUSTOMER_LOG_GROUP, logStreamName=stream)
+                    except Exception:
+                        pass
+                    _customer_audit_streams.add(source_account)
             xacct_logs.put_log_events(
                 logGroupName=CUSTOMER_LOG_GROUP, logStreamName=stream, logEvents=log_event)
         except Exception:
             logger.warning("Audit write failed (customer account %s)", source_account, exc_info=True)
+
+
+# -- SQS Message Processing --------------------------------------------------
+
+def _heartbeat(sqs, queue_url, receipt_handle, visibility_timeout, stop_event):
+    """Extend SQS message visibility periodically until stop_event is set."""
+    interval = max(visibility_timeout - 60, 30)
+    while not stop_event.wait(timeout=interval):
+        try:
+            sqs.change_message_visibility(
+                QueueUrl=queue_url,
+                ReceiptHandle=receipt_handle,
+                VisibilityTimeout=visibility_timeout,
+            )
+        except Exception:
+            logger.warning("Failed to extend visibility", exc_info=True)
+            return  # Stop heartbeat — message may become visible to other workers
+
+
+def _process_message(sqs, queue_url, message, visibility_timeout):
+    """Process a single SQS message: parse, scan, delete or let retry."""
+    message_id = message.get("MessageId", "unknown")
+    receipt_handle = message["ReceiptHandle"]
+
+    # Start heartbeat thread to keep message invisible during long scans
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat,
+        args=(sqs, queue_url, receipt_handle, visibility_timeout, heartbeat_stop),
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
+    local_s3 = _get_s3()
+    pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
+    feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
+    audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
+
+    try:
+        body = json.loads(message["Body"])
+        # EventBridge event format: detail.bucket.name, detail.object.key
+        detail = body.get("detail", {})
+        bucket = detail.get("bucket", {}).get("name")
+        key = detail.get("object", {}).get("key")
+        size = detail.get("object", {}).get("size", 0)
+        source_account = body.get("account", SCANNER_ACCOUNT_ID)
+
+        if not bucket or not key:
+            logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
+            # Delete malformed message so it doesn't block the queue
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+            return
+
+        is_cross_account = (
+            source_account
+            and SCANNER_ACCOUNT_ID
+            and source_account != SCANNER_ACCOUNT_ID
+        )
+        source_s3 = _get_cross_account_s3(source_account) if is_cross_account else local_s3
+
+        _process_file(
+            source_s3, local_s3, bucket, key, size,
+            source_account, is_cross_account,
+            pml, feedback, audit_log_group,
+        )
+        # Success — delete message from queue
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+
+    except Exception:
+        logger.exception("Failed processing SQS message %s", message_id)
+        # Let visibility expire for automatic retry (SQS redrive to DLQ after 5 failures)
+        # Shorten visibility for faster retry
+        try:
+            sqs.change_message_visibility(
+                QueueUrl=queue_url,
+                ReceiptHandle=receipt_handle,
+                VisibilityTimeout=30,
+            )
+        except Exception:
+            pass
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=5)
+
+
+# -- Main Entry Point --------------------------------------------------------
+
+def main():
+    """Long-running SQS poller with concurrent scan workers."""
+    sqs = boto3.client("sqs")
+    queue_url = os.environ["SQS_QUEUE_URL"]
+    max_workers = int(os.environ.get("MAX_CONCURRENT_SCANS", "50"))
+    visibility_timeout = int(os.environ.get("SQS_VISIBILITY_TIMEOUT", "300"))
+    consecutive_errors = 0
+
+    logger.info(
+        "Scanner worker starting — queue=%s concurrency=%d hostname=%s",
+        queue_url, max_workers, socket.gethostname(),
+    )
+
+    # Pre-build gRPC channels before accepting work
+    _build_channels()
+    logger.info("gRPC channels ready")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        in_flight = set()
+
+        while not _shutdown_event.is_set():
+            # Clean up completed futures
+            done = {f for f in in_flight if f.done()}
+            in_flight -= done
+            # Log any exceptions from completed futures
+            for f in done:
+                exc = f.exception()
+                if exc:
+                    logger.error("Worker thread raised: %s", exc)
+
+            # Backpressure: pause polling when workers are saturated
+            if len(in_flight) >= max_workers:
+                time.sleep(0.1)
+                continue
+
+            # Long-poll SQS (up to 10 messages, 20s wait)
+            try:
+                resp = sqs.receive_message(
+                    QueueUrl=queue_url,
+                    MaxNumberOfMessages=10,
+                    WaitTimeSeconds=20,
+                    AttributeNames=["All"],
+                )
+                consecutive_errors = 0
+            except Exception:
+                consecutive_errors += 1
+                delay = min(2 ** consecutive_errors, 60) + random.uniform(0, 1)
+                logger.exception("SQS receive_message error, retrying in %.1fs", delay)
+                time.sleep(delay)
+                continue
+
+            for msg in resp.get("Messages", []):
+                future = pool.submit(
+                    _process_message, sqs, queue_url, msg, visibility_timeout,
+                )
+                in_flight.add(future)
+
+        # Graceful shutdown: wait for in-flight scans to finish
+        logger.info("Shutting down — waiting for %d in-flight scans", len(in_flight))
+        for f in as_completed(in_flight, timeout=300):
+            exc = f.exception()
+            if exc:
+                logger.error("Worker thread raised during shutdown: %s", exc)
+
+    logger.info("Shutdown complete")
+
+
+def _handle_signal(signum, frame):
+    sig_name = signal.Signals(signum).name
+    logger.info("Received %s — initiating graceful shutdown", sig_name)
+    _shutdown_event.set()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    main()

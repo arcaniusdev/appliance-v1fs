@@ -6,8 +6,8 @@ Parameters:
     Description: AWS account ID where the scanner appliance runs
     Type: String
     AllowedPattern: "[0-9]{12}"
-  ScannerLambdaRoleArn:
-    Description: ARN of the scanner Lambda execution role (from scanner stack outputs)
+  WorkerRoleArn:
+    Description: ARN of the scanner worker role (from scanner stack outputs)
     Type: String
   ScanTagKey:
     Description: S3 bucket tag key that triggers scanning enrollment
@@ -15,7 +15,7 @@ Parameters:
     Default: "v1fs:scan"
 
 Resources:
-  # ── Cross-Account IAM Role for Scanner Lambda ─────────────────────
+  # ── Cross-Account IAM Role for Scanner Workers ────────────────────
   ScannerAccessRole:
     Type: AWS::IAM::Role
     Properties:
@@ -25,7 +25,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              AWS: !Ref ScannerLambdaRoleArn
+              AWS: !Ref WorkerRoleArn
             Action: sts:AssumeRole
       Policies:
         - PolicyName: S3ScanAccess
@@ -314,7 +314,7 @@ Resources:
 
 Outputs:
   ScannerAccessRoleArn:
-    Description: Cross-account role ARN assumed by the scanner Lambda
+    Description: Cross-account role ARN assumed by the scanner workers
     Value: !GetAtt ScannerAccessRole.Arn
   EnrolledAccountId:
     Description: This account's ID

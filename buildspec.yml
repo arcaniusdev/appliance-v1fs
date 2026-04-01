@@ -3,15 +3,9 @@ version: 0.2
 phases:
   build:
     commands:
-      # ── Scanner Lambda layer (visionone-filesecurity + gRPC) ──────
-      - mkdir -p /tmp/scanner-layer/python
-      - "pip install -r app/requirements.txt -t /tmp/scanner-layer/python --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12"
-      - cd /tmp/scanner-layer && zip -r /tmp/scanner-layer.zip python/
-      - aws s3 cp /tmp/scanner-layer.zip s3://$DEPLOY_BUCKET/scanner-layer.zip
-
-      # ── Scanner Lambda code ───────────────────────────────────────
-      - cd $CODEBUILD_SRC_DIR && cd app && zip /tmp/scanner-code.zip scanner.py
-      - aws s3 cp /tmp/scanner-code.zip s3://$DEPLOY_BUCKET/scanner-code.zip
+      # ── Scanner worker application ───────────────────────────────
+      - cd $CODEBUILD_SRC_DIR/app && zip /tmp/scanner-app.zip scanner.py requirements.txt
+      - aws s3 cp /tmp/scanner-app.zip s3://$DEPLOY_BUCKET/scanner-app.zip
 
       # ── Provisioner Lambda layer (paramiko only) ──────────────────
       - cd $CODEBUILD_SRC_DIR

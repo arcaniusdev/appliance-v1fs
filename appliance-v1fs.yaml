@@ -99,6 +99,32 @@ Parameters:
     Type: Number
     Default: 30
     MinValue: 1
+  WorkerInstanceType:
+    Description: EC2 instance type for scanner worker fleet
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+  WorkerMinCount:
+    Description: Minimum number of scanner workers (HA across AZs)
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 20
+  WorkerMaxCount:
+    Description: Maximum number of scanner workers (scales on queue depth)
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+  WorkerConcurrency:
+    Description: Concurrent scans per worker instance
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 200
 
 Conditions:
   HasAtLeast2SGs: !Not [!Equals [!Ref ServiceGatewayCount, 1]]
@@ -305,6 +331,17 @@ Resources:
     Properties:
       RouteTableId: !Ref PrivateRT2
       SubnetId: !Ref PrivateSubnet2
+
+  # ── S3 Gateway VPC Endpoint ────────────────────────────────────────
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRT1
+        - !Ref PrivateRT2
 
   # ── SSH Key Pair ────────────────────────────────────────────────────
   ServiceGatewayKeyPair:
@@ -637,7 +674,7 @@ Resources:
   ScanQueue:
     Type: AWS::SQS::Queue
     Properties:
-      VisibilityTimeout: 900
+      VisibilityTimeout: 300
       MessageRetentionPeriod: 1209600
       ReceiveMessageWaitTimeSeconds: 20
       RedrivePolicy:
@@ -1097,7 +1134,7 @@ Resources:
                   props = event["ResourceProperties"]
                   bucket = props["DeployBucket"]
                   account_id = props["ScannerAccountId"]
-                  role_arn = props["ScannerLambdaRoleArn"]
+                  role_arn = props["WorkerRoleArn"]
                   # Read raw enrollment template
                   resp = s3.get_object(Bucket=bucket, Key="enrollment.yaml")
                   template = resp["Body"].read().decode("utf-8")
@@ -1107,8 +1144,8 @@ Resources:
                       f'AllowedPattern: "[0-9]{{12}}"\n    Default: "{account_id}"',
                   )
                   template = template.replace(
-                      "  ScannerLambdaRoleArn:\n    Description: ARN of the scanner Lambda execution role (from scanner stack outputs)\n    Type: String",
-                      f"  ScannerLambdaRoleArn:\n    Description: ARN of the scanner Lambda execution role (from scanner stack outputs)\n    Type: String\n    Default: \"{role_arn}\"",
+                      "  WorkerRoleArn:\n    Description: ARN of the scanner worker role (from scanner stack outputs)\n    Type: String",
+                      f"  WorkerRoleArn:\n    Description: ARN of the scanner worker role (from scanner stack outputs)\n    Type: String\n    Default: \"{role_arn}\"",
                   )
                   # Upload pre-populated version
                   s3.put_object(Bucket=bucket, Key="enrollment-prepopulated.yaml",
@@ -1141,7 +1178,7 @@ Resources:
       ServiceToken: !GetAtt EnrollmentTemplateLambda.Arn
       DeployBucket: !Ref DeployBucket
       ScannerAccountId: !Ref "AWS::AccountId"
-      ScannerLambdaRoleArn: !GetAtt ScannerLambdaRole.Arn
+      WorkerRoleArn: !GetAtt WorkerRole.Arn
 
   # ── CloudWatch Audit Log ───────────────────────────────────────────
   AuditLogGroup:
@@ -1150,12 +1187,12 @@ Resources:
       LogGroupName: !Sub scan-audit-${AWS::StackName}
       RetentionInDays: 90
 
-  # ── Scanner Lambda ──────────────────────────────────────────────────
-  ScannerLambdaSecGroup:
+  # ── Scanner Worker Fleet ────────────────────────────────────────────
+  WorkerSecGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       VpcId: !Ref BaseVPC
-      GroupDescription: Scanner Lambda - egress to Service Gateway and AWS APIs
+      GroupDescription: Scanner workers - egress to Service Gateway and AWS APIs
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
@@ -1164,9 +1201,9 @@ Resources:
           Description: HTTPS to Service Gateway and AWS APIs
       Tags:
         - Key: Name
-          Value: !Sub ScannerLambdaSecGroup-${AWS::StackName}
+          Value: !Sub WorkerSecGroup-${AWS::StackName}
 
-  ScannerLambdaRole:
+  WorkerRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -1174,12 +1211,10 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: lambda.amazonaws.com
+              Service: ec2.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
       Policies:
-        - PolicyName: ScannerPolicy
+        - PolicyName: WorkerPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -1188,6 +1223,7 @@ Resources:
                   - sqs:ReceiveMessage
                   - sqs:DeleteMessage
                   - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
                 Resource: !GetAtt ScanQueue.Arn
               - Effect: Allow
                 Action:
@@ -1197,6 +1233,9 @@ Resources:
                   - s3:PutObjectTagging
                   - s3:ListBucket
                 Resource: "arn:aws:s3:::*"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}/*"
               - Effect: Allow
                 Action: sts:AssumeRole
                 Resource: "arn:aws:iam::*:role/appliance-v1fs-scanner-access"
@@ -1218,16 +1257,172 @@ Resources:
                 Action: ec2:DescribeInstances
                 Resource: "*"
 
-  ScannerLayer:
-    Type: AWS::Lambda::LayerVersion
-    DependsOn: CodeBuild
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
     Properties:
-      LayerName: !Sub scanner-deps-${AWS::StackName}
-      Content:
-        S3Bucket: !Ref DeployBucket
-        S3Key: scanner-layer.zip
-      CompatibleRuntimes:
-        - python3.12
+      Roles:
+        - !Ref WorkerRole
+
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - ServiceGateway1
+      - CodeBuild
+    Properties:
+      LaunchTemplateName: !Sub worker-${AWS::StackName}
+      LaunchTemplateData:
+        ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+        InstanceType: !Ref WorkerInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt WorkerInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WorkerSecGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub Worker-${AWS::StackName}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            exec > /var/log/scanner-bootstrap.log 2>&1
+
+            yum install -y python3.12 python3.12-pip unzip
+
+            mkdir -p /opt/scanner
+            aws s3 cp s3://${DeployBucket}/scanner-app.zip /opt/scanner/scanner-app.zip
+            cd /opt/scanner && unzip -o scanner-app.zip
+            pip3.12 install -r requirements.txt
+
+            cat > /etc/scanner.env << 'ENVEOF'
+            SQS_QUEUE_URL=${ScanQueue}
+            SQS_VISIBILITY_TIMEOUT=300
+            MAX_CONCURRENT_SCANS=${WorkerConcurrency}
+            SG_DISCOVERY_TAG=appliance-v1fs:stack=${AWS::StackName}
+            SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert
+            V1FS_API_KEY_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key
+            AUDIT_LOG_GROUP=scan-audit-${AWS::StackName}
+            PML_ENABLED=${PMLEnabled}
+            FEEDBACK_ENABLED=${SmartFeedbackEnabled}
+            CHANNELS_PER_SG=${ChannelsPerSG}
+            MAX_FILE_SIZE_MB=${MaxFileSizeMB}
+            SCANNER_ACCOUNT_ID=${AWS::AccountId}
+            QUARANTINE_BUCKET=${QuarantineBucket}
+            CUSTOMER_LOG_GROUP=v1fs-scan-audit
+            LOG_LEVEL=INFO
+            ENVEOF
+
+            cat > /etc/systemd/system/scanner.service << 'SVCEOF'
+            [Unit]
+            Description=File Scanner Worker
+            After=network.target
+
+            [Service]
+            EnvironmentFile=/etc/scanner.env
+            ExecStart=/usr/bin/python3.12 /opt/scanner/scanner.py
+            Restart=always
+            RestartSec=5
+            KillSignal=SIGTERM
+            TimeoutStopSec=330
+
+            [Install]
+            WantedBy=multi-user.target
+            SVCEOF
+
+            systemctl daemon-reload
+            systemctl enable scanner
+            systemctl start scanner
+
+  WorkerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - ServiceGateway1
+      - CodeBuild
+    Properties:
+      AutoScalingGroupName: !Sub worker-asg-${AWS::StackName}
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref WorkerMinCount
+      MaxSize: !Ref WorkerMaxCount
+      DesiredCapacity: !Ref WorkerMinCount
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 180
+      DefaultInstanceWarmup: 120
+      Tags:
+        - Key: Name
+          Value: !Sub Worker-${AWS::StackName}
+          PropagateAtLaunch: false
+
+  WorkerScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WorkerASG
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          MetricIntervalUpperBound: 1000
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 1000
+          MetricIntervalUpperBound: 5000
+          ScalingAdjustment: 2
+        - MetricIntervalLowerBound: 5000
+          ScalingAdjustment: 4
+
+  WorkerScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-worker-scale-out
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScanQueue.QueueName
+      AlarmActions:
+        - !Ref WorkerScaleOutPolicy
+
+  WorkerScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WorkerASG
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      StepAdjustments:
+        - MetricIntervalUpperBound: 0
+          ScalingAdjustment: -1
+
+  WorkerScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-worker-scale-in
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScanQueue.QueueName
+      AlarmActions:
+        - !Ref WorkerScaleInPolicy
 
   ProvisionerLayer:
     Type: AWS::Lambda::LayerVersion
@@ -1239,54 +1434,6 @@ Resources:
         S3Key: provisioner-layer.zip
       CompatibleRuntimes:
         - python3.12
-
-  ScannerLambda:
-    Type: AWS::Lambda::Function
-    DependsOn:
-      - ServiceGateway1
-      - CodeBuild
-    Properties:
-      FunctionName: !Sub scanner-${AWS::StackName}
-      Runtime: python3.12
-      Handler: scanner.handler
-      Code:
-        S3Bucket: !Ref DeployBucket
-        S3Key: scanner-code.zip
-      Layers:
-        - !Ref ScannerLayer
-      Role: !GetAtt ScannerLambdaRole.Arn
-      Timeout: 900
-      MemorySize: 3008
-      VpcConfig:
-        SubnetIds:
-          - !Ref PrivateSubnet1
-          - !Ref PrivateSubnet2
-        SecurityGroupIds:
-          - !Ref ScannerLambdaSecGroup
-      Environment:
-        Variables:
-          SG_DISCOVERY_TAG: !Sub "appliance-v1fs:stack=${AWS::StackName}"
-          SG_CA_CERT_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert"
-          V1FS_API_KEY_SECRET_ARN: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key"
-          AUDIT_LOG_GROUP: !Sub scan-audit-${AWS::StackName}
-          PML_ENABLED: !Ref PMLEnabled
-          FEEDBACK_ENABLED: !Ref SmartFeedbackEnabled
-          CHANNELS_PER_SG: !Ref ChannelsPerSG
-          MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
-          SCANNER_ACCOUNT_ID: !Ref "AWS::AccountId"
-          QUARANTINE_BUCKET: !Ref QuarantineBucket
-          CUSTOMER_LOG_GROUP: v1fs-scan-audit
-          LOG_LEVEL: INFO
-
-  ScannerEventSourceMapping:
-    Type: AWS::Lambda::EventSourceMapping
-    Properties:
-      EventSourceArn: !GetAtt ScanQueue.Arn
-      FunctionName: !Ref ScannerLambda
-      BatchSize: 1
-      MaximumBatchingWindowInSeconds: 0
-      FunctionResponseTypes:
-        - ReportBatchItemFailures
 
   # ── Alarms & Notifications ─────────────────────────────────────────
   AlarmSNSTopic:
@@ -1559,23 +1706,23 @@ Resources:
             {
               "type": "text",
               "x": 0, "y": 25, "width": 24, "height": 1,
-              "properties": { "markdown": "## Scanner Lambda" }
+              "properties": { "markdown": "## Scanner Workers" }
             },
             {
               "type": "metric",
               "x": 0, "y": 26, "width": 8, "height": 6,
               "properties": {
                 "metrics": [
-                  ["AWS/Lambda", "Invocations", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Sum", "color": "#1f77b4", "label": "Invocations"}],
-                  ["AWS/Lambda", "Errors", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Sum", "color": "#d62728", "label": "Errors"}],
-                  ["AWS/Lambda", "Throttles", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Sum", "color": "#ff7f0e", "label": "Throttles"}]
+                  ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "worker-asg-${AWS::StackName}", {"stat": "Average", "color": "#1f77b4", "label": "In Service"}],
+                  ["AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "worker-asg-${AWS::StackName}", {"stat": "Average", "color": "#ff7f0e", "label": "Desired"}],
+                  ["AWS/AutoScaling", "GroupMaxSize", "AutoScalingGroupName", "worker-asg-${AWS::StackName}", {"stat": "Average", "color": "#d62728", "label": "Max", "period": 300}]
                 ],
                 "view": "timeSeries",
                 "stacked": false,
                 "region": "${AWS::Region}",
-                "title": "Lambda Invocations / Errors / Throttles",
+                "title": "Worker Fleet Size",
                 "period": 60,
-                "yAxis": { "left": { "label": "Count", "showUnits": false } }
+                "yAxis": { "left": { "label": "Instances", "showUnits": false } }
               }
             },
             {
@@ -1583,29 +1730,31 @@ Resources:
               "x": 8, "y": 26, "width": 8, "height": 6,
               "properties": {
                 "metrics": [
-                  ["AWS/Lambda", "Duration", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Average", "color": "#1f77b4", "label": "Avg"}],
-                  ["AWS/Lambda", "Duration", "FunctionName", "scanner-${AWS::StackName}", {"stat": "p90", "color": "#ff7f0e", "label": "p90"}],
-                  ["AWS/Lambda", "Duration", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Maximum", "color": "#d62728", "label": "Max"}]
+                  ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "worker-asg-${AWS::StackName}", {"stat": "Average", "color": "#1f77b4", "label": "Avg CPU"}],
+                  ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "worker-asg-${AWS::StackName}", {"stat": "Maximum", "color": "#d62728", "label": "Max CPU"}]
                 ],
                 "view": "timeSeries",
                 "stacked": false,
                 "region": "${AWS::Region}",
-                "title": "Lambda Duration (ms)",
+                "title": "Worker CPU Utilization (%)",
                 "period": 60,
-                "yAxis": { "left": { "label": "ms", "showUnits": false } }
+                "yAxis": { "left": { "label": "%", "showUnits": false, "max": 100 } }
               }
             },
             {
               "type": "metric",
               "x": 16, "y": 26, "width": 8, "height": 6,
               "properties": {
-                "metrics": [["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "scanner-${AWS::StackName}", {"stat": "Maximum", "color": "#9467bd", "label": "Concurrent"}]],
+                "metrics": [
+                  ["AWS/EC2", "NetworkIn", "AutoScalingGroupName", "worker-asg-${AWS::StackName}", {"stat": "Sum", "color": "#1f77b4", "label": "Network In"}],
+                  ["AWS/EC2", "NetworkOut", "AutoScalingGroupName", "worker-asg-${AWS::StackName}", {"stat": "Sum", "color": "#ff7f0e", "label": "Network Out"}]
+                ],
                 "view": "timeSeries",
                 "stacked": false,
                 "region": "${AWS::Region}",
-                "title": "Lambda Concurrent Executions",
+                "title": "Worker Network I/O (bytes)",
                 "period": 60,
-                "yAxis": { "left": { "label": "Count", "showUnits": false } }
+                "yAxis": { "left": { "label": "Bytes", "showUnits": false } }
               }
             },
             {
@@ -1857,9 +2006,9 @@ Outputs:
   ScanDLQUrl:
     Description: SQS dead letter queue URL
     Value: !Ref ScanDLQ
-  ScannerLambdaName:
-    Description: Scanner Lambda function name
-    Value: !Ref ScannerLambda
+  WorkerASGName:
+    Description: Scanner worker Auto Scaling Group name
+    Value: !Ref WorkerASG
   DashboardURL:
     Description: CloudWatch dashboard URL
     Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/scanner-${AWS::StackName}"
@@ -1872,9 +2021,9 @@ Outputs:
   QuarantineBucketName:
     Description: Central quarantine bucket for malicious files
     Value: !Ref QuarantineBucket
-  ScannerLambdaRoleArn:
-    Description: Scanner Lambda execution role ARN (for enrollment template trust policy)
-    Value: !GetAtt ScannerLambdaRole.Arn
+  WorkerRoleArn:
+    Description: Scanner worker role ARN (for enrollment template trust policy)
+    Value: !GetAtt WorkerRole.Arn
   ScannerAccountId:
     Description: Scanner account ID (for enrollment template parameter)
     Value: !Ref "AWS::AccountId"
