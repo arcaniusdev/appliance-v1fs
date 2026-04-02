@@ -1400,6 +1400,7 @@ Resources:
             pip3.12 install -r requirements.txt
 
             cat > /etc/scanner.env << 'ENVEOF'
+            AWS_DEFAULT_REGION=${AWS::Region}
             SQS_QUEUE_URL=${ScanQueue}
             SQS_VISIBILITY_TIMEOUT=300
             MAX_CONCURRENT_SCANS=${WorkerConcurrency}
