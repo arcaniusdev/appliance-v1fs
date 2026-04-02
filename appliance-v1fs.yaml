@@ -1334,7 +1334,9 @@ Resources:
                 Action: s3:PutObjectTagging
                 Resource: !Sub "${SourceBucket.Arn}/*"
               - Effect: Allow
-                Action: s3:PutObject
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
                 Resource: !Sub "${QuarantineBucket.Arn}/*"
               - Effect: Allow
                 Action: s3:GetObject
