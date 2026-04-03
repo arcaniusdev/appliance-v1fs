@@ -205,17 +205,23 @@ def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
         logger.warning("s3://%s/%s gone, skipping", scan_bucket, key)
         return
 
-    channel, sg_addr, ch_idx = _get_channel()
-    scan_start = time.monotonic()
-    try:
-        result_json = amaas.grpc.scan_buffer(
-            channel, file_bytes, os.path.basename(key),
-            tags=["S3-Scan"], pml=pml, feedback=feedback,
-        )
-        _mark_channel_success(ch_idx)
-    except Exception:
-        _mark_channel_failure(ch_idx)
-        raise
+    for attempt in range(3):
+        channel, sg_addr, ch_idx = _get_channel()
+        scan_start = time.monotonic()
+        try:
+            result_json = amaas.grpc.scan_buffer(
+                channel, file_bytes, os.path.basename(key),
+                tags=["S3-Scan"], pml=pml, feedback=feedback,
+            )
+            _mark_channel_success(ch_idx)
+            break
+        except Exception as exc:
+            _mark_channel_failure(ch_idx)
+            if "RESOURCE_EXHAUSTED" in str(type(exc).__name__) or "Cannot allocate resource" in str(exc):
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+            raise
     scan_ms = int((time.monotonic() - scan_start) * 1000)
     result = json.loads(result_json)
     is_malicious = result.get("scanResult", 0) > 0
