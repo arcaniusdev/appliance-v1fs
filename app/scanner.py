@@ -306,34 +306,10 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
 
 # -- SQS Message Processing --------------------------------------------------
 
-def _heartbeat(sqs, queue_url, receipt_handle, visibility_timeout, stop_event):
-    """Extend SQS message visibility periodically until stop_event is set."""
-    interval = max(visibility_timeout - 60, 30)
-    while not stop_event.wait(timeout=interval):
-        try:
-            sqs.change_message_visibility(
-                QueueUrl=queue_url,
-                ReceiptHandle=receipt_handle,
-                VisibilityTimeout=visibility_timeout,
-            )
-        except Exception:
-            logger.warning("Failed to extend visibility", exc_info=True)
-            return  # Stop heartbeat — message may become visible to other workers
-
-
 def _process_message(sqs, queue_url, message, visibility_timeout):
     """Process a single SQS message: parse, scan, delete or let retry."""
     message_id = message.get("MessageId", "unknown")
     receipt_handle = message["ReceiptHandle"]
-
-    # Start heartbeat thread to keep message invisible during long scans
-    heartbeat_stop = threading.Event()
-    heartbeat_thread = threading.Thread(
-        target=_heartbeat,
-        args=(sqs, queue_url, receipt_handle, visibility_timeout, heartbeat_stop),
-        daemon=True,
-    )
-    heartbeat_thread.start()
 
     s3 = _get_s3()
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
@@ -369,9 +345,6 @@ def _process_message(sqs, queue_url, message, visibility_timeout):
             )
         except Exception:
             pass
-    finally:
-        heartbeat_stop.set()
-        heartbeat_thread.join(timeout=5)
 
 
 # -- ASG Lifecycle -----------------------------------------------------------
