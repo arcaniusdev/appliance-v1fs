@@ -37,14 +37,11 @@ SCANNER_ACCOUNT_ID = os.environ.get("SCANNER_ACCOUNT_ID", "")
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 
 # Channel refresh interval — re-discover SGs periodically
-CHANNEL_REFRESH_SECONDS = 300
+CHANNEL_REFRESH_SECONDS = 60
 
 # Circuit breaker settings
 CB_FAILURE_THRESHOLD = 3  # failures before marking channel unhealthy
 CB_COOLDOWN_SECONDS = 60  # seconds to skip an unhealthy channel
-
-# Limit concurrent gRPC calls to prevent internal thread accumulation
-_scan_semaphore = threading.Semaphore(16)
 
 # Shutdown coordination
 _shutdown_event = threading.Event()
@@ -143,19 +140,10 @@ def _build_channels():
                 channel_addrs.append(addr)
             logger.info("Created %d gRPC channel(s) to %s", channels_per_sg, addr)
 
-        old_channels = _channels
         _channels = channels
         _channel_addrs = channel_addrs
         _channel_failures = [0] * len(channels)
         _channel_cooldown = [0.0] * len(channels)
-
-        # Close old channels to prevent thread leak from gRPC C-core
-        if old_channels:
-            for ch in old_channels:
-                try:
-                    ch.close()
-                except Exception:
-                    pass
         _channels_built_at = time.monotonic()
 
 
@@ -221,11 +209,10 @@ def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
         channel, sg_addr, ch_idx = _get_channel()
         scan_start = time.monotonic()
         try:
-            with _scan_semaphore:
-                result_json = amaas.grpc.scan_buffer(
-                    channel, file_bytes, os.path.basename(key),
-                    tags=["S3-Scan"], pml=pml, feedback=feedback,
-                )
+            result_json = amaas.grpc.scan_buffer(
+                channel, file_bytes, os.path.basename(key),
+                tags=["S3-Scan"], pml=pml, feedback=feedback,
+            )
             _mark_channel_success(ch_idx)
             break
         except Exception as exc:
@@ -318,10 +305,34 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
 
 # -- SQS Message Processing --------------------------------------------------
 
+def _heartbeat(sqs, queue_url, receipt_handle, visibility_timeout, stop_event):
+    """Extend SQS message visibility periodically until stop_event is set."""
+    interval = max(visibility_timeout - 60, 30)
+    while not stop_event.wait(timeout=interval):
+        try:
+            sqs.change_message_visibility(
+                QueueUrl=queue_url,
+                ReceiptHandle=receipt_handle,
+                VisibilityTimeout=visibility_timeout,
+            )
+        except Exception:
+            logger.warning("Failed to extend visibility", exc_info=True)
+            return  # Stop heartbeat — message may become visible to other workers
+
+
 def _process_message(sqs, queue_url, message, visibility_timeout):
     """Process a single SQS message: parse, scan, delete or let retry."""
     message_id = message.get("MessageId", "unknown")
     receipt_handle = message["ReceiptHandle"]
+
+    # Start heartbeat thread to keep message invisible during long scans
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat,
+        args=(sqs, queue_url, receipt_handle, visibility_timeout, heartbeat_stop),
+        daemon=True,
+    )
+    heartbeat_thread.start()
 
     s3 = _get_s3()
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
@@ -357,6 +368,9 @@ def _process_message(sqs, queue_url, message, visibility_timeout):
             )
         except Exception:
             pass
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=5)
 
 
 # -- ASG Lifecycle -----------------------------------------------------------
