@@ -92,6 +92,7 @@ def _build_channels():
             ("grpc.keepalive_time_ms", 30_000),
             ("grpc.keepalive_timeout_ms", 10_000),
             ("grpc.keepalive_permit_without_calls", 1),
+            ("grpc.use_local_subchannel_pool", 1),
         ]
 
         num_channels = int(os.environ.get("GRPC_CHANNELS", "8"))
