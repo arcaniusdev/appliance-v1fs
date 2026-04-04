@@ -627,7 +627,7 @@ Resources:
       HealthCheckPort: "443"
       HealthCheckPath: /
       Matcher:
-        HttpCode: "200-399"
+        HttpCode: "200-499"
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 2
       HealthCheckIntervalSeconds: 10
