@@ -1392,7 +1392,7 @@ Resources:
             AWS_DEFAULT_REGION=${AWS::Region}
             SQS_QUEUE_URL=${ScanQueue}
             SQS_VISIBILITY_TIMEOUT=300
-            MAX_CONCURRENT_SCANS=50
+            MAX_CONCURRENT_SCANS=20
             ASG_NAME=worker-asg-${AWS::StackName}
             SG_DISCOVERY_TAG=appliance-v1fs:stack=${AWS::StackName}
             CHANNELS_PER_SG=2

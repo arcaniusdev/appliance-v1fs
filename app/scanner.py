@@ -1,12 +1,13 @@
 import json
 import logging
+import multiprocessing
 import os
 import random
 import signal
 import socket
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
@@ -315,11 +316,25 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
 
 # -- SQS Message Processing --------------------------------------------------
 
-def _process_message(sqs, queue_url, message, visibility_timeout):
-    """Process a single SQS message: parse, scan, delete or let retry."""
+def _init_worker():
+    """Initialize per-process state for worker processes."""
+    # Force fresh clients — don't inherit parent's connections
+    global _s3_client, _ec2_client, _logs_client, _channels, _audit_stream_created
+    _s3_client = None
+    _ec2_client = None
+    _logs_client = None
+    _channels = None
+    _audit_stream_created = False
+    _build_channels()
+
+
+def _process_message(args):
+    """Process a single SQS message in a worker process."""
+    queue_url, message, visibility_timeout = args
     message_id = message.get("MessageId", "unknown")
     receipt_handle = message["ReceiptHandle"]
 
+    sqs = boto3.client("sqs")
     s3 = _get_s3()
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
     feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
@@ -396,7 +411,9 @@ def _complete_lifecycle_action():
 # -- Main Entry Point --------------------------------------------------------
 
 def main():
-    """Long-running SQS poller with concurrent scan workers."""
+    """Long-running SQS poller with process pool scan workers."""
+    multiprocessing.set_start_method("spawn", force=True)
+
     sqs = boto3.client("sqs")
     queue_url = os.environ["SQS_QUEUE_URL"]
     max_workers = int(os.environ.get("MAX_CONCURRENT_SCANS", "50"))
@@ -408,11 +425,7 @@ def main():
         queue_url, max_workers, socket.gethostname(),
     )
 
-    # Pre-build gRPC channels before accepting work
-    _build_channels()
-    logger.info("gRPC channels ready")
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker) as pool:
         in_flight = set()
 
         while not _shutdown_event.is_set():
@@ -423,7 +436,7 @@ def main():
             for f in done:
                 exc = f.exception()
                 if exc:
-                    logger.error("Worker thread raised: %s", exc)
+                    logger.error("Worker process raised: %s", exc)
 
             # Backpressure: pause polling when workers are saturated
             if len(in_flight) >= max_workers:
@@ -448,7 +461,7 @@ def main():
 
             for msg in resp.get("Messages", []):
                 future = pool.submit(
-                    _process_message, sqs, queue_url, msg, visibility_timeout,
+                    _process_message, (queue_url, msg, visibility_timeout),
                 )
                 in_flight.add(future)
 
@@ -457,7 +470,7 @@ def main():
         for f in as_completed(in_flight, timeout=300):
             exc = f.exception()
             if exc:
-                logger.error("Worker thread raised during shutdown: %s", exc)
+                logger.error("Worker process raised during shutdown: %s", exc)
 
     _complete_lifecycle_action()
     logger.info("Shutdown complete")
