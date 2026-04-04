@@ -142,6 +142,20 @@ def _scale_replicas(sgowner_client, count):
     return output
 
 
+def _register_nlb_target(instance_id):
+    """Register an SG instance in the NLB target group."""
+    tg_arn = os.environ.get("TARGET_GROUP_ARN", "")
+    if not tg_arn:
+        logger.warning("TARGET_GROUP_ARN not set, skipping NLB registration")
+        return
+    elbv2 = boto3.client("elbv2")
+    elbv2.register_targets(
+        TargetGroupArn=tg_arn,
+        Targets=[{"Id": instance_id, "Port": 443}],
+    )
+    logger.info("Registered %s in NLB target group", instance_id)
+
+
 def _store_cert(secret_name, cert_pem, region):
     """Store or update the CA cert in Secrets Manager."""
     sm = boto3.client("secretsmanager", region_name=region)
@@ -288,10 +302,11 @@ def _handle_instance_running(event, context):
                 )
                 logger.info("Scanner version on %s: %s", instance_id, version)
 
-        # Mark as provisioned so we don't re-provision on restart
+        # Mark as provisioned and register in NLB
         ec2.create_tags(Resources=[instance_id], Tags=[
             {"Key": "appliance-v1fs:provisioned", "Value": "true"},
         ])
+        _register_nlb_target(instance_id)
 
         return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
 
@@ -475,6 +490,7 @@ def _check_sg(instance_info, endpoint_id, private_key, rsa_key, pubkey_b64,
                 ec2.create_tags(Resources=[instance_id], Tags=[
                     {"Key": "appliance-v1fs:provisioned", "Value": "true"},
                 ])
+                _register_nlb_target(instance_id)
                 result["provisioned"] = "true"
                 result["action"] = "provisioned"
                 logger.info("Watchdog: %s (%s) now fully provisioned",
