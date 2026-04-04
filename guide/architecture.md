@@ -35,7 +35,7 @@ SG appliances are plain **EC2 instances** (no ASG, no auto-scaling, no auto-repl
 
 ## Multi-Channel gRPC
 
-The `ChannelsPerSG` parameter (1-8, default 2) opens multiple gRPC channels per SG. **2 channels is the optimal setting** — it doubles throughput per SG without overloading nginx. 4 channels causes RST_STREAM errors under load.
+Workers open 2 gRPC channels per SG (hardcoded). This doubles throughput per SG without overloading nginx. Testing showed 3+ channels causes imbalance (79/21% traffic split) and 4 channels causes RST_STREAM errors under load.
 
 ## Scanner Lambda
 
