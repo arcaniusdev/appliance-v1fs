@@ -584,13 +584,13 @@ Resources:
     Type: AWS::EC2::Instance
     Condition: HasAtLeast4SGs
     DependsOn:
-      - PrivateRoute2
+      - PrivateRoute1
       - ProvisionerEventPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      SubnetId: !Ref PrivateSubnet2
+      SubnetId: !Ref PrivateSubnet1
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-04
