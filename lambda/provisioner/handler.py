@@ -438,7 +438,22 @@ def _check_sg(instance_info, endpoint_id, private_key, rsa_key, pubkey_b64,
             result["nginx_body_size"] = _get_nginx_body_size(client)
 
             cert_updated = False
-            if result["version"] != stored:
+            needs_cert = False
+
+            # Complete provisioning for SGs that have the scanner pod but
+            # were never fully provisioned (e.g., File Security was installed
+            # manually via the Vision One console after the provisioner timed out)
+            if instance_info["provisioned"] != "true":
+                logger.info("Watchdog: completing provisioning for %s (%s)",
+                            instance_id, instance_info["hostname"])
+                if ready is None or ready < EXPECTED_REPLICAS:
+                    _scale_replicas(client, EXPECTED_REPLICAS)
+                    ready, desired = _get_replica_count(client)
+                    result["replicas_ready"] = ready
+                    result["replicas_desired"] = desired
+                needs_cert = True
+
+            if result["version"] != stored or needs_cert:
                 logger.info("Watchdog: version changed on %s: %s -> %s",
                             instance_id, stored or "(none)", result["version"])
                 cert_pem = _extract_cert(client)
@@ -452,6 +467,17 @@ def _check_sg(instance_info, endpoint_id, private_key, rsa_key, pubkey_b64,
                 result["action"] = "updated"
             else:
                 result["action"] = "unchanged"
+
+            # Tag as provisioned if not already
+            if instance_info["provisioned"] != "true":
+                ec2 = boto3.client("ec2", region_name=region)
+                ec2.create_tags(Resources=[instance_id], Tags=[
+                    {"Key": "appliance-v1fs:provisioned", "Value": "true"},
+                ])
+                result["provisioned"] = "true"
+                result["action"] = "provisioned"
+                logger.info("Watchdog: %s (%s) now fully provisioned",
+                            instance_id, instance_info["hostname"])
         finally:
             client.close()
 
