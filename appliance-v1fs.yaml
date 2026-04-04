@@ -56,7 +56,7 @@ Parameters:
     Type: Number
     Default: 3
     MinValue: 1
-    MaxValue: 3
+    MaxValue: 4
   PMLEnabled:
     Description: Enable Predictive Machine Learning (PML) for scans
     Type: String
@@ -78,6 +78,7 @@ Parameters:
     AllowedValues:
       - c5.2xlarge
       - c5.4xlarge
+      - c5.9xlarge
   ChannelsPerSG:
     Description: Number of gRPC channels per Service Gateway (2 is optimal)
     Type: Number
@@ -128,7 +129,10 @@ Parameters:
 
 Conditions:
   HasAtLeast2SGs: !Not [!Equals [!Ref ServiceGatewayCount, 1]]
-  HasAtLeast3SGs: !Equals [!Ref ServiceGatewayCount, 3]
+  HasAtLeast3SGs: !Or
+    - !Equals [!Ref ServiceGatewayCount, 3]
+    - !Equals [!Ref ServiceGatewayCount, 4]
+  HasAtLeast4SGs: !Equals [!Ref ServiceGatewayCount, 4]
 
 Resources:
   # ── VPC ──────────────────────────────────────────────────────────────
@@ -464,6 +468,21 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-03
+
+  ServiceGateway4:
+    Type: AWS::EC2::Instance
+    Condition: HasAtLeast4SGs
+    DependsOn:
+      - PrivateRoute2
+      - ProvisionerEventPermission
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-04
 
   # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
   ProvisionerEventRule:
@@ -1290,13 +1309,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       VpcId: !Ref BaseVPC
-      GroupDescription: Scanner workers - egress to Service Gateway and AWS APIs
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS to Service Gateway and AWS APIs
+      GroupDescription: Scanner workers - private subnet, default allow-all egress
       Tags:
         - Key: Name
           Value: !Sub WorkerSecGroup-${AWS::StackName}
