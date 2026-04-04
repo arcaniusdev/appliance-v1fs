@@ -576,9 +576,7 @@ def _handle_dashboard(event, context):
     forms = event.get("widgetContext", {}).get("forms", {}).get("all", {})
     action = forms.get("action", "")
 
-    if action == "check_now":
-        _handle_watchdog({"action": "watchdog", "region": region}, context)
-    elif action in ("fix_nginx", "scale_replicas", "extract_cert"):
+    if action in ("fix_nginx", "scale_replicas", "extract_cert"):
         _handle_fix_action(action, forms, ssm, region)
 
     # Read stored state
@@ -659,9 +657,8 @@ def _render_dashboard_html(state):
     if not state:
         return (
             '<div style="padding:16px;font-family:Amazon Ember,Arial,sans-serif">'
-            "<p>No data yet. The watchdog runs every 15 minutes, or click below to check now.</p>"
-            '<form><input type="hidden" name="action" value="check_now">'
-            '<button class="btn btn-primary">Check Now</button></form></div>'
+            "<p>No data yet. The watchdog runs every 15 minutes and populates this widget automatically.</p>"
+            "</div>"
         )
 
     checked_at = state.get("checked_at", "unknown")
@@ -695,8 +692,6 @@ def _render_dashboard_html(state):
         f"<strong>{healthy}/{total}</strong> gateways healthy &nbsp; | &nbsp; "
         f"Last checked: <strong>{checked_at}</strong>"
         "</span>"
-        '<form style="margin:0"><input type="hidden" name="action" value="check_now">'
-        '<button class="btn btn-primary">Check Now</button></form>'
         "</div>"
     )
 
