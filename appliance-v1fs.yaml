@@ -623,15 +623,31 @@ Resources:
       Port: 443
       Protocol: TCP
       VpcId: !Ref BaseVPC
-      HealthCheckProtocol: TCP
+      HealthCheckProtocol: HTTPS
       HealthCheckPort: "443"
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: "200-399"
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 2
       HealthCheckIntervalSeconds: 10
       TargetGroupAttributes:
         - Key: deregistration_delay.timeout_seconds
           Value: "30"
-      # Targets registered by provisioner Lambda after scanner pod is confirmed running
+      Targets:
+        - Id: !Ref ServiceGateway1
+        - !If
+          - HasAtLeast2SGs
+          - Id: !Ref ServiceGateway2
+          - !Ref "AWS::NoValue"
+        - !If
+          - HasAtLeast3SGs
+          - Id: !Ref ServiceGateway3
+          - !Ref "AWS::NoValue"
+        - !If
+          - HasAtLeast4SGs
+          - Id: !Ref ServiceGateway4
+          - !Ref "AWS::NoValue"
 
   ScannerListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -2210,9 +2226,6 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${DeployBucket}/awscli-runtime.zip"
-              - Effect: Allow
-                Action: elasticloadbalancingv2:RegisterTargets
-                Resource: !Ref ScannerTargetGroup
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
@@ -2240,7 +2253,6 @@ Resources:
           AWS_REGION_NAME: !Ref "AWS::Region"
           DEPLOY_BUCKET: !Ref DeployBucket
           MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
-          TARGET_GROUP_ARN: !Ref ScannerTargetGroup
 
   WatchdogSchedule:
     Type: AWS::Events::Rule
