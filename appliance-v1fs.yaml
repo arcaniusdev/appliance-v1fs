@@ -6,19 +6,15 @@ Mappings:
     "1":
       MinWorkers: "2"
       MaxWorkers: "4"
-      GrpcChannels: "2"
     "2":
       MinWorkers: "4"
       MaxWorkers: "6"
-      GrpcChannels: "4"
     "3":
       MinWorkers: "6"
       MaxWorkers: "8"
-      GrpcChannels: "6"
     "4":
       MinWorkers: "8"
       MaxWorkers: "10"
-      GrpcChannels: "8"
 
   ServiceGatewayAMI:
     ap-northeast-1:
@@ -594,70 +590,6 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-04
-
-  # ── Scanner NLB (single gRPC endpoint for all SGs) ──────────────
-  ScannerNLB:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    DependsOn:
-      - PrivateRoute1
-      - PrivateRoute2
-    Properties:
-      Name: !Sub scanner-${AWS::StackName}
-      Type: network
-      Scheme: internal
-      Subnets:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
-      LoadBalancerAttributes:
-        - Key: load_balancing.cross_zone.enabled
-          Value: "true"
-      Tags:
-        - Key: Name
-          Value: !Sub ScannerNLB-${AWS::StackName}
-
-  ScannerTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: !Sub sg-targets-${AWS::StackName}
-      TargetType: instance
-      Port: 443
-      Protocol: TCP
-      VpcId: !Ref BaseVPC
-      HealthCheckProtocol: HTTPS
-      HealthCheckPort: "443"
-      HealthCheckPath: /
-      Matcher:
-        HttpCode: "200-499"
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 2
-      HealthCheckIntervalSeconds: 10
-      TargetGroupAttributes:
-        - Key: deregistration_delay.timeout_seconds
-          Value: "30"
-      Targets:
-        - Id: !Ref ServiceGateway1
-        - !If
-          - HasAtLeast2SGs
-          - Id: !Ref ServiceGateway2
-          - !Ref "AWS::NoValue"
-        - !If
-          - HasAtLeast3SGs
-          - Id: !Ref ServiceGateway3
-          - !Ref "AWS::NoValue"
-        - !If
-          - HasAtLeast4SGs
-          - Id: !Ref ServiceGateway4
-          - !Ref "AWS::NoValue"
-
-  ScannerListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref ScannerNLB
-      Port: 443
-      Protocol: TCP
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref ScannerTargetGroup
 
   # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
   ProvisionerEventRule:
@@ -1539,6 +1471,9 @@ Resources:
                   - logs:PutLogEvents
                 Resource: "*"
               - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
                 Action: autoscaling:CompleteLifecycleAction
                 Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/worker-asg-${AWS::StackName}"
 
@@ -1551,14 +1486,13 @@ Resources:
   WorkerLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     DependsOn:
-      - ScannerListener
-      - ScannerTargetGroup
+      - ServiceGateway1
       - CodeBuild
     Properties:
       LaunchTemplateName: !Sub worker-${AWS::StackName}
       LaunchTemplateData:
         ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
-        InstanceType: t3.medium
+        InstanceType: t3.large
         IamInstanceProfile:
           Arn: !GetAtt WorkerInstanceProfile.Arn
         SecurityGroupIds:
@@ -1575,68 +1509,64 @@ Resources:
               - Key: Name
                 Value: !Sub Worker-${AWS::StackName}
         UserData:
-          Fn::Base64:
-            Fn::Sub:
-              - |
-                #!/bin/bash
-                set -euo pipefail
-                exec > /var/log/scanner-bootstrap.log 2>&1
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            exec > /var/log/scanner-bootstrap.log 2>&1
 
-                yum install -y python3.12 python3.12-pip unzip
+            yum install -y python3.12 python3.12-pip unzip
 
-                mkdir -p /opt/scanner
-                aws s3 cp s3://${DeployBucket}/scanner-app.zip /opt/scanner/scanner-app.zip
-                cd /opt/scanner && unzip -o scanner-app.zip
-                pip3.12 install -r requirements.txt
+            mkdir -p /opt/scanner
+            aws s3 cp s3://${DeployBucket}/scanner-app.zip /opt/scanner/scanner-app.zip
+            cd /opt/scanner && unzip -o scanner-app.zip
+            pip3.12 install -r requirements.txt
 
-                cat > /etc/scanner.env << 'ENVEOF'
-                AWS_DEFAULT_REGION=${AWS::Region}
-                SQS_QUEUE_URL=${ScanQueue}
-                SQS_VISIBILITY_TIMEOUT=300
-                MAX_CONCURRENT_SCANS=50
-                ASG_NAME=worker-asg-${AWS::StackName}
-                SCANNER_ENDPOINT=${ScannerNLB.DNSName}
-                GRPC_CHANNELS=${GrpcChannels}
-                SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert
-                V1FS_API_KEY_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key
-                AUDIT_LOG_GROUP=scan-audit-${AWS::StackName}
-                PML_ENABLED=${PMLEnabled}
-                FEEDBACK_ENABLED=${SmartFeedbackEnabled}
-                MAX_FILE_SIZE_MB=${MaxFileSizeMB}
-                SCANNER_ACCOUNT_ID=${AWS::AccountId}
-                SOURCE_BUCKET=${SourceBucket}
-                QUARANTINE_BUCKET=${QuarantineBucket}
-                CUSTOMER_LOG_GROUP=v1fs-scan-audit
-                LOG_LEVEL=INFO
-                ENVEOF
+            cat > /etc/scanner.env << 'ENVEOF'
+            AWS_DEFAULT_REGION=${AWS::Region}
+            SQS_QUEUE_URL=${ScanQueue}
+            SQS_VISIBILITY_TIMEOUT=300
+            MAX_CONCURRENT_SCANS=50
+            ASG_NAME=worker-asg-${AWS::StackName}
+            SG_DISCOVERY_TAG=appliance-v1fs:stack=${AWS::StackName}
+            CHANNELS_PER_SG=2
+            SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert
+            V1FS_API_KEY_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key
+            AUDIT_LOG_GROUP=scan-audit-${AWS::StackName}
+            PML_ENABLED=${PMLEnabled}
+            FEEDBACK_ENABLED=${SmartFeedbackEnabled}
+            MAX_FILE_SIZE_MB=${MaxFileSizeMB}
+            SCANNER_ACCOUNT_ID=${AWS::AccountId}
+            SOURCE_BUCKET=${SourceBucket}
+            QUARANTINE_BUCKET=${QuarantineBucket}
+            CUSTOMER_LOG_GROUP=v1fs-scan-audit
+            LOG_LEVEL=INFO
+            ENVEOF
 
-                cat > /etc/systemd/system/scanner.service << 'SVCEOF'
-                [Unit]
-                Description=File Scanner Worker
-                After=network.target
+            cat > /etc/systemd/system/scanner.service << 'SVCEOF'
+            [Unit]
+            Description=File Scanner Worker
+            After=network.target
 
-                [Service]
-                EnvironmentFile=/etc/scanner.env
-                ExecStart=/usr/bin/python3.12 /opt/scanner/scanner.py
-                Restart=always
-                RestartSec=5
-                KillSignal=SIGTERM
-                TimeoutStopSec=330
+            [Service]
+            EnvironmentFile=/etc/scanner.env
+            ExecStart=/usr/bin/python3.12 /opt/scanner/scanner.py
+            Restart=always
+            RestartSec=5
+            KillSignal=SIGTERM
+            TimeoutStopSec=330
 
-                [Install]
-                WantedBy=multi-user.target
-                SVCEOF
+            [Install]
+            WantedBy=multi-user.target
+            SVCEOF
 
-                systemctl daemon-reload
-                systemctl enable scanner
-                systemctl start scanner
-              - GrpcChannels: !FindInMap [WorkerScaling, !Ref ServiceGatewayCount, GrpcChannels]
+            systemctl daemon-reload
+            systemctl enable scanner
+            systemctl start scanner
 
   WorkerASG:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn:
-      - ScannerListener
-      - ScannerTargetGroup
+      - ServiceGateway1
       - CodeBuild
     Properties:
       AutoScalingGroupName: !Sub worker-asg-${AWS::StackName}
@@ -2305,14 +2235,6 @@ Resources:
           Value: !Sub EICEndpoint-${AWS::StackName}
 
   # ── Integration SSM Parameters (for third-party scanner apps) ───
-  ScannerEndpointParam:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: /appliance-v1fs/scanner-endpoint
-      Type: String
-      Description: NLB endpoint for gRPC scanning (port 443, TLS passthrough)
-      Value: !GetAtt ScannerNLB.DNSName
-
   CACertArnParam:
     Type: AWS::SSM::Parameter
     Properties:
@@ -2395,11 +2317,6 @@ Outputs:
   EnrollmentTemplateURL:
     Description: Pre-populated enrollment template — download and deploy in customer accounts
     Value: !GetAtt EnrollmentTemplateResource.TemplateURL
-  ScannerEndpoint:
-    Description: NLB endpoint for gRPC scanning (port 443, TLS passthrough)
-    Value: !GetAtt ScannerNLB.DNSName
-    Export:
-      Name: !Sub "${AWS::StackName}-ScannerEndpoint"
   CACertSecretArn:
     Description: Secrets Manager ARN for the Service Gateway CA certificate
     Value: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert"

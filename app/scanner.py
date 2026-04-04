@@ -23,17 +23,25 @@ logging.basicConfig(
 
 # Module-level state — shared across worker threads (read-heavy, write-rare)
 _channels = None
+_channel_addrs = None
+_channel_failures = None  # Circuit breaker: failure count per channel
+_channel_cooldown = None  # Circuit breaker: cooldown expiry per channel
 _channels_built_at = 0.0  # monotonic timestamp of last channel build
 _channels_lock = threading.Lock()  # Protects channel rebuild
 _s3_client = None
+_ec2_client = None
 _logs_client = None
 _audit_stream_created = False
 
 SCANNER_ACCOUNT_ID = os.environ.get("SCANNER_ACCOUNT_ID", "")
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 
-# Channel refresh interval — reconnect periodically to rebalance across NLB targets
+# Channel refresh interval — re-discover SGs periodically
 CHANNEL_REFRESH_SECONDS = 60
+
+# Circuit breaker settings
+CB_FAILURE_THRESHOLD = 3  # failures before marking channel unhealthy
+CB_COOLDOWN_SECONDS = 60  # seconds to skip an unhealthy channel
 
 # Shutdown coordination
 _shutdown_event = threading.Event()
@@ -46,6 +54,13 @@ def _get_s3():
     return _s3_client
 
 
+def _get_ec2():
+    global _ec2_client
+    if _ec2_client is None:
+        _ec2_client = boto3.client("ec2")
+    return _ec2_client
+
+
 def _get_logs():
     global _logs_client
     if _logs_client is None:
@@ -54,18 +69,38 @@ def _get_logs():
 
 
 
+def _discover_sg_addresses():
+    """Discover running Service Gateway IPs via EC2 tags."""
+    tag_spec = os.environ.get("SG_DISCOVERY_TAG", "")
+    if not tag_spec:
+        raise RuntimeError("SG_DISCOVERY_TAG not set")
+
+    tag_key, tag_value = tag_spec.split("=", 1)
+    ec2 = _get_ec2()
+    resp = ec2.describe_instances(Filters=[
+        {"Name": f"tag:{tag_key}", "Values": [tag_value]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ])
+
+    addrs = []
+    for res in resp["Reservations"]:
+        for inst in res["Instances"]:
+            addrs.append(f"{inst['PrivateIpAddress']}:443")
+
+    if not addrs:
+        raise RuntimeError("No running Service Gateway instances found")
+
+    addrs.sort()  # deterministic order for channel stability
+    return addrs
+
+
 def _build_channels():
-    global _channels, _channels_built_at
+    global _channels, _channel_addrs, _channel_failures, _channel_cooldown, _channels_built_at
 
     with _channels_lock:
         # Double-check after acquiring lock
         if _channels is not None and (time.monotonic() - _channels_built_at <= CHANNEL_REFRESH_SECONDS):
             return
-
-        endpoint = os.environ.get("SCANNER_ENDPOINT", "")
-        if not endpoint:
-            raise RuntimeError("SCANNER_ENDPOINT not set")
-        addr = f"{endpoint}:443"
 
         sm = boto3.client("secretsmanager")
         api_key = sm.get_secret_value(
@@ -92,24 +127,66 @@ def _build_channels():
             ("grpc.keepalive_time_ms", 30_000),
             ("grpc.keepalive_timeout_ms", 10_000),
             ("grpc.keepalive_permit_without_calls", 1),
-            ("grpc.use_local_subchannel_pool", 1),
         ]
 
-        num_channels = int(os.environ.get("GRPC_CHANNELS", "8"))
+        addrs = _discover_sg_addresses()
+        channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
         channels = []
-        for _ in range(num_channels):
-            channels.append(grpc.secure_channel(addr, composite, options=options))
-        logger.info("Created %d gRPC channel(s) to %s", num_channels, addr)
+        channel_addrs = []
+        for addr in addrs:
+            for c in range(channels_per_sg):
+                ch = grpc.secure_channel(addr, composite, options=options)
+                channels.append(ch)
+                channel_addrs.append(addr)
+            logger.info("Created %d gRPC channel(s) to %s", channels_per_sg, addr)
 
         _channels = channels
+        _channel_addrs = channel_addrs
+        _channel_failures = [0] * len(channels)
+        _channel_cooldown = [0.0] * len(channels)
         _channels_built_at = time.monotonic()
 
 
 def _get_channel():
-    """Return a gRPC channel. NLB distributes each channel to a different SG."""
+    """Return a healthy gRPC channel with circuit breaker logic."""
     if _channels is None or (time.monotonic() - _channels_built_at > CHANNEL_REFRESH_SECONDS):
         _build_channels()
-    return random.choice(_channels)
+    if len(_channels) == 1:
+        return _channels[0], _channel_addrs[0], 0
+
+    now = time.monotonic()
+    healthy = [i for i in range(len(_channels))
+               if _channel_failures[i] < CB_FAILURE_THRESHOLD or now >= _channel_cooldown[i]]
+
+    if not healthy:
+        # All channels unhealthy — reset cooldowns and try any
+        logger.warning("All gRPC channels unhealthy, resetting circuit breakers")
+        for i in range(len(_channels)):
+            _channel_failures[i] = 0
+            _channel_cooldown[i] = 0.0
+        healthy = list(range(len(_channels)))
+
+    idx = random.choice(healthy)
+    # Reset failure count if cooldown expired (probe the channel)
+    if _channel_failures[idx] >= CB_FAILURE_THRESHOLD and now >= _channel_cooldown[idx]:
+        _channel_failures[idx] = 0
+    return _channels[idx], _channel_addrs[idx], idx
+
+
+def _mark_channel_success(idx):
+    """Reset failure count on successful scan."""
+    if _channel_failures is not None and idx < len(_channel_failures):
+        _channel_failures[idx] = 0
+
+
+def _mark_channel_failure(idx):
+    """Increment failure count and set cooldown if threshold reached."""
+    if _channel_failures is not None and idx < len(_channel_failures):
+        _channel_failures[idx] += 1
+        if _channel_failures[idx] >= CB_FAILURE_THRESHOLD:
+            _channel_cooldown[idx] = time.monotonic() + CB_COOLDOWN_SECONDS
+            logger.warning("Circuit breaker OPEN for channel %d (%s) — cooldown %ds",
+                           idx, _channel_addrs[idx], CB_COOLDOWN_SECONDS)
 
 
 
@@ -120,7 +197,6 @@ SOURCE_BUCKET = os.environ.get("SOURCE_BUCKET", "")
 
 def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
     logger.info("Processing s3://%s/%s (%d bytes)", scan_bucket, key, size)
-    sg_addr = os.environ.get("SCANNER_ENDPOINT", "unknown")
 
     try:
         resp = s3.get_object(Bucket=scan_bucket, Key=key)
@@ -130,15 +206,17 @@ def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
         return
 
     for attempt in range(3):
-        channel = _get_channel()
+        channel, sg_addr, ch_idx = _get_channel()
         scan_start = time.monotonic()
         try:
             result_json = amaas.grpc.scan_buffer(
                 channel, file_bytes, os.path.basename(key),
                 tags=["S3-Scan"], pml=pml, feedback=feedback,
             )
+            _mark_channel_success(ch_idx)
             break
         except Exception as exc:
+            _mark_channel_failure(ch_idx)
             if "RESOURCE_EXHAUSTED" in str(type(exc).__name__) or "Cannot allocate resource" in str(exc):
                 if attempt < 2:
                     time.sleep(0.5 * (attempt + 1))
