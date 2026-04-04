@@ -267,11 +267,12 @@ def _handle_instance_running(event, context):
             # Wait for File Security scanner pod to be running
             _wait_for_scanner_pod(host, private_key, port=port)
 
-            # Extract CA cert and patch nginx for large file gRPC scanning
+            # Extract CA cert, patch nginx, and scale replicas
             sgowner = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
             cert_pem = _extract_cert(sgowner)
             version = _get_scanner_version(sgowner)
             _patch_nginx_body_size(sgowner)
+            _scale_replicas(sgowner, EXPECTED_REPLICAS)
             sgowner.close()
 
             if cert_pem:
