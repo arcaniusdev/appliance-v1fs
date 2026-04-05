@@ -682,7 +682,7 @@ Resources:
                           "openssl", "req", "-x509", "-nodes", "-days", "3650",
                           "-newkey", "rsa:2048",
                           "-keyout", key_file.name, "-out", cert_file.name,
-                          "-subj", f"/CN={alb_dns}/O=appliance-v1fs",
+                          "-subj", "/CN=scanner-alb/O=appliance-v1fs",
                           "-extfile", ext_file.name,
                       ], check=True, capture_output=True)
                       os.unlink(ext_file.name)
