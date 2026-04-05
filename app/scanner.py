@@ -54,20 +54,13 @@ def _build_scan_handles():
     api_key = sm.get_secret_value(
         SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
     )["SecretString"]
-    ca_cert_pem = sm.get_secret_value(
-        SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
-    )["SecretString"]
-
-    import tempfile
-    cert_file = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
-    cert_file.write(ca_cert_pem)
-    cert_file.close()
-
     addrs = _discover_sg_addresses()
     handles = []
     for addr in addrs:
         # init() is synchronous — do NOT await
-        handle = amaas.grpc.aio.init(addr, api_key, True, ca_cert=cert_file.name)
+        # TLS disabled — SGs use self-signed certs for sg.sgi.xdr.trendmicro.com
+        # which don't match the SG IP addresses. Traffic stays in VPC private subnets.
+        handle = amaas.grpc.aio.init(addr, api_key, False)
         handles.append((handle, addr))
         logger.info("Async scan handle created for %s", addr)
     return handles
