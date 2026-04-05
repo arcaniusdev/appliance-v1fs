@@ -1,18 +1,18 @@
+import asyncio
 import json
 import logging
 import os
 import random
 import signal
 import socket
+import tempfile
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import boto3
-import grpc
-import amaas.grpc
+import amaas.grpc.aio
+from aiobotocore.session import AioSession
 
 logger = logging.getLogger("scanner")
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -21,214 +21,71 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
 )
 
-# Module-level state — shared across worker threads (read-heavy, write-rare)
-_channels = None
-_channel_addrs = None
-_channel_failures = None  # Circuit breaker: failure count per channel
-_channel_cooldown = None  # Circuit breaker: cooldown expiry per channel
-_channels_built_at = 0.0  # monotonic timestamp of last channel build
-_channels_lock = threading.Lock()  # Protects channel rebuild
-_s3_client = None
-_ec2_client = None
-_logs_client = None
-_audit_stream_created = False
-
 SCANNER_ACCOUNT_ID = os.environ.get("SCANNER_ACCOUNT_ID", "")
+SOURCE_BUCKET = os.environ.get("SOURCE_BUCKET", "")
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 
-# Channel refresh interval — re-discover SGs periodically
-CHANNEL_REFRESH_SECONDS = 60
 
-# Circuit breaker settings
-CB_FAILURE_THRESHOLD = 3  # failures before marking channel unhealthy
-CB_COOLDOWN_SECONDS = 60  # seconds to skip an unhealthy channel
+# ── Scan Handle ──────────────────────────────────────────────────────
 
-# Shutdown coordination
-_shutdown_event = threading.Event()
+def _build_scan_handle():
+    """Create a single async scan handle pointing at the ALB."""
+    endpoint = os.environ.get("SCANNER_ENDPOINT", "")
+    if not endpoint:
+        raise RuntimeError("SCANNER_ENDPOINT not set")
 
+    sm = boto3.client("secretsmanager")
+    api_key = sm.get_secret_value(
+        SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
+    )["SecretString"]
+    ca_cert_pem = sm.get_secret_value(
+        SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
+    )["SecretString"]
 
-def _get_s3():
-    global _s3_client
-    if _s3_client is None:
-        _s3_client = boto3.client("s3")
-    return _s3_client
+    # Write CA cert to temp file for the SDK
+    cert_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".pem", delete=False
+    )
+    cert_file.write(ca_cert_pem)
+    cert_file.close()
 
-
-def _get_ec2():
-    global _ec2_client
-    if _ec2_client is None:
-        _ec2_client = boto3.client("ec2")
-    return _ec2_client
-
-
-def _get_logs():
-    global _logs_client
-    if _logs_client is None:
-        _logs_client = boto3.client("logs")
-    return _logs_client
+    # init() is synchronous — do NOT await
+    handle = amaas.grpc.aio.init(endpoint, api_key, True, ca_cert=cert_file.name)
+    logger.info("Async scan handle created for %s", endpoint)
+    return handle
 
 
+# ── Core Scan Logic ──────────────────────────────────────────────────
 
-def _discover_sg_addresses():
-    """Discover running Service Gateway IPs via EC2 tags."""
-    tag_spec = os.environ.get("SG_DISCOVERY_TAG", "")
-    if not tag_spec:
-        raise RuntimeError("SG_DISCOVERY_TAG not set")
-
-    tag_key, tag_value = tag_spec.split("=", 1)
-    ec2 = _get_ec2()
-    resp = ec2.describe_instances(Filters=[
-        {"Name": f"tag:{tag_key}", "Values": [tag_value]},
-        {"Name": "instance-state-name", "Values": ["running"]},
-    ])
-
-    addrs = []
-    for res in resp["Reservations"]:
-        for inst in res["Instances"]:
-            addrs.append(f"{inst['PrivateIpAddress']}:443")
-
-    if not addrs:
-        raise RuntimeError("No running Service Gateway instances found")
-
-    addrs.sort()  # deterministic order for channel stability
-    return addrs
-
-
-def _build_channels():
-    global _channels, _channel_addrs, _channel_failures, _channel_cooldown, _channels_built_at
-
-    with _channels_lock:
-        # Double-check after acquiring lock
-        if _channels is not None and (time.monotonic() - _channels_built_at <= CHANNEL_REFRESH_SECONDS):
-            return
-
-        sm = boto3.client("secretsmanager")
-        api_key = sm.get_secret_value(
-            SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
-        )["SecretString"]
-        ca_cert = sm.get_secret_value(
-            SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
-        )["SecretString"].encode("utf-8")
-
-        call_creds = grpc.metadata_call_credentials(
-            lambda context, callback: callback(
-                [("authorization", f"Bearer {api_key}")], None
-            )
-        )
-        channel_creds = grpc.ssl_channel_credentials(root_certificates=ca_cert)
-        composite = grpc.composite_channel_credentials(channel_creds, call_creds)
-
-        tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
-        max_file_bytes = int(os.environ.get("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
-        options = [
-            ("grpc.ssl_target_name_override", tls_override),
-            ("grpc.max_send_message_length", max_file_bytes),
-            ("grpc.max_receive_message_length", max_file_bytes),
-            ("grpc.keepalive_time_ms", 30_000),
-            ("grpc.keepalive_timeout_ms", 10_000),
-            ("grpc.keepalive_permit_without_calls", 1),
-        ]
-
-        addrs = _discover_sg_addresses()
-        channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
-        channels = []
-        channel_addrs = []
-        for addr in addrs:
-            for c in range(channels_per_sg):
-                ch = grpc.secure_channel(addr, composite, options=options)
-                channels.append(ch)
-                channel_addrs.append(addr)
-            logger.info("Created %d gRPC channel(s) to %s", channels_per_sg, addr)
-
-        old_channels = _channels
-        _channels = channels
-        _channel_addrs = channel_addrs
-        _channel_failures = [0] * len(channels)
-        _channel_cooldown = [0.0] * len(channels)
-        _channels_built_at = time.monotonic()
-
-        if old_channels:
-            for ch in old_channels:
-                try:
-                    ch.close()
-                except Exception:
-                    pass
-
-
-def _get_channel():
-    """Return a healthy gRPC channel with circuit breaker logic."""
-    if _channels is None or (time.monotonic() - _channels_built_at > CHANNEL_REFRESH_SECONDS):
-        _build_channels()
-    if len(_channels) == 1:
-        return _channels[0], _channel_addrs[0], 0
-
-    now = time.monotonic()
-    healthy = [i for i in range(len(_channels))
-               if _channel_failures[i] < CB_FAILURE_THRESHOLD or now >= _channel_cooldown[i]]
-
-    if not healthy:
-        # All channels unhealthy — reset cooldowns and try any
-        logger.warning("All gRPC channels unhealthy, resetting circuit breakers")
-        for i in range(len(_channels)):
-            _channel_failures[i] = 0
-            _channel_cooldown[i] = 0.0
-        healthy = list(range(len(_channels)))
-
-    idx = random.choice(healthy)
-    # Reset failure count if cooldown expired (probe the channel)
-    if _channel_failures[idx] >= CB_FAILURE_THRESHOLD and now >= _channel_cooldown[idx]:
-        _channel_failures[idx] = 0
-    return _channels[idx], _channel_addrs[idx], idx
-
-
-def _mark_channel_success(idx):
-    """Reset failure count on successful scan."""
-    if _channel_failures is not None and idx < len(_channel_failures):
-        _channel_failures[idx] = 0
-
-
-def _mark_channel_failure(idx):
-    """Increment failure count and set cooldown if threshold reached."""
-    if _channel_failures is not None and idx < len(_channel_failures):
-        _channel_failures[idx] += 1
-        if _channel_failures[idx] >= CB_FAILURE_THRESHOLD:
-            _channel_cooldown[idx] = time.monotonic() + CB_COOLDOWN_SECONDS
-            logger.warning("Circuit breaker OPEN for channel %d (%s) — cooldown %ds",
-                           idx, _channel_addrs[idx], CB_COOLDOWN_SECONDS)
-
-
-
-# -- Core Scan Logic ----------------------------------------------------------
-
-SOURCE_BUCKET = os.environ.get("SOURCE_BUCKET", "")
-
-
-def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
+async def _process_file(s3, scan_bucket, key, size, pml,
+                        audit_log_group, logs, scan_handle):
     logger.info("Processing s3://%s/%s (%d bytes)", scan_bucket, key, size)
+    sg_addr = os.environ.get("SCANNER_ENDPOINT", "unknown")
 
     try:
-        resp = s3.get_object(Bucket=scan_bucket, Key=key)
-        file_bytes = resp["Body"].read()
-    except s3.exceptions.NoSuchKey:
-        logger.warning("s3://%s/%s gone, skipping", scan_bucket, key)
-        return
+        resp = await s3.get_object(Bucket=scan_bucket, Key=key)
+        async with resp["Body"] as stream:
+            file_bytes = await stream.read()
+    except Exception as exc:
+        if "NoSuchKey" in str(type(exc).__name__) or "NoSuchKey" in str(exc):
+            logger.warning("s3://%s/%s gone, skipping", scan_bucket, key)
+            return
+        raise
 
     for attempt in range(3):
-        channel, sg_addr, ch_idx = _get_channel()
         scan_start = time.monotonic()
         try:
-            result_json = amaas.grpc.scan_buffer(
-                channel, file_bytes, os.path.basename(key),
-                tags=["S3-Scan"], pml=pml, feedback=feedback,
+            result_json = await amaas.grpc.aio.scan_buffer(
+                scan_handle, file_bytes, os.path.basename(key),
+                pml=pml, tags=["S3-Scan"],
             )
-            _mark_channel_success(ch_idx)
             break
-        except Exception as exc:
-            _mark_channel_failure(ch_idx)
+        except Exception:
             if attempt < 2:
-                time.sleep(0.5 * (attempt + 1))
+                await asyncio.sleep(0.5 * (attempt + 1))
                 continue
             raise
+
     scan_ms = int((time.monotonic() - scan_start) * 1000)
     result = json.loads(result_json)
     is_malicious = result.get("scanResult", 0) > 0
@@ -240,22 +97,20 @@ def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
             "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s",
             scan_bucket, key, malware_names, scan_ms, sg_addr,
         )
-        # Tag the source object to block access via bucket policy
-        s3.put_object_tagging(
+        await s3.put_object_tagging(
             Bucket=SOURCE_BUCKET, Key=key,
             Tagging={"TagSet": [
                 {"Key": "ScanResult", "Value": "Malware"},
                 {"Key": "ScanTimestamp", "Value": scan_ts},
             ]},
         )
-        # Copy to quarantine bucket with metadata
         quarantine_key = f"{SOURCE_BUCKET}/{key}"
         tags = urlencode({
             "ScanResult": "Malware",
             "ScanTimestamp": scan_ts,
             "SourceBucket": SOURCE_BUCKET,
         })
-        s3.put_object(
+        await s3.put_object(
             Bucket=QUARANTINE_BUCKET, Key=quarantine_key,
             Body=file_bytes, Tagging=tags,
         )
@@ -265,20 +120,23 @@ def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
                      scan_bucket, key, scan_ms, sg_addr)
         verdict = "clean"
 
-    # Delete the staging copy — scan is done, source bucket has the original
-    s3.delete_object(Bucket=scan_bucket, Key=key)
+    await s3.delete_object(Bucket=scan_bucket, Key=key)
 
-    _audit(audit_log_group, scan_bucket, key, size, verdict, result, scan_ms, sg_addr,
-           SCANNER_ACCOUNT_ID)
+    await _audit(logs, audit_log_group, scan_bucket, key, size, verdict,
+                 result, scan_ms, sg_addr, SCANNER_ACCOUNT_ID)
     del file_bytes
 
 
-_audit_lock = threading.Lock()
+# ── Audit Trail ──────────────────────────────────────────────────────
+
+_audit_stream_created = False
+_audit_lock = asyncio.Lock()
 
 
-def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, source_account):
+async def _audit(logs, log_group, bucket, key, size, verdict, result,
+                 scan_ms, sg_addr, source_account):
     global _audit_stream_created
-    if not log_group:
+    if not log_group or not logs:
         return
     stream = f"scanner-{socket.gethostname()}"
     entry = {
@@ -298,58 +156,44 @@ def _audit(log_group, bucket, key, size, verdict, result, scan_ms, sg_addr, sour
     log_event = [{"timestamp": int(time.time() * 1000), "message": json.dumps(entry)}]
 
     try:
-        logs = _get_logs()
-        with _audit_lock:
+        async with _audit_lock:
             if not _audit_stream_created:
                 try:
-                    logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
+                    await logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
                 except Exception:
                     pass
                 _audit_stream_created = True
-        logs.put_log_events(logGroupName=log_group, logStreamName=stream, logEvents=log_event)
+        await logs.put_log_events(logGroupName=log_group, logStreamName=stream, logEvents=log_event)
     except Exception:
         logger.warning("Audit write failed", exc_info=True)
 
 
-# -- SQS Message Processing --------------------------------------------------
+# ── SQS Message Processing ──────────────────────────────────────────
 
-def _heartbeat(sqs, queue_url, receipt_handle, visibility_timeout, stop_event):
-    """Extend SQS message visibility periodically until stop_event is set."""
-    interval = max(visibility_timeout - 60, 30)
-    while not stop_event.wait(timeout=interval):
-        try:
-            sqs.change_message_visibility(
-                QueueUrl=queue_url,
-                ReceiptHandle=receipt_handle,
-                VisibilityTimeout=visibility_timeout,
-            )
-        except Exception:
-            logger.warning("Failed to extend visibility", exc_info=True)
-            return  # Stop heartbeat — message may become visible to other workers
-
-
-def _process_message(sqs, queue_url, message, visibility_timeout):
-    """Process a single SQS message: parse, scan, delete or let retry."""
+async def _process_message(sqs, s3, logs, queue_url, message, scan_handle, visibility_timeout):
     message_id = message.get("MessageId", "unknown")
     receipt_handle = message["ReceiptHandle"]
 
-    # Start heartbeat thread to keep message invisible during long scans
-    heartbeat_stop = threading.Event()
-    heartbeat_thread = threading.Thread(
-        target=_heartbeat,
-        args=(sqs, queue_url, receipt_handle, visibility_timeout, heartbeat_stop),
-        daemon=True,
-    )
-    heartbeat_thread.start()
+    async def heartbeat():
+        interval = max(visibility_timeout - 60, 30)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await sqs.change_message_visibility(
+                    QueueUrl=queue_url,
+                    ReceiptHandle=receipt_handle,
+                    VisibilityTimeout=visibility_timeout,
+                )
+            except Exception:
+                logger.warning("Failed to extend visibility", exc_info=True)
+                return
 
-    s3 = _get_s3()
+    heartbeat_task = asyncio.create_task(heartbeat())
     pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
-    feedback = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
     audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
 
     try:
         body = json.loads(message["Body"])
-        # EventBridge event format: detail.bucket.name, detail.object.key
         detail = body.get("detail", {})
         scan_bucket = detail.get("bucket", {}).get("name")
         key = detail.get("object", {}).get("key")
@@ -357,19 +201,17 @@ def _process_message(sqs, queue_url, message, visibility_timeout):
 
         if not scan_bucket or not key:
             logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
-            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+            await sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
             return
 
-        _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group)
-        # Success — delete message from queue
-        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+        await _process_file(s3, scan_bucket, key, size, pml,
+                            audit_log_group, logs, scan_handle)
+        await sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
     except Exception:
         logger.exception("Failed processing SQS message %s", message_id)
-        # Let visibility expire for automatic retry (SQS redrive to DLQ after 5 failures)
-        # Shorten visibility for faster retry
         try:
-            sqs.change_message_visibility(
+            await sqs.change_message_visibility(
                 QueueUrl=queue_url,
                 ReceiptHandle=receipt_handle,
                 VisibilityTimeout=30,
@@ -377,31 +219,31 @@ def _process_message(sqs, queue_url, message, visibility_timeout):
         except Exception:
             pass
     finally:
-        heartbeat_stop.set()
-        heartbeat_thread.join(timeout=5)
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
-# -- ASG Lifecycle -----------------------------------------------------------
+# ── ASG Lifecycle ────────────────────────────────────────────────────
 
 def _complete_lifecycle_action():
-    """Signal ASG that this instance is ready to terminate."""
     try:
-        token_url = "http://169.254.169.254/latest/api/token"
         import urllib.request
-        req = urllib.request.Request(token_url, method="PUT",
-                                     headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"})
+        req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token", method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"})
         token = urllib.request.urlopen(req, timeout=2).read().decode()
         meta_headers = {"X-aws-ec2-metadata-token": token}
         instance_id = urllib.request.urlopen(
             urllib.request.Request("http://169.254.169.254/latest/meta-data/instance-id",
                                    headers=meta_headers), timeout=2).read().decode()
     except Exception:
-        logger.info("Not running on EC2 or IMDS unavailable — skipping lifecycle completion")
         return
 
     asg_name = os.environ.get("ASG_NAME")
     if not asg_name:
-        logger.info("ASG_NAME not set — skipping lifecycle completion")
         return
 
     try:
@@ -414,50 +256,54 @@ def _complete_lifecycle_action():
         )
         logger.info("Lifecycle action completed for %s", instance_id)
     except Exception:
-        logger.warning("Failed to complete lifecycle action — ASG will time out and CONTINUE",
-                       exc_info=True)
+        logger.warning("Failed to complete lifecycle action", exc_info=True)
 
 
-# -- Main Entry Point --------------------------------------------------------
+# ── Main ─────────────────────────────────────────────────────────────
 
-def main():
-    """Long-running SQS poller with concurrent scan workers."""
-    sqs = boto3.client("sqs")
+async def async_main():
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
+    loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
+
     queue_url = os.environ["SQS_QUEUE_URL"]
-    max_workers = int(os.environ.get("MAX_CONCURRENT_SCANS", "50"))
+    max_concurrent = int(os.environ.get("MAX_CONCURRENT_SCANS", "50"))
     visibility_timeout = int(os.environ.get("SQS_VISIBILITY_TIMEOUT", "300"))
+    semaphore = asyncio.Semaphore(max_concurrent)
     consecutive_errors = 0
+
+    scan_handle = _build_scan_handle()
 
     logger.info(
         "Scanner worker starting — queue=%s concurrency=%d hostname=%s",
-        queue_url, max_workers, socket.gethostname(),
+        queue_url, max_concurrent, socket.gethostname(),
     )
 
-    # Pre-build gRPC channels before accepting work
-    _build_channels()
-    logger.info("gRPC channels ready")
+    session = AioSession()
+    async with session.create_client("sqs") as sqs, \
+               session.create_client("s3") as s3, \
+               session.create_client("logs") as logs:
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        in_flight = set()
+        in_flight: set[asyncio.Task] = set()
 
-        while not _shutdown_event.is_set():
-            # Clean up completed futures
-            done = {f for f in in_flight if f.done()}
-            in_flight -= done
-            # Log any exceptions from completed futures
-            for f in done:
-                exc = f.exception()
-                if exc:
-                    logger.error("Worker thread raised: %s", exc)
+        async def guarded_process(message):
+            async with semaphore:
+                await _process_message(sqs, s3, logs, queue_url, message,
+                                       scan_handle, visibility_timeout)
 
-            # Backpressure: pause polling when workers are saturated
-            if len(in_flight) >= max_workers:
-                time.sleep(0.1)
+        while not shutdown_event.is_set():
+            if len(in_flight) >= max_concurrent * 2:
+                await asyncio.sleep(0.1)
+                done = {t for t in in_flight if t.done()}
+                in_flight -= done
+                for t in done:
+                    if t.exception():
+                        logger.error("Task raised: %s", t.exception())
                 continue
 
-            # Long-poll SQS (up to 10 messages, 20s wait)
             try:
-                resp = sqs.receive_message(
+                resp = await sqs.receive_message(
                     QueueUrl=queue_url,
                     MaxNumberOfMessages=10,
                     WaitTimeSeconds=20,
@@ -467,34 +313,37 @@ def main():
             except Exception:
                 consecutive_errors += 1
                 delay = min(2 ** consecutive_errors, 60) + random.uniform(0, 1)
-                logger.exception("SQS receive_message error, retrying in %.1fs", delay)
-                time.sleep(delay)
+                logger.exception("SQS error, retrying in %.1fs", delay)
+                await asyncio.sleep(delay)
                 continue
 
             for msg in resp.get("Messages", []):
-                future = pool.submit(
-                    _process_message, sqs, queue_url, msg, visibility_timeout,
-                )
-                in_flight.add(future)
+                task = asyncio.create_task(guarded_process(msg))
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
 
-        # Graceful shutdown: wait for in-flight scans to finish
-        logger.info("Shutting down — waiting for %d in-flight scans", len(in_flight))
-        for f in as_completed(in_flight, timeout=300):
-            exc = f.exception()
-            if exc:
-                logger.error("Worker thread raised during shutdown: %s", exc)
+            done = {t for t in in_flight if t.done()}
+            in_flight -= done
+            for t in done:
+                if t.exception():
+                    logger.error("Task raised: %s", t.exception())
+
+        logger.info("Shutting down — %d in-flight tasks", len(in_flight))
+        if in_flight:
+            await asyncio.gather(*in_flight, return_exceptions=True)
+
+    try:
+        await amaas.grpc.aio.quit(scan_handle)
+    except Exception:
+        pass
 
     _complete_lifecycle_action()
     logger.info("Shutdown complete")
 
 
-def _handle_signal(signum, frame):
-    sig_name = signal.Signals(signum).name
-    logger.info("Received %s — initiating graceful shutdown", sig_name)
-    _shutdown_event.set()
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
     main()
