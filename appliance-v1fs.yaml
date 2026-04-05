@@ -2,20 +2,6 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: TrendAI Service Gateway File Scanner - Network Infrastructure
 
 Mappings:
-  WorkerScaling:
-    "1":
-      MinWorkers: "2"
-      MaxWorkers: "4"
-    "2":
-      MinWorkers: "4"
-      MaxWorkers: "6"
-    "3":
-      MinWorkers: "6"
-      MaxWorkers: "8"
-    "4":
-      MinWorkers: "8"
-      MaxWorkers: "10"
-
   ServiceGatewayAMI:
     ap-northeast-1:
       AMI: ami-061b8e13afe1358d6
@@ -85,6 +71,20 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
+  ServiceGatewayInstanceType:
+    Description: EC2 instance type for Service Gateway appliances
+    Type: String
+    Default: c5.4xlarge
+    AllowedValues:
+      - c5.2xlarge
+      - c5.4xlarge
+      - c5.9xlarge
+  ChannelsPerSG:
+    Description: Number of gRPC channels per Service Gateway (2 is optimal)
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 8
   MaxFileSizeMB:
     Description: Maximum file size in MB for gRPC scanning (nginx and gRPC channel limit)
     Type: Number
@@ -100,6 +100,32 @@ Parameters:
     Type: Number
     Default: 30
     MinValue: 1
+  WorkerInstanceType:
+    Description: EC2 instance type for scanner worker fleet
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+  WorkerMinCount:
+    Description: Minimum number of scanner workers (HA across AZs)
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 20
+  WorkerMaxCount:
+    Description: Maximum number of scanner workers (scales on queue depth)
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+  WorkerConcurrency:
+    Description: Concurrent scans per worker instance
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 200
 
 Conditions:
   HasAtLeast2SGs: !Not [!Equals [!Ref ServiceGatewayCount, 1]]
@@ -384,7 +410,7 @@ Resources:
       LaunchTemplateName: !Sub ServiceGateway-${AWS::StackName}
       LaunchTemplateData:
         ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
-        InstanceType: c5.4xlarge
+        InstanceType: !Ref ServiceGatewayInstanceType
         KeyName: !Ref ServiceGatewayKeyPair
         IamInstanceProfile:
           Arn: !GetAtt ServiceGatewayInstanceProfile.Arn
@@ -447,13 +473,13 @@ Resources:
     Type: AWS::EC2::Instance
     Condition: HasAtLeast4SGs
     DependsOn:
-      - PrivateRoute1
+      - PrivateRoute2
       - ProvisionerEventPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      SubnetId: !Ref PrivateSubnet1
+      SubnetId: !Ref PrivateSubnet2
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-04
@@ -1321,9 +1347,7 @@ Resources:
                 Action: s3:PutObjectTagging
                 Resource: !Sub "${SourceBucket.Arn}/*"
               - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:PutObjectTagging
+                Action: s3:PutObject
                 Resource: !Sub "${QuarantineBucket.Arn}/*"
               - Effect: Allow
                 Action: s3:GetObject
@@ -1359,7 +1383,7 @@ Resources:
       LaunchTemplateName: !Sub worker-${AWS::StackName}
       LaunchTemplateData:
         ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
-        InstanceType: t3.medium
+        InstanceType: !Ref WorkerInstanceType
         IamInstanceProfile:
           Arn: !GetAtt WorkerInstanceProfile.Arn
         SecurityGroupIds:
@@ -1392,15 +1416,15 @@ Resources:
             AWS_DEFAULT_REGION=${AWS::Region}
             SQS_QUEUE_URL=${ScanQueue}
             SQS_VISIBILITY_TIMEOUT=300
-            MAX_CONCURRENT_SCANS=50
+            MAX_CONCURRENT_SCANS=${WorkerConcurrency}
             ASG_NAME=worker-asg-${AWS::StackName}
             SG_DISCOVERY_TAG=appliance-v1fs:stack=${AWS::StackName}
-            CHANNELS_PER_SG=2
             SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert
             V1FS_API_KEY_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key
             AUDIT_LOG_GROUP=scan-audit-${AWS::StackName}
             PML_ENABLED=${PMLEnabled}
             FEEDBACK_ENABLED=${SmartFeedbackEnabled}
+            CHANNELS_PER_SG=${ChannelsPerSG}
             MAX_FILE_SIZE_MB=${MaxFileSizeMB}
             SCANNER_ACCOUNT_ID=${AWS::AccountId}
             SOURCE_BUCKET=${SourceBucket}
@@ -1440,9 +1464,9 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref WorkerLaunchTemplate
         Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
-      MinSize: !FindInMap [WorkerScaling, !Ref ServiceGatewayCount, MinWorkers]
-      MaxSize: !FindInMap [WorkerScaling, !Ref ServiceGatewayCount, MaxWorkers]
-      DesiredCapacity: !FindInMap [WorkerScaling, !Ref ServiceGatewayCount, MinWorkers]
+      MinSize: !Ref WorkerMinCount
+      MaxSize: !Ref WorkerMaxCount
+      DesiredCapacity: !Ref WorkerMinCount
       VPCZoneIdentifier:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
@@ -1959,24 +1983,6 @@ Resources:
                 "title": "Latest Scan Results",
                 "view": "table"
               }
-            },
-            {
-              "type": "text",
-              "x": 0, "y": 67, "width": 24, "height": 1,
-              "properties": { "markdown": "## Service Gateway Health" }
-            },
-            {
-              "type": "custom",
-              "x": 0, "y": 68, "width": 24, "height": 8,
-              "properties": {
-                "endpoint": "${ProvisionerLambda.Arn}",
-                "title": "Service Gateway Status",
-                "updateOn": {
-                  "refresh": true,
-                  "resize": true,
-                  "timeRange": false
-                }
-              }
             }
           ]
         }
@@ -2073,13 +2079,6 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt WatchdogSchedule.Arn
 
-  DashboardWidgetPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref ProvisionerLambda
-      Action: lambda:InvokeFunction
-      Principal: cloudwatch.amazonaws.com
-
   # ── EC2 Instance Connect Endpoint ──────────────────────────────────
   EICSecGroup:
     Type: AWS::EC2::SecurityGroup
@@ -2100,31 +2099,6 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub EICEndpoint-${AWS::StackName}
-
-  # ── Integration SSM Parameters (for third-party scanner apps) ───
-  CACertArnParam:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: /appliance-v1fs/ca-cert-secret-arn
-      Type: String
-      Description: Secrets Manager ARN for the Service Gateway CA certificate (PEM)
-      Value: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert"
-
-  APIKeyArnParam:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: /appliance-v1fs/api-key-secret-arn
-      Type: String
-      Description: Secrets Manager ARN for the Vision One API key
-      Value: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key"
-
-  TLSServerNameParam:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: /appliance-v1fs/tls-server-name
-      Type: String
-      Description: TLS server name for gRPC SNI override
-      Value: sg.sgi.xdr.trendmicro.com
 
 Outputs:
   VPCId:
@@ -2184,12 +2158,3 @@ Outputs:
   EnrollmentTemplateURL:
     Description: Pre-populated enrollment template — download and deploy in customer accounts
     Value: !GetAtt EnrollmentTemplateResource.TemplateURL
-  CACertSecretArn:
-    Description: Secrets Manager ARN for the Service Gateway CA certificate
-    Value: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert"
-  APIKeySecretArn:
-    Description: Secrets Manager ARN for the Vision One API key
-    Value: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key"
-  TLSServerName:
-    Description: TLS server name for gRPC SNI override
-    Value: sg.sgi.xdr.trendmicro.com
