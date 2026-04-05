@@ -5,7 +5,6 @@ import os
 import random
 import signal
 import socket
-import tempfile
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -43,9 +42,8 @@ def _build_scan_handle():
     )["SecretString"]
 
     # Write CA cert to temp file for the SDK
-    cert_file = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".pem", delete=False
-    )
+    import tempfile
+    cert_file = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
     cert_file.write(ca_cert_pem)
     cert_file.close()
 
