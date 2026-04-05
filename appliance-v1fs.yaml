@@ -673,19 +673,17 @@ Resources:
                       # Generate self-signed cert with ALB DNS as SAN
                       key_file = tempfile.NamedTemporaryFile(suffix=".key", delete=False)
                       cert_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
-                      ext_file = tempfile.NamedTemporaryFile(suffix=".ext", mode="w", delete=False)
                       key_file.close(); cert_file.close()
-                      ext_file.write(f"subjectAltName=DNS:{alb_dns}\n")
-                      ext_file.close()
 
-                      subprocess.run([
-                          "openssl", "req", "-x509", "-nodes", "-days", "3650",
-                          "-newkey", "rsa:2048",
-                          "-keyout", key_file.name, "-out", cert_file.name,
-                          "-subj", "/CN=scanner-alb/O=appliance-v1fs",
-                          "-extfile", ext_file.name,
-                      ], check=True, capture_output=True)
-                      os.unlink(ext_file.name)
+                      result = subprocess.run(
+                          f"openssl req -x509 -nodes -days 3650 -newkey rsa:2048 "
+                          f"-keyout {key_file.name} -out {cert_file.name} "
+                          f'-subj "/CN=scanner-alb/O=appliance-v1fs" '
+                          f'-addext "subjectAltName=DNS:{alb_dns}"',
+                          shell=True, capture_output=True, text=True,
+                      )
+                      if result.returncode != 0:
+                          raise RuntimeError(f"openssl failed: {result.stderr}")
 
                       with open(cert_file.name) as f: cert_pem = f.read()
                       with open(key_file.name) as f: key_pem = f.read()
