@@ -14,7 +14,7 @@ logger.setLevel(logging.INFO)
 
 # SSM parameter for tracking scanner version per SG
 VERSION_PARAM_PREFIX = "/appliance-v1fs/scanner-version/"
-EXPECTED_REPLICAS = 4
+EXPECTED_REPLICAS = 1
 
 
 def handler(event, context):

@@ -56,7 +56,7 @@ Parameters:
     Type: Number
     Default: 3
     MinValue: 1
-    MaxValue: 4
+    MaxValue: 8
   PMLEnabled:
     Description: Enable Predictive Machine Learning (PML) for scans
     Type: String
@@ -74,7 +74,7 @@ Parameters:
   ServiceGatewayInstanceType:
     Description: EC2 instance type for Service Gateway appliances
     Type: String
-    Default: c5.4xlarge
+    Default: c5.2xlarge
     AllowedValues:
       - c5.2xlarge
       - c5.4xlarge
@@ -132,7 +132,25 @@ Conditions:
   HasAtLeast3SGs: !Or
     - !Equals [!Ref ServiceGatewayCount, 3]
     - !Equals [!Ref ServiceGatewayCount, 4]
-  HasAtLeast4SGs: !Equals [!Ref ServiceGatewayCount, 4]
+    - !Equals [!Ref ServiceGatewayCount, 5]
+    - !Equals [!Ref ServiceGatewayCount, 6]
+    - !Equals [!Ref ServiceGatewayCount, 7]
+    - !Equals [!Ref ServiceGatewayCount, 8]
+  HasAtLeast4SGs: !Or
+    - !Equals [!Ref ServiceGatewayCount, 4]
+    - !Equals [!Ref ServiceGatewayCount, 5]
+    - !Equals [!Ref ServiceGatewayCount, 6]
+    - !Equals [!Ref ServiceGatewayCount, 7]
+    - !Equals [!Ref ServiceGatewayCount, 8]
+  HasAtLeast5SGs: !Or
+    - !Equals [!Ref ServiceGatewayCount, 5]
+    - !Equals [!Ref ServiceGatewayCount, 6]
+    - !Equals [!Ref ServiceGatewayCount, 7]
+    - !Equals [!Ref ServiceGatewayCount, 8]
+  HasAtLeast6SGs: !Or
+    - !Equals [!Ref ServiceGatewayCount, 6]
+    - !Equals [!Ref ServiceGatewayCount, 7]
+    - !Equals [!Ref ServiceGatewayCount, 8]
 
 Resources:
   # ── VPC ──────────────────────────────────────────────────────────────
@@ -617,6 +635,35 @@ Resources:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-04
 
+  ServiceGateway5:
+    Type: AWS::EC2::Instance
+    Condition: HasAtLeast5SGs
+    DependsOn:
+      - PrivateRoute1
+      - ProvisionerEventPermission
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-05
+
+  ServiceGateway6:
+    Type: AWS::EC2::Instance
+    Condition: HasAtLeast6SGs
+    DependsOn:
+      - PrivateRoute2
+      - ProvisionerEventPermission
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-06
 
   # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
   ProvisionerEventRule:
