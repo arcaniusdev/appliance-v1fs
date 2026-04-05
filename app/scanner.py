@@ -217,10 +217,9 @@ def _process_file(s3, scan_bucket, key, size, pml, feedback, audit_log_group):
             break
         except Exception as exc:
             _mark_channel_failure(ch_idx)
-            if "RESOURCE_EXHAUSTED" in str(type(exc).__name__) or "Cannot allocate resource" in str(exc):
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
             raise
     scan_ms = int((time.monotonic() - scan_start) * 1000)
     result = json.loads(result_json)

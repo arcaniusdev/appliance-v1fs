@@ -14,6 +14,7 @@ logger.setLevel(logging.INFO)
 
 # SSM parameter for tracking scanner version per SG
 VERSION_PARAM_PREFIX = "/appliance-v1fs/scanner-version/"
+EXPECTED_REPLICAS = 4
 
 
 def handler(event, context):
@@ -94,6 +95,18 @@ def _get_scanner_version(sgowner_client):
     return stdout.read().decode().strip("'")
 
 
+def _scale_replicas(sgowner_client, count):
+    """Scale the scanner deployment to the specified replica count."""
+    stdin, stdout, stderr = sgowner_client.exec_command(
+        f"sudo microk8s kubectl scale deployment --all "
+        f"-n sg-sfs-scanner --replicas={count} 2>&1",
+        timeout=15,
+    )
+    output = stdout.read().decode().strip()
+    logger.info("Scale replicas to %d: %s", count, output)
+    return output
+
+
 def _store_cert(secret_name, cert_pem, region):
     """Store or update the CA cert in Secrets Manager."""
     sm = boto3.client("secretsmanager", region_name=region)
@@ -112,7 +125,7 @@ def _store_cert(secret_name, cert_pem, region):
 # ── Dynamic SG Discovery ─────────────────────────────────────────────
 
 def _discover_sg_instances(region):
-    """Discover running SG instance IDs via EC2 tags."""
+    """Discover running SG instances with metadata."""
     tag_key = os.environ.get("SG_TAG_KEY", "appliance-v1fs:stack")
     tag_value = os.environ.get("SG_TAG_VALUE", "")
     if not tag_value:
@@ -123,11 +136,17 @@ def _discover_sg_instances(region):
         {"Name": f"tag:{tag_key}", "Values": [tag_value]},
         {"Name": "instance-state-name", "Values": ["running"]},
     ])
-    return [
-        inst["InstanceId"]
-        for res in resp["Reservations"]
-        for inst in res["Instances"]
-    ]
+    instances = []
+    for res in resp["Reservations"]:
+        for inst in res["Instances"]:
+            tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+            instances.append({
+                "instance_id": inst["InstanceId"],
+                "hostname": tags.get("Name", inst["InstanceId"]),
+                "provisioned": tags.get("appliance-v1fs:provisioned", "false"),
+            })
+    instances.sort(key=lambda x: x["hostname"])
+    return instances
 
 
 # ── EC2 State Change → Provision ────────────────────────────────────
@@ -238,11 +257,12 @@ def _handle_instance_running(event, context):
             # Wait for File Security scanner pod to be running
             _wait_for_scanner_pod(host, private_key, port=port)
 
-            # Extract CA cert and patch nginx for large file gRPC scanning
+            # Extract CA cert, patch nginx, and scale replicas
             sgowner = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
             cert_pem = _extract_cert(sgowner)
             version = _get_scanner_version(sgowner)
             _patch_nginx_body_size(sgowner)
+            _scale_replicas(sgowner, EXPECTED_REPLICAS)
             sgowner.close()
 
             if cert_pem:
@@ -356,8 +376,9 @@ def _handle_watchdog(event, context):
     results = []
     cert_updated = False
 
-    for instance_id in sg_instances:
-        logger.info("Watchdog: checking %s", instance_id)
+    for inst_info in sg_instances:
+        instance_id = inst_info["instance_id"]
+        logger.info("Watchdog: checking %s (%s)", instance_id, inst_info["hostname"])
         try:
             # Get stored version
             param_name = f"{VERSION_PARAM_PREFIX}{instance_id}"
@@ -387,12 +408,34 @@ def _handle_watchdog(event, context):
                     results.append({"instance": instance_id, "action": "waiting"})
                     continue
 
-                # Get version, cert, and re-apply nginx patch via sgowner (same tunnel)
+                # Get version, cert, re-apply nginx patch, and scale replicas via sgowner
                 client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
                 _patch_nginx_body_size(client)
                 current_version = _get_scanner_version(client)
 
-                if current_version != stored:
+                # Complete provisioning for SGs that have the scanner pod but
+                # were never fully provisioned (e.g., File Security was installed
+                # manually via the Vision One console after the provisioner timed out)
+                if inst_info["provisioned"] != "true":
+                    logger.info("Watchdog: completing provisioning for %s (%s)",
+                                instance_id, inst_info["hostname"])
+                    _scale_replicas(client, EXPECTED_REPLICAS)
+                    cert_pem = _extract_cert(client)
+                    if cert_pem:
+                        _store_cert(cert_secret_name, cert_pem, region)
+                        cert_updated = True
+                    ssm.put_parameter(
+                        Name=param_name, Value=current_version,
+                        Type="String", Overwrite=True,
+                    )
+                    ec2 = boto3.client("ec2", region_name=region)
+                    ec2.create_tags(Resources=[instance_id], Tags=[
+                        {"Key": "appliance-v1fs:provisioned", "Value": "true"},
+                    ])
+                    results.append({"instance": instance_id, "action": "provisioned"})
+                    logger.info("Watchdog: %s (%s) now fully provisioned",
+                                instance_id, inst_info["hostname"])
+                elif current_version != stored:
                     logger.info(
                         "Watchdog: version changed on %s: %s -> %s",
                         instance_id, stored or "(none)", current_version,
