@@ -140,11 +140,19 @@ def _build_channels():
                 channel_addrs.append(addr)
             logger.info("Created %d gRPC channel(s) to %s", channels_per_sg, addr)
 
+        old_channels = _channels
         _channels = channels
         _channel_addrs = channel_addrs
         _channel_failures = [0] * len(channels)
         _channel_cooldown = [0.0] * len(channels)
         _channels_built_at = time.monotonic()
+
+        if old_channels:
+            for ch in old_channels:
+                try:
+                    ch.close()
+                except Exception:
+                    pass
 
 
 def _get_channel():
