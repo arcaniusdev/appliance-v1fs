@@ -716,8 +716,6 @@ Resources:
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub "scan-${AWS::StackName}"
-      VersioningConfiguration:
-        Status: Enabled
       NotificationConfiguration:
         EventBridgeConfiguration:
           EventBridgeEnabled: true
