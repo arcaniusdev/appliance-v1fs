@@ -121,14 +121,18 @@ async def _process_file(s3, scan_bucket, key, size, pml,
             "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s",
             scan_bucket, key, malware_names, scan_ms, sg_addr,
         )
-        await s3.put_object_tagging(
-            Bucket=SOURCE_BUCKET, Key=key,
-            Tagging={"TagSet": [
-                {"Key": "ScanResult", "Value": "Malware"},
-                {"Key": "ScanTimestamp", "Value": scan_ts},
-            ]},
-        )
-        quarantine_key = f"{SOURCE_BUCKET}/{key}"
+        if SOURCE_BUCKET and SOURCE_BUCKET != scan_bucket:
+            try:
+                await s3.put_object_tagging(
+                    Bucket=SOURCE_BUCKET, Key=key,
+                    Tagging={"TagSet": [
+                        {"Key": "ScanResult", "Value": "Malware"},
+                        {"Key": "ScanTimestamp", "Value": scan_ts},
+                    ]},
+                )
+            except Exception:
+                logger.debug("Could not tag source object (may not exist)", exc_info=True)
+        quarantine_key = f"{SOURCE_BUCKET or scan_bucket}/{key}"
         tags = urlencode({
             "ScanResult": "Malware",
             "ScanTimestamp": scan_ts,
