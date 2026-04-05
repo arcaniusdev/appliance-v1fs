@@ -1685,6 +1685,9 @@ Resources:
                   - s3:DeleteObject
                 Resource: !Sub "${ScanBucket.Arn}/*"
               - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "${ScanBucket.Arn}"
+              - Effect: Allow
                 Action: s3:PutObjectTagging
                 Resource: !Sub "${SourceBucket.Arn}/*"
               - Effect: Allow
