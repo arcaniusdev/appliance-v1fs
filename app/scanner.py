@@ -25,14 +25,31 @@ SOURCE_BUCKET = os.environ.get("SOURCE_BUCKET", "")
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 
 
-# ── Scan Handle ──────────────────────────────────────────────────────
+# ── SG Discovery + Scan Handles ──────────────────────────────────────
 
-def _build_scan_handle():
-    """Create a single async scan handle pointing at the ALB."""
-    endpoint = os.environ.get("SCANNER_ENDPOINT", "")
-    if not endpoint:
-        raise RuntimeError("SCANNER_ENDPOINT not set")
+def _discover_sg_addresses():
+    """Discover running Service Gateway IPs via EC2 tags."""
+    tag_spec = os.environ.get("SG_DISCOVERY_TAG", "")
+    if not tag_spec:
+        raise RuntimeError("SG_DISCOVERY_TAG not set")
+    tag_key, tag_value = tag_spec.split("=", 1)
+    ec2 = boto3.client("ec2")
+    resp = ec2.describe_instances(Filters=[
+        {"Name": f"tag:{tag_key}", "Values": [tag_value]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ])
+    addrs = []
+    for res in resp["Reservations"]:
+        for inst in res["Instances"]:
+            addrs.append(f"{inst['PrivateIpAddress']}:443")
+    if not addrs:
+        raise RuntimeError("No running Service Gateway instances found")
+    addrs.sort()
+    return addrs
 
+
+def _build_scan_handles():
+    """Create one async scan handle per SG for direct IP scanning."""
     sm = boto3.client("secretsmanager")
     api_key = sm.get_secret_value(
         SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
@@ -41,24 +58,26 @@ def _build_scan_handle():
         SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
     )["SecretString"]
 
-    # Write CA cert to temp file for the SDK
     import tempfile
     cert_file = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
     cert_file.write(ca_cert_pem)
     cert_file.close()
 
-    # init() is synchronous — do NOT await
-    handle = amaas.grpc.aio.init(endpoint, api_key, True, ca_cert=cert_file.name)
-    logger.info("Async scan handle created for %s", endpoint)
-    return handle
+    addrs = _discover_sg_addresses()
+    handles = []
+    for addr in addrs:
+        # init() is synchronous — do NOT await
+        handle = amaas.grpc.aio.init(addr, api_key, True, ca_cert=cert_file.name)
+        handles.append((handle, addr))
+        logger.info("Async scan handle created for %s", addr)
+    return handles
 
 
 # ── Core Scan Logic ──────────────────────────────────────────────────
 
 async def _process_file(s3, scan_bucket, key, size, pml,
-                        audit_log_group, logs, scan_handle):
+                        audit_log_group, logs, scan_handles):
     logger.info("Processing s3://%s/%s (%d bytes)", scan_bucket, key, size)
-    sg_addr = os.environ.get("SCANNER_ENDPOINT", "unknown")
 
     try:
         resp = await s3.get_object(Bucket=scan_bucket, Key=key)
@@ -71,10 +90,11 @@ async def _process_file(s3, scan_bucket, key, size, pml,
         raise
 
     for attempt in range(3):
+        handle, sg_addr = random.choice(scan_handles)
         scan_start = time.monotonic()
         try:
             result_json = await amaas.grpc.aio.scan_buffer(
-                scan_handle, file_bytes, os.path.basename(key),
+                handle, file_bytes, os.path.basename(key),
                 pml=pml, tags=["S3-Scan"],
             )
             break
@@ -168,7 +188,7 @@ async def _audit(logs, log_group, bucket, key, size, verdict, result,
 
 # ── SQS Message Processing ──────────────────────────────────────────
 
-async def _process_message(sqs, s3, logs, queue_url, message, scan_handle, visibility_timeout):
+async def _process_message(sqs, s3, logs, queue_url, message, scan_handles, visibility_timeout):
     message_id = message.get("MessageId", "unknown")
     receipt_handle = message["ReceiptHandle"]
 
@@ -203,7 +223,7 @@ async def _process_message(sqs, s3, logs, queue_url, message, scan_handle, visib
             return
 
         await _process_file(s3, scan_bucket, key, size, pml,
-                            audit_log_group, logs, scan_handle)
+                            audit_log_group, logs, scan_handles)
         await sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
     except Exception:
@@ -271,11 +291,11 @@ async def async_main():
     semaphore = asyncio.Semaphore(max_concurrent)
     consecutive_errors = 0
 
-    scan_handle = _build_scan_handle()
+    scan_handles = _build_scan_handles()
 
     logger.info(
-        "Scanner worker starting — queue=%s concurrency=%d hostname=%s",
-        queue_url, max_concurrent, socket.gethostname(),
+        "Scanner worker starting — queue=%s concurrency=%d handles=%d hostname=%s",
+        queue_url, max_concurrent, len(scan_handles), socket.gethostname(),
     )
 
     session = AioSession()
@@ -288,7 +308,7 @@ async def async_main():
         async def guarded_process(message):
             async with semaphore:
                 await _process_message(sqs, s3, logs, queue_url, message,
-                                       scan_handle, visibility_timeout)
+                                       scan_handles, visibility_timeout)
 
         while not shutdown_event.is_set():
             if len(in_flight) >= max_concurrent * 2:
@@ -330,10 +350,11 @@ async def async_main():
         if in_flight:
             await asyncio.gather(*in_flight, return_exceptions=True)
 
-    try:
-        await amaas.grpc.aio.quit(scan_handle)
-    except Exception:
-        pass
+    for handle, addr in scan_handles:
+        try:
+            await amaas.grpc.aio.quit(handle)
+        except Exception:
+            pass
 
     _complete_lifecycle_action()
     logger.info("Shutdown complete")
