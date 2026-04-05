@@ -484,6 +484,207 @@ Resources:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-04
 
+  # ── ALB Certificate (self-signed, for internal gRPC) ────────────
+  ALBCertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CertPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:ImportCertificate
+                  - acm:DeleteCertificate
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DeleteSecret
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
+
+  ALBCertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub alb-cert-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ALBCertRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, subprocess, tempfile, os
+          from urllib.request import Request, urlopen
+
+          def handler(event, context):
+              rtype = event["RequestType"]
+              props = event["ResourceProperties"]
+              cert_secret = props["CertSecretName"]
+              data = {}
+
+              try:
+                  if rtype in ("Create", "Update"):
+                      # Generate self-signed cert
+                      key_file = tempfile.NamedTemporaryFile(suffix=".key", delete=False)
+                      cert_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
+                      key_file.close(); cert_file.close()
+
+                      subprocess.run([
+                          "openssl", "req", "-x509", "-nodes", "-days", "3650",
+                          "-newkey", "rsa:2048",
+                          "-keyout", key_file.name, "-out", cert_file.name,
+                          "-subj", "/CN=scanner-alb/O=appliance-v1fs",
+                      ], check=True, capture_output=True)
+
+                      with open(cert_file.name) as f: cert_pem = f.read()
+                      with open(key_file.name) as f: key_pem = f.read()
+                      os.unlink(key_file.name); os.unlink(cert_file.name)
+
+                      # Import to ACM
+                      acm = boto3.client("acm")
+                      resp = acm.import_certificate(
+                          Certificate=cert_pem.encode(),
+                          PrivateKey=key_pem.encode(),
+                      )
+                      arn = resp["CertificateArn"]
+                      data["CertificateArn"] = arn
+
+                      # Store cert PEM in Secrets Manager for workers
+                      sm = boto3.client("secretsmanager")
+                      try:
+                          sm.create_secret(Name=cert_secret, SecretString=cert_pem)
+                      except sm.exceptions.ResourceExistsException:
+                          sm.put_secret_value(SecretId=cert_secret, SecretString=cert_pem)
+
+                  elif rtype == "Delete":
+                      # Clean up ACM cert if we have the ARN
+                      phys = event.get("PhysicalResourceId", "")
+                      if phys.startswith("arn:aws:acm:"):
+                          try:
+                              boto3.client("acm").delete_certificate(CertificateArn=phys)
+                          except Exception:
+                              pass
+
+                  _respond(event, "SUCCESS", data.get("CertificateArn", event.get("PhysicalResourceId", "none")), data)
+              except Exception as e:
+                  print(f"Error: {e}")
+                  _respond(event, "FAILED", event.get("PhysicalResourceId", "none"), {}, str(e))
+
+          def _respond(event, status, physical_id, data, reason=""):
+              body = json.dumps({
+                  "Status": status, "Reason": reason,
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data,
+              }).encode()
+              req = Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("Content-Type", "")
+              req.add_header("Content-Length", str(len(body)))
+              urlopen(req)
+
+  ALBCertResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ALBCertLambda.Arn
+      CertSecretName: appliance-v1fs/alb-ca-cert
+
+  # ── Scanner ALB (gRPC request-level load balancing) ────────────
+  ScannerALBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: Scanner ALB - accepts gRPC from VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.2.0.0/16
+          Description: HTTPS/gRPC from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ScannerALBSG-${AWS::StackName}
+
+  ScannerALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - PrivateRoute1
+      - PrivateRoute2
+    Properties:
+      Name: !Sub scanner-${AWS::StackName}
+      Type: application
+      Scheme: internal
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref ScannerALBSecGroup
+      LoadBalancerAttributes:
+        - Key: routing.http2.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub ScannerALB-${AWS::StackName}
+
+  ScannerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub sg-grpc-${AWS::StackName}
+      TargetType: instance
+      Port: 443
+      Protocol: HTTPS
+      ProtocolVersion: GRPC
+      VpcId: !Ref BaseVPC
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: "443"
+      HealthCheckPath: /
+      Matcher:
+        GrpcCode: "0-99"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckIntervalSeconds: 10
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Targets:
+        - Id: !Ref ServiceGateway1
+        - !If
+          - HasAtLeast2SGs
+          - Id: !Ref ServiceGateway2
+          - !Ref "AWS::NoValue"
+        - !If
+          - HasAtLeast3SGs
+          - Id: !Ref ServiceGateway3
+          - !Ref "AWS::NoValue"
+        - !If
+          - HasAtLeast4SGs
+          - Id: !Ref ServiceGateway4
+          - !Ref "AWS::NoValue"
+
+  ScannerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ScannerALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !GetAtt ALBCertResource.CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ScannerTargetGroup
+
   # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
   ProvisionerEventRule:
     Type: AWS::Events::Rule
@@ -1364,9 +1565,6 @@ Resources:
                   - logs:PutLogEvents
                 Resource: "*"
               - Effect: Allow
-                Action: ec2:DescribeInstances
-                Resource: "*"
-              - Effect: Allow
                 Action: autoscaling:CompleteLifecycleAction
                 Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/worker-asg-${AWS::StackName}"
 
@@ -1379,7 +1577,7 @@ Resources:
   WorkerLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     DependsOn:
-      - ServiceGateway1
+      - ScannerListener
       - CodeBuild
     Properties:
       LaunchTemplateName: !Sub worker-${AWS::StackName}
@@ -1420,13 +1618,12 @@ Resources:
             SQS_VISIBILITY_TIMEOUT=300
             MAX_CONCURRENT_SCANS=${WorkerConcurrency}
             ASG_NAME=worker-asg-${AWS::StackName}
-            SG_DISCOVERY_TAG=appliance-v1fs:stack=${AWS::StackName}
-            SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert
+            SCANNER_ENDPOINT=${ScannerALB.DNSName}:443
+            SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/alb-ca-cert
             V1FS_API_KEY_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key
             AUDIT_LOG_GROUP=scan-audit-${AWS::StackName}
             PML_ENABLED=${PMLEnabled}
             FEEDBACK_ENABLED=${SmartFeedbackEnabled}
-            CHANNELS_PER_SG=${ChannelsPerSG}
             MAX_FILE_SIZE_MB=${MaxFileSizeMB}
             SCANNER_ACCOUNT_ID=${AWS::AccountId}
             SOURCE_BUCKET=${SourceBucket}
@@ -1459,7 +1656,7 @@ Resources:
   WorkerASG:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn:
-      - ServiceGateway1
+      - ScannerListener
       - CodeBuild
     Properties:
       AutoScalingGroupName: !Sub worker-asg-${AWS::StackName}
