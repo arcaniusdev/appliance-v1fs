@@ -54,13 +54,25 @@ def _build_scan_handles():
     api_key = sm.get_secret_value(
         SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
     )["SecretString"]
+    ca_cert_pem = sm.get_secret_value(
+        SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
+    )["SecretString"]
+
+    import grpc as grpc_lib
+    tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
+    auth_key = f"ApiKey {api_key}"
+    call_creds = grpc_lib.metadata_call_credentials(
+        lambda context, callback: callback([("authorization", auth_key)], None)
+    )
+    ssl_creds = grpc_lib.ssl_channel_credentials(ca_cert_pem.encode("utf-8"))
+    composite = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
+    options = [("grpc.ssl_target_name_override", tls_override)]
+
     addrs = _discover_sg_addresses()
     handles = []
     for addr in addrs:
-        # init() is synchronous — do NOT await
-        # TLS disabled — SGs use self-signed certs for sg.sgi.xdr.trendmicro.com
-        # which don't match the SG IP addresses. Traffic stays in VPC private subnets.
-        handle = amaas.grpc.aio.init(addr, api_key, False)
+        # Create async gRPC channel directly with TLS name override
+        handle = grpc_lib.aio.secure_channel(addr, composite, options=options)
         handles.append((handle, addr))
         logger.info("Async scan handle created for %s", addr)
     return handles
