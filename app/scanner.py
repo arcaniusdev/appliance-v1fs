@@ -66,7 +66,10 @@ def _build_scan_handles():
     )
     ssl_creds = grpc_lib.ssl_channel_credentials(ca_cert_pem.encode("utf-8"))
     composite = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
-    options = [("grpc.ssl_target_name_override", tls_override)]
+    options = [
+        ("grpc.ssl_target_name_override", tls_override),
+        ("grpc.use_local_subchannel_pool", 1),
+    ]
 
     addrs = _discover_sg_addresses()
     channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "2"))
