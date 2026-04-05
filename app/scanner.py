@@ -69,12 +69,13 @@ def _build_scan_handles():
     options = [("grpc.ssl_target_name_override", tls_override)]
 
     addrs = _discover_sg_addresses()
+    channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "2"))
     handles = []
     for addr in addrs:
-        # Create async gRPC channel directly with TLS name override
-        handle = grpc_lib.aio.secure_channel(addr, composite, options=options)
-        handles.append((handle, addr))
-        logger.info("Async scan handle created for %s", addr)
+        for _ in range(channels_per_sg):
+            handle = grpc_lib.aio.secure_channel(addr, composite, options=options)
+            handles.append((handle, addr))
+        logger.info("Created %d async channel(s) to %s", channels_per_sg, addr)
     return handles
 
 
