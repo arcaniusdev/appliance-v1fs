@@ -28,16 +28,50 @@ QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 # ── SG Discovery + Scan Handles ──────────────────────────────────────
 
 def _build_scan_handles():
-    """Build scan handle(s) — ALB single channel or direct IP multi-channel."""
+    """Build scan handle(s) — DNS, ALB, or EC2 tag discovery."""
     sm = boto3.client("secretsmanager")
     api_key = sm.get_secret_value(
         SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
     )["SecretString"]
 
+    sg_dns = os.environ.get("SG_DNS_NAME", "")
+    if sg_dns:
+        return _build_dns_handles(sm, api_key, sg_dns)
     alb_endpoint = os.environ.get("ALB_ENDPOINT", "")
     if alb_endpoint:
         return _build_alb_handle(sm, api_key, alb_endpoint)
     return _build_direct_handles(sm, api_key)
+
+
+def _build_dns_handles(sm, api_key, dns_name):
+    """Resolve DNS to multiple SG IPs, create one channel per IP."""
+    import grpc as grpc_lib
+
+    addrs = sorted(set(
+        info[4][0] for info in socket.getaddrinfo(dns_name, 443, socket.AF_INET)
+    ))
+    if not addrs:
+        raise RuntimeError(f"DNS {dns_name} resolved to no addresses")
+
+    ca_cert_pem = sm.get_secret_value(
+        SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
+    )["SecretString"]
+    tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
+    auth_key = f"ApiKey {api_key}"
+    call_creds = grpc_lib.metadata_call_credentials(
+        lambda context, callback: callback([("authorization", auth_key)], None)
+    )
+    ssl_creds = grpc_lib.ssl_channel_credentials(ca_cert_pem.encode("utf-8"))
+    composite = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
+    options = [("grpc.ssl_target_name_override", tls_override)]
+
+    handles = []
+    for ip in addrs:
+        addr = f"{ip}:443"
+        handle = grpc_lib.aio.secure_channel(addr, composite, options=options)
+        handles.append((handle, addr))
+        logger.info("DNS %s → channel to %s", dns_name, addr)
+    return handles
 
 
 def _build_alb_handle(sm, api_key, alb_endpoint):
