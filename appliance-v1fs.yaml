@@ -597,7 +597,7 @@ Resources:
       InstanceReusePolicy:
         ReuseOnScaleIn: true
 
-  SGTargetTrackingPolicy:
+  SGScalingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
       AutoScalingGroupName: !Ref ServiceGatewayASG
