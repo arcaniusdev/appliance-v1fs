@@ -566,7 +566,7 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      MinSize: !Ref ServiceGatewayMinCount
+      MinSize: 0
       MaxSize: !Ref ServiceGatewayMaxCount
       DesiredCapacity: !Ref ServiceGatewayMaxCount
       VPCZoneIdentifier:

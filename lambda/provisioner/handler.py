@@ -209,8 +209,13 @@ def _handle_instance_running(event, context):
         _complete_lifecycle_hook(instance_id, region)
         return {"status": "warm_pool_ready", "instance": instance_id}
 
-    # Hostname comes from the Name tag set by CloudFormation
-    hostname = tags.get("Name", instance_id)
+    # Assign numbered hostname based on position among stack SGs
+    hostname_prefix = tags.get("Name", "FSVA-AWS")
+    all_sgs = _discover_sg_instances(region)
+    sg_ids = sorted(sg["instance_id"] for sg in all_sgs)
+    sg_index = sg_ids.index(instance_id) + 1 if instance_id in sg_ids else len(sg_ids) + 1
+    hostname = f"{hostname_prefix}-{sg_index:02d}"
+    ec2.create_tags(Resources=[instance_id], Tags=[{"Key": "Name", "Value": hostname}])
     logger.info("Provisioning Service Gateway %s as %s", instance_id, hostname)
     endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
     key_pair_id = os.environ.get("KEY_PAIR_ID", "")
