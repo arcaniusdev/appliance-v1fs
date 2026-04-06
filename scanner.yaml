@@ -837,6 +837,9 @@ Resources:
         - !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
       SecurityGroups:
         - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "300"
       Tags:
         - Key: Name
           Value: !Sub ScannerALB-${AWS::StackName}
