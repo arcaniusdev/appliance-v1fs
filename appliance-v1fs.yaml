@@ -2360,7 +2360,10 @@ Resources:
                 Action: s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${DeployBucket}/awscli-runtime.zip"
               - Effect: Allow
-                Action: autoscaling:CompleteLifecycleAction
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:DescribeAutoScalingGroups
                 Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/sg-asg-${AWS::StackName}"
 
   ProvisionerLambda:
@@ -2390,6 +2393,7 @@ Resources:
           DEPLOY_BUCKET: !Ref DeployBucket
           MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
           SG_ASG_NAME: !Sub sg-asg-${AWS::StackName}
+          SG_MIN_COUNT: !Ref ServiceGatewayMinCount
 
   WatchdogSchedule:
     Type: AWS::Events::Rule

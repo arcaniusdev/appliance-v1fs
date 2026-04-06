@@ -36,6 +36,44 @@ def _complete_lifecycle_hook(instance_id, region):
         logger.warning("Could not complete lifecycle hook for %s", instance_id, exc_info=True)
 
 
+def _check_initial_provisioning_complete(region):
+    """If all ASG instances are provisioned, scale down to min count (warm pool absorbs extras)."""
+    asg_name = os.environ.get("SG_ASG_NAME", "")
+    min_count = int(os.environ.get("SG_MIN_COUNT", "0"))
+    if not asg_name or not min_count:
+        return
+
+    autoscaling = boto3.client("autoscaling", region_name=region)
+    asg = autoscaling.describe_auto_scaling_groups(
+        AutoScalingGroupNames=[asg_name],
+    )["AutoScalingGroups"]
+    if not asg:
+        return
+
+    asg = asg[0]
+    desired = asg["DesiredCapacity"]
+    if desired <= min_count:
+        return  # Already scaled down
+
+    # Check if all instances are provisioned
+    all_sgs = _discover_sg_instances(region)
+    if not all_sgs:
+        return
+
+    all_provisioned = all(sg["provisioned"] == "true" for sg in all_sgs)
+    if not all_provisioned:
+        logger.info("Initial provisioning: %d/%d SGs provisioned",
+                     sum(1 for sg in all_sgs if sg["provisioned"] == "true"), len(all_sgs))
+        return
+
+    logger.info("All %d SGs provisioned — scaling desired to %d (extras go to warm pool)",
+                 len(all_sgs), min_count)
+    autoscaling.update_auto_scaling_group(
+        AutoScalingGroupName=asg_name,
+        DesiredCapacity=min_count,
+    )
+
+
 def handler(event, context):
     """Service Gateway provisioner.
 
@@ -317,6 +355,7 @@ def _handle_instance_running(event, context):
             {"Key": "appliance-v1fs:provisioned", "Value": "true"},
         ])
         _complete_lifecycle_hook(instance_id, region)
+        _check_initial_provisioning_complete(region)
 
         return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
 
@@ -468,6 +507,7 @@ def _handle_watchdog(event, context):
                         {"Key": "appliance-v1fs:provisioned", "Value": "true"},
                     ])
                     _complete_lifecycle_hook(instance_id, region)
+                    _check_initial_provisioning_complete(region)
                     results.append({"instance": instance_id, "action": "provisioned"})
                     logger.info("Watchdog: %s (%s) now fully provisioned",
                                 instance_id, inst_info["hostname"])
