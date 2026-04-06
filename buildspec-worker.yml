@@ -1,0 +1,11 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      # ── Scanner worker application ───────────────────────────────
+      - cd $CODEBUILD_SRC_DIR/app && zip /tmp/scanner-app.zip scanner.py requirements.txt
+      - aws s3 cp /tmp/scanner-app.zip s3://$DEPLOY_BUCKET/scanner-app.zip
+
+      # ── Enrollment template (raw, pre-populated by custom resource after stack creation)
+      - aws s3 cp $CODEBUILD_SRC_DIR/enrollment.yaml s3://$DEPLOY_BUCKET/enrollment.yaml

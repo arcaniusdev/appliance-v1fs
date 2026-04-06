@@ -1,0 +1,1153 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: TrendAI Service Gateway Scanner Infrastructure
+
+Mappings:
+  ServiceGatewayAMI:
+    ap-northeast-1:
+      AMI: ami-061b8e13afe1358d6
+    ap-northeast-2:
+      AMI: ami-06d290f555649e7cf
+    ap-northeast-3:
+      AMI: ami-00f25d39db251653f
+    ap-south-1:
+      AMI: ami-0a2f9a344b741d105
+    ap-southeast-1:
+      AMI: ami-0314c89685371c51b
+    ap-southeast-2:
+      AMI: ami-041754942552affa3
+    ca-central-1:
+      AMI: ami-07402a3cb195e17fc
+    eu-central-1:
+      AMI: ami-052395dc73896c7e9
+    eu-north-1:
+      AMI: ami-01da7559532215e43
+    eu-west-1:
+      AMI: ami-0464d17a390eaa185
+    eu-west-2:
+      AMI: ami-074a722115304208d
+    eu-west-3:
+      AMI: ami-0fb56479bb67150e8
+    sa-east-1:
+      AMI: ami-0fceef1ddaea68074
+    us-east-1:
+      AMI: ami-0cc07c329eab4df1c
+    us-east-2:
+      AMI: ami-070f04f9bc3eea5f5
+    us-west-1:
+      AMI: ami-0d82ee727bafa15e8
+    us-west-2:
+      AMI: ami-0bcbbe1b09927f3d7
+
+Parameters:
+  PrimaryAZ:
+    Description: Availability Zone 1
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+  SecondaryAZ:
+    Description: Availability Zone 2
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1b
+  ServiceGatewayHostname:
+    Description: Hostname prefix for Service Gateway appliances (numbered automatically)
+    Type: String
+    Default: FSVA-AWS
+  ServiceGatewayMinCount:
+    Description: Minimum Service Gateways (always running)
+    Type: Number
+    Default: 1
+    MinValue: 1
+  ServiceGatewayMaxCount:
+    Description: Maximum Service Gateways (includes warm pool)
+    Type: Number
+    Default: 6
+    MinValue: 1
+  ServiceGatewayInstanceType:
+    Description: EC2 instance type for Service Gateway appliances
+    Type: String
+    Default: c5.2xlarge
+    AllowedValues:
+      - c5.2xlarge
+      - c5.4xlarge
+      - c5.9xlarge
+  MaxFileSizeMB:
+    Description: Maximum file size in MB for gRPC scanning (nginx and gRPC channel limit)
+    Type: Number
+    Default: 500
+    MinValue: 10
+    MaxValue: 2048
+  PMLEnabled:
+    Description: Enable Predictive Machine Learning (PML) for scans
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+  SmartFeedbackEnabled:
+    Description: Enable Smart Feedback (scan telemetry sent to TrendAI for threat intelligence)
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Resources:
+  # ── VPC ──────────────────────────────────────────────────────────────
+  BaseVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.2.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub BaseVPC-${AWS::StackName}
+
+  # ── Internet Gateway ────────────────────────────────────────────────
+  IG:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub IG-${AWS::StackName}
+
+  VPCIG:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref IG
+      VpcId: !Ref BaseVPC
+
+  # ── Public Subnets ──────────────────────────────────────────────────
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.0.0/22
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref PrimaryAZ
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet1-${AWS::StackName}
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.4.0/22
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref SecondaryAZ
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet2-${AWS::StackName}
+
+  # ── Private Subnets ─────────────────────────────────────────────────
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.32.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref PrimaryAZ
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet1-${AWS::StackName}
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.48.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref SecondaryAZ
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet2-${AWS::StackName}
+
+  # ── NAT Gateway EIPs ────────────────────────────────────────────────
+  NGWEIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP1-${AWS::StackName}
+
+  NGWEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP2-${AWS::StackName}
+
+  # ── NAT Gateways ────────────────────────────────────────────────────
+  NGW1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP1.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub NGW1-${AWS::StackName}
+
+  NGW2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP2.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub NGW2-${AWS::StackName}
+
+  # ── Public Route Tables ─────────────────────────────────────────────
+  PublicRT1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT1-${AWS::StackName}
+
+  PublicRoute1:
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  PublicRT2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT2-${AWS::StackName}
+
+  PublicRoute2:
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT2
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  # ── Private Route Tables ────────────────────────────────────────────
+  PrivateRT1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT1-${AWS::StackName}
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW1
+
+  PrivateRT2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT2-${AWS::StackName}
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW2
+
+  # ── Route Table Associations ────────────────────────────────────────
+  PublicSubnetRT1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT1
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnetRT2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT2
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateSubnetRT1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnetRT2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT2
+      SubnetId: !Ref PrivateSubnet2
+
+  # ── S3 Gateway VPC Endpoint ────────────────────────────────────────
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRT1
+        - !Ref PrivateRT2
+
+  # ── Interface VPC Endpoints (keep AWS API traffic off the internet) ─
+  VPCEndpointSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: HTTPS access for VPC Interface Endpoints
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.2.0.0/16
+          Description: HTTPS from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub VPCEndpointSG-${AWS::StackName}
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  SQSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sqs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  AutoScalingEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.autoscaling
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  STSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sts
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  EC2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BaseVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecGroup
+
+  # ── SSH Key Pair ────────────────────────────────────────────────────
+  ServiceGatewayKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ServiceGatewayKeyPair-${AWS::StackName}
+      KeyType: ed25519
+      Tags:
+        - Key: Name
+          Value: !Sub ServiceGatewayKeyPair-${AWS::StackName}
+
+  # ── Service Gateway ────────────────────────────────────────────────
+  ServiceGatewaySecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: Service Gateway appliance - inbound scan traffic and management
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.2.0.0/16
+          Description: HTTPS from VPC (SDK gRPC, management)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.2.0.0/16
+          Description: SSH from VPC (CLI management)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound (Vision One, updates)
+      Tags:
+        - Key: Name
+          Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
+
+  # ── Service Gateway ──────────────────────────────────────────────
+  ServiceGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ServiceGatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ServiceGatewayRole
+
+  ServiceGatewayLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ServiceGateway-${AWS::StackName}
+      LaunchTemplateData:
+        ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
+        InstanceType: !Ref ServiceGatewayInstanceType
+        KeyName: !Ref ServiceGatewayKeyPair
+        IamInstanceProfile:
+          Arn: !GetAtt ServiceGatewayInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref ServiceGatewaySecGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 200
+              VolumeType: gp3
+              Encrypted: true
+        MetadataOptions:
+          HttpTokens: required
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: appliance-v1fs:stack
+                Value: !Ref "AWS::StackName"
+
+  # ── Service Gateway ASG + Warm Pool ──────────────────────────────
+  ServiceGatewayASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - PrivateRoute1
+      - PrivateRoute2
+      - ProvisionerEventPermission
+    Properties:
+      AutoScalingGroupName: !Sub sg-asg-${AWS::StackName}
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      MinSize: 0
+      MaxSize: !Ref ServiceGatewayMaxCount
+      DesiredCapacity: !Ref ServiceGatewayMaxCount
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 600
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: SGLaunchHook
+          LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+          HeartbeatTimeout: 3600
+          DefaultResult: ABANDON
+      TargetGroupARNs:
+        - !Ref GrpcTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}
+          PropagateAtLaunch: true
+
+  ServiceGatewayWarmPool:
+    Type: AWS::AutoScaling::WarmPool
+    Properties:
+      AutoScalingGroupName: !Ref ServiceGatewayASG
+      PoolState: Stopped
+      MinSize: 0
+      InstanceReusePolicy:
+        ReuseOnScaleIn: true
+
+  SGScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ServiceGatewayASG
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 60
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub "${ScannerALB.LoadBalancerFullName}/${GrpcTargetGroup.TargetGroupFullName}"
+        TargetValue: 1200
+
+  SGResponseTimePolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ServiceGatewayASG
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 60
+      TargetTrackingConfiguration:
+        CustomizedMetricSpecification:
+          MetricName: TargetResponseTime
+          Namespace: AWS/ApplicationELB
+          Dimensions:
+            - Name: LoadBalancer
+              Value: !GetAtt ScannerALB.LoadBalancerFullName
+          Statistic: Average
+        TargetValue: 0.5
+
+  # ── ALB Certificate (self-signed, imported to ACM) ────────────────
+  ALBCertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ALBCertPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:ImportCertificate
+                  - acm:DeleteCertificate
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DeleteSecret
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
+
+  ALBCertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub alb-cert-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ALBCertRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, logging, subprocess, os
+          from urllib.request import urlopen, Request
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  secret_name = props["SecretName"]
+                  acm = boto3.client("acm")
+                  sm = boto3.client("secretsmanager")
+
+                  if event["RequestType"] == "Delete":
+                      # Clean up ACM cert
+                      cert_arn = event.get("PhysicalResourceId", "")
+                      if cert_arn.startswith("arn:aws:acm:"):
+                          try:
+                              acm.delete_certificate(CertificateArn=cert_arn)
+                              logger.info("Deleted ACM cert: %s", cert_arn)
+                          except Exception:
+                              logger.warning("Could not delete ACM cert", exc_info=True)
+                      # Clean up secret
+                      try:
+                          sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+                          logger.info("Deleted secret: %s", secret_name)
+                      except Exception:
+                          logger.warning("Could not delete secret", exc_info=True)
+                      _respond(event, context, "SUCCESS", physical_id=cert_arn)
+                      return
+
+                  # Generate self-signed cert + key
+                  key_path = "/tmp/alb.key"
+                  cert_path = "/tmp/alb.crt"
+                  subprocess.run([
+                      "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                      "-keyout", key_path, "-out", cert_path,
+                      "-days", "3650", "-nodes",
+                      "-subj", "/CN=scanner-alb.internal",
+                  ], check=True, capture_output=True)
+
+                  with open(cert_path, "rb") as f:
+                      cert_pem = f.read()
+                  with open(key_path, "rb") as f:
+                      key_pem = f.read()
+
+                  # Import into ACM
+                  resp = acm.import_certificate(
+                      Certificate=cert_pem,
+                      PrivateKey=key_pem,
+                  )
+                  cert_arn = resp["CertificateArn"]
+                  logger.info("Imported ACM cert: %s", cert_arn)
+
+                  # Store CA cert in Secrets Manager for workers
+                  cert_str = cert_pem.decode("utf-8")
+                  try:
+                      sm.create_secret(
+                          Name=secret_name,
+                          Description="ALB self-signed CA certificate (PEM)",
+                          SecretString=cert_str,
+                      )
+                  except sm.exceptions.ResourceExistsException:
+                      sm.put_secret_value(SecretId=secret_name, SecretString=cert_str)
+                  logger.info("Stored CA cert in secret: %s", secret_name)
+
+                  _respond(event, context, "SUCCESS",
+                           data={"CertificateArn": cert_arn},
+                           physical_id=cert_arn)
+              except Exception as e:
+                  logger.exception("ALB cert generation failed")
+                  _respond(event, context, "FAILED", reason=str(e))
+
+          def _respond(event, context, status, data=None, reason="", physical_id=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": physical_id or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+              req = Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("Content-Type", "")
+              req.add_header("Content-Length", str(len(body)))
+              urlopen(req)
+
+  ALBCertResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ALBCertLambda.Arn
+      SecretName: appliance-v1fs/alb-ca-cert
+
+  # ── Scanner ALB (internal gRPC load balancer) ────────────────────
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: Scanner ALB - gRPC traffic from workers to Service Gateways
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.2.0.0/16
+          Description: HTTPS/gRPC from VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref ServiceGatewaySecGroup
+          Description: HTTPS to Service Gateways
+      Tags:
+        - Key: Name
+          Value: !Sub ALBSecGroup-${AWS::StackName}
+
+  ScannerALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub scanner-alb-${AWS::StackName}
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ScannerALB-${AWS::StackName}
+
+  GrpcTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub grpc-tg-${AWS::StackName}
+      Port: 443
+      Protocol: HTTPS
+      ProtocolVersion: GRPC
+      VpcId: !Ref BaseVPC
+      TargetType: instance
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: "443"
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        GrpcCode: "0-99"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: stickiness.enabled
+          Value: "false"
+      # Targets managed dynamically by ServiceGatewayASG TargetGroupARNs
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ScannerALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !GetAtt ALBCertResource.CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GrpcTargetGroup
+
+  # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
+  ProvisionerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub sg-provision-${AWS::StackName}
+      Description: Trigger provisioner when SG instances reach running state
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - "EC2 Instance State-change Notification"
+        detail:
+          state:
+            - running
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProvisionerLambda.Arn
+          Id: ProvisionerTarget
+
+  ProvisionerEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProvisionerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ProvisionerEventRule.Arn
+
+  # ── Scanner Deploy Bucket & CodeBuild ─────────────────────────────
+  ScannerDeployBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ScannerDeployBucket-${AWS::StackName}
+
+  ScannerCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScannerCodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ScannerDeployBucket}/*"
+
+  ScannerCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: ScannerDeployBucket
+    Properties:
+      Name: !Sub scanner-build-${AWS::StackName}
+      ServiceRole: !GetAtt ScannerCodeBuildRole.Arn
+      TimeoutInMinutes: 15
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: DEPLOY_BUCKET
+            Value: !Ref ScannerDeployBucket
+      Source:
+        Type: GITHUB
+        Location: https://github.com/arcaniusdev/appliance-v1fs.git
+        BuildSpec: buildspec-scanner.yml
+      Artifacts:
+        Type: NO_ARTIFACTS
+
+  ScannerCodeBuildTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TriggerBuild
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt ScannerCodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                  - s3:ListBucketVersions
+                  - s3:DeleteObjectVersion
+                Resource:
+                  - !GetAtt ScannerDeployBucket.Arn
+                  - !Sub "${ScannerDeployBucket.Arn}/*"
+
+  ScannerCodeBuildTrigger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub scanner-build-trigger-${AWS::StackName}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ScannerCodeBuildTriggerRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3, json, time, urllib.request
+
+          def handler(event, context):
+              cb = boto3.client("codebuild")
+              props = event.get("ResourceProperties", {})
+              project = props["ProjectName"]
+
+              if event["RequestType"] == "Delete":
+                  bucket = props.get("DeployBucket", "")
+                  if bucket:
+                      s3 = boto3.client("s3")
+                      try:
+                          while True:
+                              objs = s3.list_object_versions(Bucket=bucket, MaxKeys=1000)
+                              to_delete = [{"Key": o["Key"], "VersionId": o["VersionId"]} for o in objs.get("Versions", [])]
+                              to_delete += [{"Key": o["Key"], "VersionId": o["VersionId"]} for o in objs.get("DeleteMarkers", [])]
+                              if not to_delete:
+                                  break
+                              s3.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
+                      except Exception as e:
+                          print(f"Bucket cleanup warning: {e}")
+                  return send(event, context, "SUCCESS", {})
+
+              try:
+                  resp = cb.start_build(projectName=project)
+                  build_id = resp["build"]["id"]
+                  while True:
+                      time.sleep(15)
+                      builds = cb.batch_get_builds(ids=[build_id])["builds"]
+                      status = builds[0]["buildStatus"]
+                      if status == "SUCCEEDED":
+                          return send(event, context, "SUCCESS", {"BuildId": build_id})
+                      if status in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT"):
+                          return send(event, context, "FAILED", {}, f"Build {status}: {build_id}")
+                      remaining = context.get_remaining_time_in_millis()
+                      if remaining < 30000:
+                          return send(event, context, "FAILED", {}, "Lambda timeout waiting for build")
+              except Exception as e:
+                  return send(event, context, "FAILED", {}, str(e))
+
+          def send(event, context, status, data, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data,
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("Content-Type", "")
+              req.add_header("Content-Length", str(len(body)))
+              urllib.request.urlopen(req)
+
+  ScannerCodeBuild:
+    Type: Custom::CodeBuild
+    DependsOn: ScannerDeployBucket
+    Properties:
+      ServiceToken: !GetAtt ScannerCodeBuildTrigger.Arn
+      ProjectName: !Ref ScannerCodeBuildProject
+      DeployBucket: !Ref ScannerDeployBucket
+
+  # ── Provisioner Layer ──────────────────────────────────────────────
+  ProvisionerLayer:
+    Type: AWS::Lambda::LayerVersion
+    DependsOn: ScannerCodeBuild
+    Properties:
+      LayerName: !Sub provisioner-deps-${AWS::StackName}
+      Content:
+        S3Bucket: !Ref ScannerDeployBucket
+        S3Key: provisioner-layer.zip
+      CompatibleRuntimes:
+        - python3.12
+
+  # ── Provisioner Lambda ──────────────────────────────────────────────
+  ProvisionerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ProvisionerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ec2/keypair/*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
+              - Effect: Allow
+                Action:
+                  - ec2-instance-connect:OpenTunnel
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceConnectEndpoints
+                  - ec2:CreateTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/appliance-v1fs/*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ScannerDeployBucket}/awscli-runtime.zip"
+              - Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:DescribeAutoScalingGroups
+                Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/sg-asg-${AWS::StackName}"
+
+  ProvisionerLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: ScannerCodeBuild
+    Properties:
+      FunctionName: !Sub provisioner-${AWS::StackName}
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref ScannerDeployBucket
+        S3Key: provisioner-code.zip
+      Layers:
+        - !Ref ProvisionerLayer
+      Role: !GetAtt ProvisionerLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          SG_TAG_KEY: "appliance-v1fs:stack"
+          SG_TAG_VALUE: !Ref "AWS::StackName"
+          EICE_ENDPOINT_ID: !Ref EICEndpoint
+          KEY_PAIR_ID: !GetAtt ServiceGatewayKeyPair.KeyPairId
+          CERT_SECRET_NAME: appliance-v1fs/sg-ca-cert
+          REGISTRATION_TOKEN_SECRET: appliance-v1fs/sg-registration-token
+          AWS_REGION_NAME: !Ref "AWS::Region"
+          DEPLOY_BUCKET: !Ref ScannerDeployBucket
+          MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
+          SG_ASG_NAME: !Sub sg-asg-${AWS::StackName}
+          SG_MIN_COUNT: !Ref ServiceGatewayMinCount
+
+  WatchdogSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub watchdog-${AWS::StackName}
+      Description: Check SG scanner versions and re-apply customizations if updated
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProvisionerLambda.Arn
+          Id: WatchdogTarget
+          Input: '{"action": "watchdog"}'
+
+  WatchdogPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProvisionerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WatchdogSchedule.Arn
+
+  # ── EC2 Instance Connect Endpoint ──────────────────────────────────
+  EICSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref BaseVPC
+      GroupDescription: EC2 Instance Connect Endpoint
+      Tags:
+        - Key: Name
+          Value: !Sub EICSecGroup-${AWS::StackName}
+
+  EICEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref EICSecGroup
+      PreserveClientIp: false
+      Tags:
+        - Key: Name
+          Value: !Sub EICEndpoint-${AWS::StackName}
+
+Outputs:
+  ALBDNSName:
+    Description: Scanner ALB DNS name (internal gRPC endpoint)
+    Value: !GetAtt ScannerALB.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-ALBDNSName
+  ALBCACertSecretArn:
+    Description: ALB CA certificate secret ARN (for TLS trust)
+    Value: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/alb-ca-cert
+    Export:
+      Name: !Sub ${AWS::StackName}-ALBCACertSecretArn
+  VPCId:
+    Description: VPC ID
+    Value: !Ref BaseVPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VPCId
+  PrivateSubnet1Id:
+    Description: Private subnet 1
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet1Id
+  PrivateSubnet2Id:
+    Description: Private subnet 2
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet2Id
+  ServiceGatewayASGName:
+    Description: Service Gateway Auto Scaling Group
+    Value: !Ref ServiceGatewayASG
+    Export:
+      Name: !Sub ${AWS::StackName}-ServiceGatewayASGName
+  ServiceGatewaySecGroupId:
+    Description: Service Gateway security group ID
+    Value: !Ref ServiceGatewaySecGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-ServiceGatewaySecGroupId
