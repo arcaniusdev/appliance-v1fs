@@ -1042,8 +1042,10 @@ Resources:
                 Action:
                   - autoscaling:CompleteLifecycleAction
                   - autoscaling:UpdateAutoScalingGroup
-                  - autoscaling:DescribeAutoScalingGroups
                 Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/sg-asg-${AWS::StackName}"
+              - Effect: Allow
+                Action: autoscaling:DescribeAutoScalingGroups
+                Resource: "*"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
