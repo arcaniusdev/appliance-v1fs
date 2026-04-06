@@ -592,7 +592,7 @@ Resources:
     Type: AWS::AutoScaling::WarmPool
     Properties:
       AutoScalingGroupName: !Ref ServiceGatewayASG
-      PoolState: Hibernated
+      PoolState: Stopped
       MinSize: 0
       InstanceReusePolicy:
         ReuseOnScaleIn: true
