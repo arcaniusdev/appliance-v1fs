@@ -602,13 +602,12 @@ Resources:
     Properties:
       AutoScalingGroupName: !Ref ServiceGatewayASG
       PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 120
       TargetTrackingConfiguration:
         PredefinedMetricSpecification:
           PredefinedMetricType: ALBRequestCountPerTarget
           ResourceLabel: !Sub "${ScannerALB.LoadBalancerFullName}/${GrpcTargetGroup.TargetGroupFullName}"
         TargetValue: 1800
-        ScaleInCooldown: 300
-        ScaleOutCooldown: 60
 
   # ── ALB Certificate (self-signed, imported to ACM) ────────────────
   ALBCertRole:
