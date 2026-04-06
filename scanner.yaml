@@ -89,6 +89,18 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
+  ExistingVPCId:
+    Description: Use an existing VPC (e.g., vpc-0123456789abcdef0). Leave empty to create a new VPC.
+    Type: String
+    Default: ""
+  ExistingPrivateSubnet1Id:
+    Description: Existing private subnet in AZ1. Required if ExistingVPCId is set.
+    Type: String
+    Default: ""
+  ExistingPrivateSubnet2Id:
+    Description: Existing private subnet in AZ2. Required if ExistingVPCId is set.
+    Type: String
+    Default: ""
   DomainName:
     Description: Domain for ALB certificate (e.g., scanner.example.com). Leave empty for self-signed cert.
     Type: String
@@ -99,12 +111,14 @@ Parameters:
     Default: ""
 
 Conditions:
+  CreateNetworking: !Equals [!Ref ExistingVPCId, ""]
   UseSelfSignedCert: !Equals [!Ref DomainName, ""]
   UseACMCert: !Not [!Equals [!Ref DomainName, ""]]
 
 Resources:
   # ── VPC ──────────────────────────────────────────────────────────────
   BaseVPC:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPC
     Properties:
       CidrBlock: 10.2.0.0/16
@@ -117,6 +131,7 @@ Resources:
 
   # ── Internet Gateway ────────────────────────────────────────────────
   IG:
+    Condition: CreateNetworking
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
@@ -124,6 +139,7 @@ Resources:
           Value: !Sub IG-${AWS::StackName}
 
   VPCIG:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
       InternetGatewayId: !Ref IG
@@ -131,6 +147,7 @@ Resources:
 
   # ── Public Subnets ──────────────────────────────────────────────────
   PublicSubnet1:
+    Condition: CreateNetworking
     Type: AWS::EC2::Subnet
     Properties:
       CidrBlock: 10.2.0.0/22
@@ -142,6 +159,7 @@ Resources:
           Value: !Sub PublicSubnet1-${AWS::StackName}
 
   PublicSubnet2:
+    Condition: CreateNetworking
     Type: AWS::EC2::Subnet
     Properties:
       CidrBlock: 10.2.4.0/22
@@ -154,6 +172,7 @@ Resources:
 
   # ── Private Subnets ─────────────────────────────────────────────────
   PrivateSubnet1:
+    Condition: CreateNetworking
     Type: AWS::EC2::Subnet
     Properties:
       CidrBlock: 10.2.32.0/20
@@ -165,6 +184,7 @@ Resources:
           Value: !Sub PrivateSubnet1-${AWS::StackName}
 
   PrivateSubnet2:
+    Condition: CreateNetworking
     Type: AWS::EC2::Subnet
     Properties:
       CidrBlock: 10.2.48.0/20
@@ -177,6 +197,7 @@ Resources:
 
   # ── NAT Gateway EIPs ────────────────────────────────────────────────
   NGWEIP1:
+    Condition: CreateNetworking
     Type: AWS::EC2::EIP
     DependsOn: VPCIG
     Properties:
@@ -186,6 +207,7 @@ Resources:
           Value: !Sub NGWEIP1-${AWS::StackName}
 
   NGWEIP2:
+    Condition: CreateNetworking
     Type: AWS::EC2::EIP
     DependsOn: VPCIG
     Properties:
@@ -196,6 +218,7 @@ Resources:
 
   # ── NAT Gateways ────────────────────────────────────────────────────
   NGW1:
+    Condition: CreateNetworking
     Type: AWS::EC2::NatGateway
     Properties:
       AllocationId: !GetAtt NGWEIP1.AllocationId
@@ -206,6 +229,7 @@ Resources:
           Value: !Sub NGW1-${AWS::StackName}
 
   NGW2:
+    Condition: CreateNetworking
     Type: AWS::EC2::NatGateway
     Properties:
       AllocationId: !GetAtt NGWEIP2.AllocationId
@@ -217,6 +241,7 @@ Resources:
 
   # ── Public Route Tables ─────────────────────────────────────────────
   PublicRT1:
+    Condition: CreateNetworking
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref BaseVPC
@@ -225,6 +250,7 @@ Resources:
           Value: !Sub PublicRT1-${AWS::StackName}
 
   PublicRoute1:
+    Condition: CreateNetworking
     DependsOn: VPCIG
     Type: AWS::EC2::Route
     Properties:
@@ -233,6 +259,7 @@ Resources:
       GatewayId: !Ref IG
 
   PublicRT2:
+    Condition: CreateNetworking
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref BaseVPC
@@ -241,6 +268,7 @@ Resources:
           Value: !Sub PublicRT2-${AWS::StackName}
 
   PublicRoute2:
+    Condition: CreateNetworking
     DependsOn: VPCIG
     Type: AWS::EC2::Route
     Properties:
@@ -250,6 +278,7 @@ Resources:
 
   # ── Private Route Tables ────────────────────────────────────────────
   PrivateRT1:
+    Condition: CreateNetworking
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref BaseVPC
@@ -258,6 +287,7 @@ Resources:
           Value: !Sub PrivateRT1-${AWS::StackName}
 
   PrivateRoute1:
+    Condition: CreateNetworking
     Type: AWS::EC2::Route
     Properties:
       RouteTableId: !Ref PrivateRT1
@@ -265,6 +295,7 @@ Resources:
       NatGatewayId: !Ref NGW1
 
   PrivateRT2:
+    Condition: CreateNetworking
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref BaseVPC
@@ -273,6 +304,7 @@ Resources:
           Value: !Sub PrivateRT2-${AWS::StackName}
 
   PrivateRoute2:
+    Condition: CreateNetworking
     Type: AWS::EC2::Route
     Properties:
       RouteTableId: !Ref PrivateRT2
@@ -281,24 +313,28 @@ Resources:
 
   # ── Route Table Associations ────────────────────────────────────────
   PublicSubnetRT1:
+    Condition: CreateNetworking
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       RouteTableId: !Ref PublicRT1
       SubnetId: !Ref PublicSubnet1
 
   PublicSubnetRT2:
+    Condition: CreateNetworking
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       RouteTableId: !Ref PublicRT2
       SubnetId: !Ref PublicSubnet2
 
   PrivateSubnetRT1:
+    Condition: CreateNetworking
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       RouteTableId: !Ref PrivateRT1
       SubnetId: !Ref PrivateSubnet1
 
   PrivateSubnetRT2:
+    Condition: CreateNetworking
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       RouteTableId: !Ref PrivateRT2
@@ -306,6 +342,7 @@ Resources:
 
   # ── S3 Gateway VPC Endpoint ────────────────────────────────────────
   S3GatewayEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -317,6 +354,7 @@ Resources:
 
   # ── Interface VPC Endpoints (keep AWS API traffic off the internet) ─
   VPCEndpointSecGroup:
+    Condition: CreateNetworking
     Type: AWS::EC2::SecurityGroup
     Properties:
       VpcId: !Ref BaseVPC
@@ -332,6 +370,7 @@ Resources:
           Value: !Sub VPCEndpointSG-${AWS::StackName}
 
   SecretsManagerEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -345,6 +384,7 @@ Resources:
         - !Ref VPCEndpointSecGroup
 
   SQSEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -358,6 +398,7 @@ Resources:
         - !Ref VPCEndpointSecGroup
 
   CloudWatchLogsEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -371,6 +412,7 @@ Resources:
         - !Ref VPCEndpointSecGroup
 
   SSMEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -384,6 +426,7 @@ Resources:
         - !Ref VPCEndpointSecGroup
 
   AutoScalingEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -397,6 +440,7 @@ Resources:
         - !Ref VPCEndpointSecGroup
 
   STSEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -410,6 +454,7 @@ Resources:
         - !Ref VPCEndpointSecGroup
 
   SSMMessagesEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -423,6 +468,7 @@ Resources:
         - !Ref VPCEndpointSecGroup
 
   EC2MessagesEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -436,6 +482,7 @@ Resources:
         - !Ref VPCEndpointSecGroup
 
   EC2Endpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref BaseVPC
@@ -462,7 +509,7 @@ Resources:
   ServiceGatewaySecGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      VpcId: !Ref BaseVPC
+      VpcId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
       GroupDescription: Service Gateway appliance - inbound scan traffic and management
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -535,8 +582,6 @@ Resources:
   ServiceGatewayASG:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn:
-      - PrivateRoute1
-      - PrivateRoute2
       - ProvisionerEventPermission
     Properties:
       AutoScalingGroupName: !Sub sg-asg-${AWS::StackName}
@@ -547,8 +592,8 @@ Resources:
       MaxSize: !Ref ServiceGatewayMaxCount
       DesiredCapacity: !Ref ServiceGatewayMaxCount
       VPCZoneIdentifier:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
+        - !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+        - !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
       HealthCheckType: EC2
       HealthCheckGracePeriod: 600
       LifecycleHookSpecificationList:
@@ -763,7 +808,7 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      VpcId: !Ref BaseVPC
+      VpcId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
       GroupDescription: Scanner ALB - gRPC traffic from workers to Service Gateways
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -788,8 +833,8 @@ Resources:
       Scheme: internal
       Type: application
       Subnets:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
+        - !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+        - !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
       SecurityGroups:
         - !Ref ALBSecurityGroup
       Tags:
@@ -803,7 +848,7 @@ Resources:
       Port: 443
       Protocol: HTTPS
       ProtocolVersion: GRPC
-      VpcId: !Ref BaseVPC
+      VpcId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
       TargetType: instance
       HealthCheckProtocol: HTTPS
       HealthCheckPort: "443"
@@ -1139,6 +1184,7 @@ Resources:
 
   # ── EC2 Instance Connect Endpoint ──────────────────────────────────
   EICSecGroup:
+    Condition: CreateNetworking
     Type: AWS::EC2::SecurityGroup
     Properties:
       VpcId: !Ref BaseVPC
@@ -1148,6 +1194,7 @@ Resources:
           Value: !Sub EICSecGroup-${AWS::StackName}
 
   EICEndpoint:
+    Condition: CreateNetworking
     Type: AWS::EC2::InstanceConnectEndpoint
     Properties:
       SubnetId: !Ref PrivateSubnet1
@@ -1177,17 +1224,17 @@ Outputs:
       Name: !Sub ${AWS::StackName}-ALBCACertSecretArn
   VPCId:
     Description: VPC ID
-    Value: !Ref BaseVPC
+    Value: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
     Export:
       Name: !Sub ${AWS::StackName}-VPCId
   PrivateSubnet1Id:
     Description: Private subnet 1
-    Value: !Ref PrivateSubnet1
+    Value: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
     Export:
       Name: !Sub ${AWS::StackName}-PrivateSubnet1Id
   PrivateSubnet2Id:
     Description: Private subnet 2
-    Value: !Ref PrivateSubnet2
+    Value: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
     Export:
       Name: !Sub ${AWS::StackName}-PrivateSubnet2Id
   ServiceGatewayASGName:
