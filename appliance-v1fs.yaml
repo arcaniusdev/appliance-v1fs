@@ -597,17 +597,53 @@ Resources:
       InstanceReusePolicy:
         ReuseOnScaleIn: true
 
-  SGScalingPolicy:
+  SGTargetTrackingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
       AutoScalingGroupName: !Ref ServiceGatewayASG
       PolicyType: TargetTrackingScaling
-      EstimatedInstanceWarmup: 120
+      EstimatedInstanceWarmup: 60
       TargetTrackingConfiguration:
         PredefinedMetricSpecification:
           PredefinedMetricType: ALBRequestCountPerTarget
           ResourceLabel: !Sub "${ScannerALB.LoadBalancerFullName}/${GrpcTargetGroup.TargetGroupFullName}"
-        TargetValue: 1800
+        TargetValue: 1200
+
+  SGStepScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ServiceGatewayASG
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      MetricAggregationType: Average
+      EstimatedInstanceWarmup: 60
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          MetricIntervalUpperBound: 5000
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 5000
+          MetricIntervalUpperBound: 20000
+          ScalingAdjustment: 2
+        - MetricIntervalLowerBound: 20000
+          ScalingAdjustment: 4
+
+  SGQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sg-queue-depth-${AWS::StackName}
+      AlarmDescription: Scale out SGs when scan queue backs up
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScanQueue.QueueName
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SGStepScalingPolicy
 
   # ── ALB Certificate (self-signed, imported to ACM) ────────────────
   ALBCertRole:
