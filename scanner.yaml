@@ -94,7 +94,7 @@ Parameters:
     Type: String
     Default: ""
   HostedZoneId:
-    Description: Route 53 Hosted Zone ID for the domain. Required if DomainName is set.
+    Description: "Route 53 Hosted Zone ID for DomainName (e.g., Z0123456789ABCDEFGHIJ). Find in Route 53 console under Hosted Zones."
     Type: String
     Default: ""
 
