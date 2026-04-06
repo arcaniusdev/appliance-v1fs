@@ -83,12 +83,6 @@ Parameters:
       - c5.2xlarge
       - c5.4xlarge
       - c5.9xlarge
-  ChannelsPerSG:
-    Description: Number of gRPC channels per Service Gateway (2 is optimal)
-    Type: Number
-    Default: 2
-    MinValue: 1
-    MaxValue: 8
   MaxFileSizeMB:
     Description: Maximum file size in MB for gRPC scanning (nginx and gRPC channel limit)
     Type: Number
@@ -546,6 +540,14 @@ Resources:
           Arn: !GetAtt ServiceGatewayInstanceProfile.Arn
         SecurityGroupIds:
           - !Ref ServiceGatewaySecGroup
+        HibernationOptions:
+          Configured: true
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 50
+              VolumeType: gp3
+              Encrypted: true
         MetadataOptions:
           HttpTokens: required
         TagSpecifications:
@@ -574,7 +576,11 @@ Resources:
         - !Ref PrivateSubnet2
       HealthCheckType: EC2
       HealthCheckGracePeriod: 600
-      NewInstancesProtectedFromScaleIn: true
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: SGLaunchHook
+          LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+          HeartbeatTimeout: 3600
+          DefaultResult: ABANDON
       TargetGroupARNs:
         - !Ref GrpcTargetGroup
       Tags:
@@ -586,19 +592,10 @@ Resources:
     Type: AWS::AutoScaling::WarmPool
     Properties:
       AutoScalingGroupName: !Ref ServiceGatewayASG
-      PoolState: Stopped
+      PoolState: Hibernated
       MinSize: 0
       InstanceReusePolicy:
         ReuseOnScaleIn: true
-
-  SGLaunchLifecycleHook:
-    Type: AWS::AutoScaling::LifecycleHook
-    Properties:
-      LifecycleHookName: SGLaunchHook
-      AutoScalingGroupName: !Ref ServiceGatewayASG
-      LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
-      HeartbeatTimeout: 3600
-      DefaultResult: ABANDON
 
   # ── ALB Certificate (self-signed, imported to ACM) ────────────────
   ALBCertRole:
