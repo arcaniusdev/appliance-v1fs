@@ -27,33 +27,46 @@ QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 
 # ── SG Discovery + Scan Handles ──────────────────────────────────────
 
-def _discover_sg_addresses():
-    """Discover running Service Gateway IPs via EC2 tags."""
-    tag_spec = os.environ.get("SG_DISCOVERY_TAG", "")
-    if not tag_spec:
-        raise RuntimeError("SG_DISCOVERY_TAG not set")
-    tag_key, tag_value = tag_spec.split("=", 1)
-    ec2 = boto3.client("ec2")
-    resp = ec2.describe_instances(Filters=[
-        {"Name": f"tag:{tag_key}", "Values": [tag_value]},
-        {"Name": "instance-state-name", "Values": ["running"]},
-    ])
-    addrs = []
-    for res in resp["Reservations"]:
-        for inst in res["Instances"]:
-            addrs.append(f"{inst['PrivateIpAddress']}:443")
-    if not addrs:
-        raise RuntimeError("No running Service Gateway instances found")
-    addrs.sort()
-    return addrs
-
-
 def _build_scan_handles():
-    """Create one async scan handle per SG for direct IP scanning."""
+    """Build scan handle(s) — ALB single channel or direct IP multi-channel."""
     sm = boto3.client("secretsmanager")
     api_key = sm.get_secret_value(
         SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
     )["SecretString"]
+
+    alb_endpoint = os.environ.get("ALB_ENDPOINT", "")
+    if alb_endpoint:
+        return _build_alb_handle(sm, api_key, alb_endpoint)
+    return _build_direct_handles(sm, api_key)
+
+
+def _build_alb_handle(sm, api_key, alb_endpoint):
+    """Single channel to ALB — ALB handles gRPC request-level load balancing."""
+    import grpc as grpc_lib
+
+    ca_cert_arn = os.environ.get("ALB_CA_CERT_SECRET_ARN", "")
+    auth_key = f"ApiKey {api_key}"
+    call_creds = grpc_lib.metadata_call_credentials(
+        lambda context, callback: callback([("authorization", auth_key)], None)
+    )
+
+    if ca_cert_arn:
+        ca_cert_pem = sm.get_secret_value(SecretId=ca_cert_arn)["SecretString"]
+        ssl_creds = grpc_lib.ssl_channel_credentials(ca_cert_pem.encode("utf-8"))
+        # Self-signed cert CN won't match ALB DNS — override hostname validation
+        options = [("grpc.ssl_target_name_override", "scanner-alb.internal")]
+    else:
+        ssl_creds = grpc_lib.ssl_channel_credentials()
+        options = []
+
+    composite = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
+    handle = grpc_lib.aio.secure_channel(alb_endpoint, composite, options=options)
+    logger.info("Connected to ALB endpoint: %s", alb_endpoint)
+    return [(handle, alb_endpoint)]
+
+
+def _build_direct_handles(sm, api_key):
+    """One channel per SG via EC2 tag discovery (fallback when no ALB)."""
     ca_cert_pem = sm.get_secret_value(
         SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
     )["SecretString"]
@@ -68,7 +81,23 @@ def _build_scan_handles():
     composite = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
     options = [("grpc.ssl_target_name_override", tls_override)]
 
-    addrs = _discover_sg_addresses()
+    tag_spec = os.environ.get("SG_DISCOVERY_TAG", "")
+    if not tag_spec:
+        raise RuntimeError("SG_DISCOVERY_TAG not set")
+    tag_key, tag_value = tag_spec.split("=", 1)
+    ec2 = boto3.client("ec2")
+    resp = ec2.describe_instances(Filters=[
+        {"Name": f"tag:{tag_key}", "Values": [tag_value]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ])
+    addrs = sorted(
+        f"{inst['PrivateIpAddress']}:443"
+        for res in resp["Reservations"]
+        for inst in res["Instances"]
+    )
+    if not addrs:
+        raise RuntimeError("No running Service Gateway instances found")
+
     channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
     handles = []
     for addr in addrs:

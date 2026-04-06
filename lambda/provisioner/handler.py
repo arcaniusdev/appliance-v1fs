@@ -15,6 +15,25 @@ logger.setLevel(logging.INFO)
 # SSM parameter for tracking scanner version per SG
 VERSION_PARAM_PREFIX = "/appliance-v1fs/scanner-version/"
 EXPECTED_REPLICAS = 1
+SG_LIFECYCLE_HOOK = "SGLaunchHook"
+
+
+def _complete_lifecycle_hook(instance_id, region):
+    """Complete the ASG launch lifecycle hook so the instance enters InService."""
+    asg_name = os.environ.get("SG_ASG_NAME", "")
+    if not asg_name:
+        return
+    try:
+        autoscaling = boto3.client("autoscaling", region_name=region)
+        autoscaling.complete_lifecycle_action(
+            LifecycleHookName=SG_LIFECYCLE_HOOK,
+            AutoScalingGroupName=asg_name,
+            InstanceId=instance_id,
+            LifecycleActionResult="CONTINUE",
+        )
+        logger.info("Completed lifecycle hook for %s", instance_id)
+    except Exception:
+        logger.warning("Could not complete lifecycle hook for %s", instance_id, exc_info=True)
 
 
 def handler(event, context):
@@ -175,10 +194,20 @@ def _handle_instance_running(event, context):
                       instance_id, tag_key, tags.get(tag_key))
         return {"status": "skipped", "reason": "not our instance"}
 
-    # Skip if already provisioned
+    # Already provisioned (warm pool re-entry) — verify scanner, complete lifecycle hook
     if tags.get("appliance-v1fs:provisioned") == "true":
-        logger.info("Instance %s already provisioned, skipping", instance_id)
-        return {"status": "skipped", "reason": "already provisioned"}
+        logger.info("Instance %s already provisioned (warm pool re-entry), verifying scanner...", instance_id)
+        try:
+            endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
+            key_pair_id = os.environ.get("KEY_PAIR_ID", "")
+            private_key = _get_ssh_key(key_pair_id, region)
+            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
+                _wait_for_scanner_pod("127.0.0.1", private_key, port=tunnel.local_port)
+            logger.info("Scanner pod running on %s, completing lifecycle hook", instance_id)
+        except Exception:
+            logger.warning("Could not verify scanner on %s", instance_id, exc_info=True)
+        _complete_lifecycle_hook(instance_id, region)
+        return {"status": "warm_pool_ready", "instance": instance_id}
 
     # Hostname comes from the Name tag set by CloudFormation
     hostname = tags.get("Name", instance_id)
@@ -282,6 +311,7 @@ def _handle_instance_running(event, context):
         ec2.create_tags(Resources=[instance_id], Tags=[
             {"Key": "appliance-v1fs:provisioned", "Value": "true"},
         ])
+        _complete_lifecycle_hook(instance_id, region)
 
         return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
 
@@ -432,6 +462,7 @@ def _handle_watchdog(event, context):
                     ec2.create_tags(Resources=[instance_id], Tags=[
                         {"Key": "appliance-v1fs:provisioned", "Value": "true"},
                     ])
+                    _complete_lifecycle_hook(instance_id, region)
                     results.append({"instance": instance_id, "action": "provisioned"})
                     logger.info("Watchdog: %s (%s) now fully provisioned",
                                 instance_id, inst_info["hostname"])
