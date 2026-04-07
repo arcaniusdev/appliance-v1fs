@@ -595,6 +595,17 @@ Resources:
           Value: !Sub ${ServiceGatewayHostname}
           PropagateAtLaunch: true
 
+  SGScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ServiceGatewayASG
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 90
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60
+
   ServiceGatewayWarmPool:
     Type: AWS::AutoScaling::WarmPool
     Properties:
