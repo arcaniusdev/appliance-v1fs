@@ -334,8 +334,7 @@ Resources:
                 SQS_VISIBILITY_TIMEOUT=300
                 MAX_CONCURRENT_SCANS=${WorkerConcurrency}
                 ASG_NAME=worker-asg-${AWS::StackName}
-                ALB_ENDPOINT=${ALBEndpoint}:443
-                ALB_CA_CERT_SECRET_ARN=${ALBCACertArn}
+                SG_DNS_NAME=sg.scanner.internal
                 SG_DISCOVERY_TAG=appliance-v1fs:stack=${ScannerStackName}
                 SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert
                 V1FS_API_KEY_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key
@@ -370,10 +369,7 @@ Resources:
                 systemctl daemon-reload
                 systemctl enable scanner
                 systemctl start scanner
-              - ALBEndpoint:
-                  Fn::ImportValue: !Sub ${ScannerStackName}-ALBDNSName
-                ALBCACertArn:
-                  Fn::ImportValue: !Sub ${ScannerStackName}-ALBCACertSecretArn
+              - {}
 
   WorkerASG:
     Type: AWS::AutoScaling::AutoScalingGroup

@@ -28,7 +28,7 @@ QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 # ── SG Discovery + Scan Handles ──────────────────────────────────────
 
 def _build_scan_handles():
-    """Build scan handle(s) — DNS, ALB, or EC2 tag discovery."""
+    """Build scan handle(s) — DNS or EC2 tag discovery."""
     sm = boto3.client("secretsmanager")
     api_key = sm.get_secret_value(
         SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
@@ -37,9 +37,6 @@ def _build_scan_handles():
     sg_dns = os.environ.get("SG_DNS_NAME", "")
     if sg_dns:
         return _build_dns_handles(sm, api_key, sg_dns)
-    alb_endpoint = os.environ.get("ALB_ENDPOINT", "")
-    if alb_endpoint:
-        return _build_alb_handle(sm, api_key, alb_endpoint)
     return _build_direct_handles(sm, api_key)
 
 
@@ -74,33 +71,8 @@ def _build_dns_handles(sm, api_key, dns_name):
     return handles
 
 
-def _build_alb_handle(sm, api_key, alb_endpoint):
-    """Single channel to ALB — ALB handles gRPC request-level load balancing."""
-    import grpc as grpc_lib
-
-    ca_cert_arn = os.environ.get("ALB_CA_CERT_SECRET_ARN", "")
-    auth_key = f"ApiKey {api_key}"
-    call_creds = grpc_lib.metadata_call_credentials(
-        lambda context, callback: callback([("authorization", auth_key)], None)
-    )
-
-    if ca_cert_arn:
-        ca_cert_pem = sm.get_secret_value(SecretId=ca_cert_arn)["SecretString"]
-        ssl_creds = grpc_lib.ssl_channel_credentials(ca_cert_pem.encode("utf-8"))
-        # Self-signed cert CN won't match ALB DNS — override hostname validation
-        options = [("grpc.ssl_target_name_override", "scanner-alb.internal")]
-    else:
-        ssl_creds = grpc_lib.ssl_channel_credentials()
-        options = []
-
-    composite = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
-    handle = grpc_lib.aio.secure_channel(alb_endpoint, composite, options=options)
-    logger.info("Connected to ALB endpoint: %s", alb_endpoint)
-    return [(handle, alb_endpoint)]
-
-
 def _build_direct_handles(sm, api_key):
-    """One channel per SG via EC2 tag discovery (fallback when no ALB)."""
+    """One channel per SG via EC2 tag discovery (fallback when no DNS)."""
     ca_cert_pem = sm.get_secret_value(
         SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
     )["SecretString"]
