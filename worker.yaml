@@ -62,6 +62,15 @@ Resources:
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub "scan-${AWS::StackName}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       NotificationConfiguration:
         QueueConfigurations:
           - Event: s3:ObjectCreated:*
@@ -75,6 +84,15 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       Tags:
         - Key: Name
           Value: !Sub QuarantineBucket-${AWS::StackName}
@@ -83,6 +101,7 @@ Resources:
   ScanQueue:
     Type: AWS::SQS::Queue
     Properties:
+      SqsManagedSseEnabled: true
       VisibilityTimeout: 300
       MessageRetentionPeriod: 1209600
       ReceiveMessageWaitTimeSeconds: 20
@@ -96,6 +115,7 @@ Resources:
   ScanDLQ:
     Type: AWS::SQS::Queue
     Properties:
+      SqsManagedSseEnabled: true
       VisibilityTimeout: 120
       MessageRetentionPeriod: 1209600
       Tags:
@@ -206,6 +226,8 @@ Resources:
           Arn: !GetAtt WorkerInstanceProfile.Arn
         SecurityGroupIds:
           - !Ref WorkerSecGroup
+        MetadataOptions:
+          HttpTokens: required
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs:
@@ -372,6 +394,15 @@ Resources:
   WorkerDeployBucket:
     Type: AWS::S3::Bucket
     Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       Tags:
         - Key: Name
           Value: !Sub WorkerDeployBucket-${AWS::StackName}

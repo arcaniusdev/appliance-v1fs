@@ -9,39 +9,29 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-import boto3
 import amaas.grpc.aio
+import boto3
 from aiobotocore.session import AioSession
 
 logger = logging.getLogger("scanner")
-logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     level=os.environ.get("LOG_LEVEL", "INFO"),
 )
 
-SCANNER_ACCOUNT_ID = os.environ.get("SCANNER_ACCOUNT_ID", "")
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 
 
-# ── SG Discovery + Scan Handles ──────────────────────────────────────
+# ── SG Discovery ────────────────────────────────────────────────────
 
 def _build_scan_handles():
-    """Build scan handle(s) — DNS or EC2 tag discovery."""
-    sm = boto3.client("secretsmanager")
-    api_key = sm.get_secret_value(
-        SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"]
-    )["SecretString"]
-
-    sg_dns = os.environ.get("SG_DNS_NAME", "")
-    if sg_dns:
-        return _build_dns_handles(sm, api_key, sg_dns)
-    return _build_direct_handles(sm, api_key)
-
-
-def _build_dns_handles(sm, api_key, dns_name):
-    """Resolve DNS to multiple SG IPs, create one channel per IP."""
+    """Resolve DNS to SG IPs, create one gRPC channel per IP."""
     import grpc as grpc_lib
+
+    sm = boto3.client("secretsmanager")
+    api_key = sm.get_secret_value(SecretId=os.environ["V1FS_API_KEY_SECRET_ARN"])["SecretString"]
+    ca_cert = sm.get_secret_value(SecretId=os.environ["SG_CA_CERT_SECRET_ARN"])["SecretString"]
+    dns_name = os.environ["SG_DNS_NAME"]
 
     addrs = sorted(set(
         info[4][0] for info in socket.getaddrinfo(dns_name, 443, socket.AF_INET)
@@ -49,74 +39,26 @@ def _build_dns_handles(sm, api_key, dns_name):
     if not addrs:
         raise RuntimeError(f"DNS {dns_name} resolved to no addresses")
 
-    ca_cert_pem = sm.get_secret_value(
-        SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
-    )["SecretString"]
     tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
-    auth_key = f"ApiKey {api_key}"
     call_creds = grpc_lib.metadata_call_credentials(
-        lambda context, callback: callback([("authorization", auth_key)], None)
+        lambda ctx, cb: cb([("authorization", f"ApiKey {api_key}")], None)
     )
-    ssl_creds = grpc_lib.ssl_channel_credentials(ca_cert_pem.encode("utf-8"))
-    composite = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
+    ssl_creds = grpc_lib.ssl_channel_credentials(ca_cert.encode("utf-8"))
+    creds = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
     options = [("grpc.ssl_target_name_override", tls_override)]
 
     handles = []
     for ip in addrs:
         addr = f"{ip}:443"
-        handle = grpc_lib.aio.secure_channel(addr, composite, options=options)
-        handles.append((handle, addr))
-        logger.info("DNS %s → channel to %s", dns_name, addr)
-    return handles
-
-
-def _build_direct_handles(sm, api_key):
-    """One channel per SG via EC2 tag discovery (fallback when no DNS)."""
-    ca_cert_pem = sm.get_secret_value(
-        SecretId=os.environ["SG_CA_CERT_SECRET_ARN"]
-    )["SecretString"]
-
-    import grpc as grpc_lib
-    tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
-    auth_key = f"ApiKey {api_key}"
-    call_creds = grpc_lib.metadata_call_credentials(
-        lambda context, callback: callback([("authorization", auth_key)], None)
-    )
-    ssl_creds = grpc_lib.ssl_channel_credentials(ca_cert_pem.encode("utf-8"))
-    composite = grpc_lib.composite_channel_credentials(ssl_creds, call_creds)
-    options = [("grpc.ssl_target_name_override", tls_override)]
-
-    tag_spec = os.environ.get("SG_DISCOVERY_TAG", "")
-    if not tag_spec:
-        raise RuntimeError("SG_DISCOVERY_TAG not set")
-    tag_key, tag_value = tag_spec.split("=", 1)
-    ec2 = boto3.client("ec2")
-    resp = ec2.describe_instances(Filters=[
-        {"Name": f"tag:{tag_key}", "Values": [tag_value]},
-        {"Name": "instance-state-name", "Values": ["running"]},
-    ])
-    addrs = sorted(
-        f"{inst['PrivateIpAddress']}:443"
-        for res in resp["Reservations"]
-        for inst in res["Instances"]
-    )
-    if not addrs:
-        raise RuntimeError("No running Service Gateway instances found")
-
-    channels_per_sg = int(os.environ.get("CHANNELS_PER_SG", "1"))
-    handles = []
-    for addr in addrs:
-        for _ in range(channels_per_sg):
-            handle = grpc_lib.aio.secure_channel(addr, composite, options=options)
-            handles.append((handle, addr))
-        logger.info("Created %d async channel(s) to %s", channels_per_sg, addr)
+        handles.append((grpc_lib.aio.secure_channel(addr, creds, options=options), addr))
+        logger.info("Channel to %s via %s", addr, dns_name)
     return handles
 
 
 # ── Core Scan Logic ──────────────────────────────────────────────────
 
-async def _process_file(s3, scan_bucket, key, size, pml,
-                        audit_log_group, logs, scan_handles):
+async def _process_file(s3, scan_bucket, key, size, pml, scan_handles,
+                        logs, audit_log_group):
     logger.info("Processing s3://%s/%s (%d bytes)", scan_bucket, key, size)
 
     try:
@@ -129,6 +71,7 @@ async def _process_file(s3, scan_bucket, key, size, pml,
             return
         raise
 
+    # Scan with retry
     for attempt in range(3):
         handle, sg_addr = random.choice(scan_handles)
         scan_start = time.monotonic()
@@ -149,12 +92,11 @@ async def _process_file(s3, scan_bucket, key, size, pml,
     is_malicious = result.get("scanResult", 0) > 0
     scan_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # Route based on verdict
     if is_malicious:
         malware_names = [m.get("malwareName", "") for m in result.get("foundMalwares", [])]
-        logger.warning(
-            "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s",
-            scan_bucket, key, malware_names, scan_ms, sg_addr,
-        )
+        logger.warning("MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s",
+                       scan_bucket, key, malware_names, scan_ms, sg_addr)
         await s3.put_object_tagging(
             Bucket=scan_bucket, Key=key,
             Tagging={"TagSet": [
@@ -162,20 +104,16 @@ async def _process_file(s3, scan_bucket, key, size, pml,
                 {"Key": "ScanTimestamp", "Value": scan_ts},
             ]},
         )
-        quarantine_key = f"{scan_bucket}/{key}"
-        tags = urlencode({
-            "ScanResult": "Malware",
-            "ScanTimestamp": scan_ts,
-        })
         await s3.put_object(
-            Bucket=QUARANTINE_BUCKET, Key=quarantine_key,
-            Body=file_bytes, Tagging=tags,
+            Bucket=QUARANTINE_BUCKET,
+            Key=f"{scan_bucket}/{key}",
+            Body=file_bytes,
+            Tagging=urlencode({"ScanResult": "Malware", "ScanTimestamp": scan_ts}),
         )
         await s3.delete_object(Bucket=scan_bucket, Key=key)
         verdict = "malicious"
     else:
-        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s",
-                     scan_bucket, key, scan_ms, sg_addr)
+        logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s", scan_bucket, key, scan_ms, sg_addr)
         await s3.put_object_tagging(
             Bucket=scan_bucket, Key=key,
             Tagging={"TagSet": [
@@ -186,19 +124,14 @@ async def _process_file(s3, scan_bucket, key, size, pml,
         verdict = "clean"
 
     await _audit(logs, audit_log_group, scan_bucket, key, size, verdict,
-                 result, scan_ms, sg_addr, SCANNER_ACCOUNT_ID)
+                 result, scan_ms, sg_addr)
     del file_bytes
 
 
 # ── Audit Trail ──────────────────────────────────────────────────────
 
-_audit_stream_created = False
-_audit_lock = asyncio.Lock()
-
-
 async def _audit(logs, log_group, bucket, key, size, verdict, result,
-                 scan_ms, sg_addr, source_account):
-    global _audit_stream_created
+                 scan_ms, sg_addr):
     if not log_group or not logs:
         return
     stream = f"scanner-{socket.gethostname()}"
@@ -206,7 +139,6 @@ async def _audit(logs, log_group, bucket, key, size, verdict, result,
         "timestamp": time.time(),
         "file": key,
         "bucket": bucket,
-        "scanBucket": bucket,
         "size": size,
         "verdict": verdict,
         "scanResult": result.get("scanResult", -1),
@@ -216,25 +148,23 @@ async def _audit(logs, log_group, bucket, key, size, verdict, result,
         "scanDurationMs": scan_ms,
         "serviceGateway": sg_addr,
     }
-    log_event = [{"timestamp": int(time.time() * 1000), "message": json.dumps(entry)}]
-
     try:
-        async with _audit_lock:
-            if not _audit_stream_created:
-                try:
-                    await logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
-                except Exception:
-                    pass
-                _audit_stream_created = True
-        await logs.put_log_events(logGroupName=log_group, logStreamName=stream, logEvents=log_event)
+        try:
+            await logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
+        except Exception:
+            pass  # Already exists
+        await logs.put_log_events(
+            logGroupName=log_group, logStreamName=stream,
+            logEvents=[{"timestamp": int(time.time() * 1000), "message": json.dumps(entry)}],
+        )
     except Exception:
         logger.warning("Audit write failed", exc_info=True)
 
 
 # ── SQS Message Processing ──────────────────────────────────────────
 
-async def _process_message(sqs, s3, logs, queue_url, message, scan_handles, visibility_timeout):
-    message_id = message.get("MessageId", "unknown")
+async def _process_message(sqs, s3, logs, queue_url, message, scan_handles,
+                           visibility_timeout, pml, audit_log_group):
     receipt_handle = message["ReceiptHandle"]
 
     async def heartbeat():
@@ -243,18 +173,13 @@ async def _process_message(sqs, s3, logs, queue_url, message, scan_handles, visi
             await asyncio.sleep(interval)
             try:
                 await sqs.change_message_visibility(
-                    QueueUrl=queue_url,
-                    ReceiptHandle=receipt_handle,
-                    VisibilityTimeout=visibility_timeout,
-                )
+                    QueueUrl=queue_url, ReceiptHandle=receipt_handle,
+                    VisibilityTimeout=visibility_timeout)
             except Exception:
                 logger.warning("Failed to extend visibility", exc_info=True)
                 return
 
     heartbeat_task = asyncio.create_task(heartbeat())
-    pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
-    audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
-
     try:
         body = json.loads(message["Body"])
         record = body.get("Records", [{}])[0].get("s3", {})
@@ -263,22 +188,20 @@ async def _process_message(sqs, s3, logs, queue_url, message, scan_handles, visi
         size = record.get("object", {}).get("size", 0)
 
         if not scan_bucket or not key:
-            logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
+            logger.error("Missing bucket/key in event: %s", json.dumps(body)[:200])
             await sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
             return
 
-        await _process_file(s3, scan_bucket, key, size, pml,
-                            audit_log_group, logs, scan_handles)
+        await _process_file(s3, scan_bucket, key, size, pml, scan_handles,
+                            logs, audit_log_group)
         await sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
     except Exception:
-        logger.exception("Failed processing SQS message %s", message_id)
+        logger.exception("Failed processing message %s", message.get("MessageId", "?"))
         try:
             await sqs.change_message_visibility(
-                QueueUrl=queue_url,
-                ReceiptHandle=receipt_handle,
-                VisibilityTimeout=30,
-            )
+                QueueUrl=queue_url, ReceiptHandle=receipt_handle,
+                VisibilityTimeout=30)
         except Exception:
             pass
     finally:
@@ -287,39 +210,6 @@ async def _process_message(sqs, s3, logs, queue_url, message, scan_handles, visi
             await heartbeat_task
         except asyncio.CancelledError:
             pass
-
-
-# ── ASG Lifecycle ────────────────────────────────────────────────────
-
-def _complete_lifecycle_action():
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            "http://169.254.169.254/latest/api/token", method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"})
-        token = urllib.request.urlopen(req, timeout=2).read().decode()
-        meta_headers = {"X-aws-ec2-metadata-token": token}
-        instance_id = urllib.request.urlopen(
-            urllib.request.Request("http://169.254.169.254/latest/meta-data/instance-id",
-                                   headers=meta_headers), timeout=2).read().decode()
-    except Exception:
-        return
-
-    asg_name = os.environ.get("ASG_NAME")
-    if not asg_name:
-        return
-
-    try:
-        autoscaling = boto3.client("autoscaling")
-        autoscaling.complete_lifecycle_action(
-            LifecycleHookName="WorkerTerminationHook",
-            AutoScalingGroupName=asg_name,
-            InstanceId=instance_id,
-            LifecycleActionResult="CONTINUE",
-        )
-        logger.info("Lifecycle action completed for %s", instance_id)
-    except Exception:
-        logger.warning("Failed to complete lifecycle action", exc_info=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -333,16 +223,15 @@ async def async_main():
     queue_url = os.environ["SQS_QUEUE_URL"]
     max_concurrent = int(os.environ.get("MAX_CONCURRENT_SCANS", "50"))
     visibility_timeout = int(os.environ.get("SQS_VISIBILITY_TIMEOUT", "300"))
-    semaphore = asyncio.Semaphore(max_concurrent)
-    consecutive_errors = 0
-
-    scan_handles = _build_scan_handles()
     dns_refresh_interval = int(os.environ.get("DNS_REFRESH_INTERVAL", "60"))
+    pml = os.environ.get("PML_ENABLED", "true").lower() == "true"
+    audit_log_group = os.environ.get("AUDIT_LOG_GROUP", "")
 
-    logger.info(
-        "Scanner worker starting — queue=%s concurrency=%d handles=%d hostname=%s",
-        queue_url, max_concurrent, len(scan_handles), socket.gethostname(),
-    )
+    semaphore = asyncio.Semaphore(max_concurrent)
+    scan_handles = _build_scan_handles()
+
+    logger.info("Scanner starting — queue=%s concurrency=%d handles=%d",
+                queue_url, max_concurrent, len(scan_handles))
 
     session = AioSession()
     async with session.create_client("sqs") as sqs, \
@@ -351,19 +240,21 @@ async def async_main():
 
         in_flight: set[asyncio.Task] = set()
         last_dns_refresh = time.monotonic()
+        consecutive_errors = 0
 
         async def guarded_process(message):
             async with semaphore:
                 await _process_message(sqs, s3, logs, queue_url, message,
-                                       scan_handles, visibility_timeout)
+                                       scan_handles, visibility_timeout,
+                                       pml, audit_log_group)
 
         while not shutdown_event.is_set():
-            # Periodic DNS refresh — re-resolve and rebuild channels if IPs changed
+            # Periodic DNS refresh
             if time.monotonic() - last_dns_refresh > dns_refresh_interval:
                 last_dns_refresh = time.monotonic()
-                sg_dns = os.environ.get("SG_DNS_NAME", "")
-                if sg_dns:
-                    try:
+                try:
+                    sg_dns = os.environ.get("SG_DNS_NAME", "")
+                    if sg_dns:
                         new_addrs = sorted(set(
                             f"{info[4][0]}:443"
                             for info in socket.getaddrinfo(sg_dns, 443, socket.AF_INET)
@@ -373,29 +264,25 @@ async def async_main():
                             logger.info("DNS changed: %s → %s", old_addrs, new_addrs)
                             old_handles = scan_handles
                             scan_handles = _build_scan_handles()
-                            for handle, addr in old_handles:
+                            for handle, _ in old_handles:
                                 try:
                                     await amaas.grpc.aio.quit(handle)
                                 except Exception:
                                     pass
-                    except Exception:
-                        logger.warning("DNS refresh failed", exc_info=True)
+                except Exception:
+                    logger.warning("DNS refresh failed", exc_info=True)
+
+            # Backpressure
             if len(in_flight) >= max_concurrent * 2:
                 await asyncio.sleep(0.1)
-                done = {t for t in in_flight if t.done()}
-                in_flight -= done
-                for t in done:
-                    if t.exception():
-                        logger.error("Task raised: %s", t.exception())
+                in_flight -= {t for t in in_flight if t.done()}
                 continue
 
+            # Poll SQS
             try:
                 resp = await sqs.receive_message(
-                    QueueUrl=queue_url,
-                    MaxNumberOfMessages=10,
-                    WaitTimeSeconds=20,
-                    AttributeNames=["All"],
-                )
+                    QueueUrl=queue_url, MaxNumberOfMessages=10,
+                    WaitTimeSeconds=20, AttributeNames=["All"])
                 consecutive_errors = 0
             except Exception:
                 consecutive_errors += 1
@@ -409,23 +296,19 @@ async def async_main():
                 in_flight.add(task)
                 task.add_done_callback(in_flight.discard)
 
-            done = {t for t in in_flight if t.done()}
-            in_flight -= done
-            for t in done:
-                if t.exception():
-                    logger.error("Task raised: %s", t.exception())
+            in_flight -= {t for t in in_flight if t.done()}
 
+        # Graceful shutdown
         logger.info("Shutting down — %d in-flight tasks", len(in_flight))
         if in_flight:
             await asyncio.gather(*in_flight, return_exceptions=True)
 
-    for handle, addr in scan_handles:
+    for handle, _ in scan_handles:
         try:
             await amaas.grpc.aio.quit(handle)
         except Exception:
             pass
 
-    _complete_lifecycle_action()
     logger.info("Shutdown complete")
 
 

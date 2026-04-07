@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 
 import boto3
@@ -15,6 +16,14 @@ logger.setLevel(logging.INFO)
 # SSM parameter for tracking scanner version per SG
 VERSION_PARAM_PREFIX = "/appliance-v1fs/scanner-version/"
 EXPECTED_REPLICAS = 1
+_SAFE_HOSTNAME = re.compile(r'^[A-Za-z0-9\-]{1,63}$')
+
+
+def _validate_hostname(hostname):
+    """Validate hostname contains only safe characters."""
+    if not _SAFE_HOSTNAME.match(hostname):
+        raise ValueError(f"Invalid hostname: {hostname!r}")
+    return hostname
 
 
 def _sync_dns_records(region):
@@ -300,7 +309,7 @@ def _handle_watchdog(event, context):
                             logger.info("Watchdog: %s already registered (banner)", instance_id)
                         else:
                             # Set hostname via sgowner
-                            hostname = inst_info["hostname"]
+                            hostname = _validate_hostname(inst_info["hostname"])
                             logger.info("Watchdog: setting hostname to %s", hostname)
                             temp_rsa = paramiko.RSAKey.generate(4096)
                             temp_pub = temp_rsa.get_base64()
@@ -332,7 +341,7 @@ def _handle_watchdog(event, context):
                                         f"register {token}",
                                         expect="# ", timeout=300,
                                     )
-                                    logger.info("Watchdog: register output: %s", reg_output[-500:])
+                                    logger.info("Watchdog: register complete (output length: %d)", len(reg_output))
                                 if "Try again later" not in reg_output:
                                     break
                                 logger.warning("Watchdog: register blocked, retrying in 30s")
