@@ -31,10 +31,6 @@ Parameters:
     Default: 50
     MinValue: 1
     MaxValue: 200
-  OrgId:
-    Description: AWS Organization ID — enables cross-account scanning (leave empty for single-account)
-    Type: String
-    Default: ""
   RescanAfterDays:
     Description: Re-scan files whose last scan is older than this many days
     Type: Number
@@ -98,6 +94,7 @@ Resources:
 
   ScanBucket:
     Type: AWS::S3::Bucket
+    DependsOn: ScanQueuePolicy
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
@@ -105,8 +102,9 @@ Resources:
       VersioningConfiguration:
         Status: Enabled
       NotificationConfiguration:
-        EventBridgeConfiguration:
-          EventBridgeEnabled: true
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ScanQueue.Arn
       Tags:
         - Key: Name
           Value: !Sub ScanBucket-${AWS::StackName}
@@ -153,26 +151,6 @@ Resources:
         - Key: Name
           Value: !Sub QuarantineBucket-${AWS::StackName}
 
-  # ── EventBridge Fan-In (S3 Object Created → SQS) ──────────────────
-  ScanEventRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub scan-ingest-${AWS::StackName}
-      Description: Route S3 object-created events from the scan bucket to the scan queue
-      EventPattern:
-        source:
-          - aws.s3
-        detail-type:
-          - "Object Created"
-        detail:
-          bucket:
-            name:
-              - !Ref ScanBucket
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt ScanQueue.Arn
-          Id: ScanQueueTarget
-
   # ── SQS ────────────────────────────────────────────────────────────
   ScanQueue:
     Type: AWS::SQS::Queue
@@ -206,12 +184,12 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: events.amazonaws.com
+              Service: s3.amazonaws.com
             Action: sqs:SendMessage
             Resource: !GetAtt ScanQueue.Arn
             Condition:
-              ArnEquals:
-                aws:SourceArn: !GetAtt ScanEventRule.Arn
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::scan-${AWS::StackName}"
 
   # ── Scanner Worker Fleet ────────────────────────────────────────────
   WorkerSecGroup:
@@ -1328,109 +1306,6 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt ReconciliationSchedule.Arn
-
-  # ── Cross-Account EventBridge Bus Policy ────────────────────────────
-  OrgBusPolicyRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: OrgBusPolicyPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: organizations:DescribeOrganization
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - events:PutPermission
-                  - events:RemovePermission
-                  - events:DescribeEventBus
-                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
-
-  OrgBusPolicyLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub org-bus-policy-${AWS::StackName}
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt OrgBusPolicyRole.Arn
-      Timeout: 30
-      Code:
-        ZipFile: |
-          import boto3, json, logging
-          from urllib.request import urlopen, Request
-          logger = logging.getLogger()
-          logger.setLevel(logging.INFO)
-          events = boto3.client("events")
-          SID = "AllowOrgAccounts"
-
-          def handler(event, context):
-              try:
-                  if event["RequestType"] == "Delete":
-                      try:
-                          events.remove_permission(EventBusName="default", StatementId=SID)
-                          logger.info("Removed org bus policy")
-                      except Exception:
-                          pass
-                      _respond(event, context, "SUCCESS", {"OrgId": ""})
-                      return
-                  override = event["ResourceProperties"].get("OrgIdOverride", "")
-                  org_id = override
-                  if not org_id:
-                      try:
-                          org = boto3.client("organizations").describe_organization()
-                          org_id = org["Organization"]["Id"]
-                          logger.info("Discovered OrgId: %s", org_id)
-                      except Exception:
-                          logger.info("Account is not in an organization")
-                  if org_id:
-                      events.put_permission(
-                          EventBusName="default", Action="events:PutEvents",
-                          Principal="*", StatementId=SID,
-                          Condition={"Type": "StringEquals", "Key": "aws:PrincipalOrgID", "Value": org_id},
-                      )
-                      logger.info("Set org bus policy for %s", org_id)
-                  else:
-                      try:
-                          events.remove_permission(EventBusName="default", StatementId=SID)
-                      except Exception:
-                          pass
-                      logger.info("No org — bus policy not set")
-                  _respond(event, context, "SUCCESS", {"OrgId": org_id})
-              except Exception as e:
-                  logger.exception("OrgBusPolicy failed")
-                  _respond(event, context, "FAILED", reason=str(e))
-
-          def _respond(event, context, status, data=None, reason=""):
-              body = json.dumps({
-                  "Status": status,
-                  "Reason": reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
-                  "PhysicalResourceId": context.log_stream_name,
-                  "StackId": event["StackId"],
-                  "RequestId": event["RequestId"],
-                  "LogicalResourceId": event["LogicalResourceId"],
-                  "Data": data or {},
-              }).encode("utf-8")
-              req = Request(event["ResponseURL"], data=body, method="PUT")
-              req.add_header("Content-Type", "")
-              req.add_header("Content-Length", str(len(body)))
-              urlopen(req)
-
-  OrgBusPolicyResource:
-    Type: AWS::CloudFormation::CustomResource
-    Properties:
-      ServiceToken: !GetAtt OrgBusPolicyLambda.Arn
-      OrgIdOverride: !Ref OrgId
 
   # ── Pre-Populated Enrollment Template ──────────────────────────────
   EnrollmentTemplateRole:

@@ -257,10 +257,10 @@ async def _process_message(sqs, s3, logs, queue_url, message, scan_handles, visi
 
     try:
         body = json.loads(message["Body"])
-        detail = body.get("detail", {})
-        scan_bucket = detail.get("bucket", {}).get("name")
-        key = detail.get("object", {}).get("key")
-        size = detail.get("object", {}).get("size", 0)
+        record = body.get("Records", [{}])[0].get("s3", {})
+        scan_bucket = record.get("bucket", {}).get("name")
+        key = record.get("object", {}).get("key")
+        size = record.get("object", {}).get("size", 0)
 
         if not scan_bucket or not key:
             logger.error("Missing bucket/key in event: %s", json.dumps(body)[:500])
