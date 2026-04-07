@@ -37,11 +37,25 @@ def _complete_lifecycle_hook(instance_id, region):
 
 
 def _check_initial_provisioning_complete(region):
-    """If all ASG instances are provisioned, scale down to min count (warm pool absorbs extras)."""
+    """One-time scale-down after all SGs are initially provisioned and InService.
+
+    Only runs once — sets an SSM flag so it never interferes with normal scaling.
+    Verifies all ASG instances are InService (not just tagged) before scaling down.
+    """
     asg_name = os.environ.get("SG_ASG_NAME", "")
     min_count = int(os.environ.get("SG_MIN_COUNT", "0"))
     if not asg_name or not min_count:
         return
+
+    ssm = boto3.client("ssm", region_name=region)
+    flag_param = f"/appliance-v1fs/initial-provisioning-complete/{asg_name}"
+
+    # Check if we've already done the initial scale-down
+    try:
+        ssm.get_parameter(Name=flag_param)
+        return  # Already completed — never run again
+    except ssm.exceptions.ParameterNotFound:
+        pass
 
     autoscaling = boto3.client("autoscaling", region_name=region)
     asg = autoscaling.describe_auto_scaling_groups(
@@ -50,24 +64,33 @@ def _check_initial_provisioning_complete(region):
     if not asg:
         return
 
-    asg = asg[0]
-    desired = asg["DesiredCapacity"]
+    instances = asg[0]["Instances"]
+    desired = asg[0]["DesiredCapacity"]
     if desired <= min_count:
-        return  # Already scaled down
-
-    # Check if all instances are provisioned
-    all_sgs = _discover_sg_instances(region)
-    if not all_sgs:
         return
 
+    # ALL instances must be InService (not Pending:Wait, not Pending:Proceed)
+    all_in_service = all(i["LifecycleState"] == "InService" for i in instances)
+    if not all_in_service:
+        in_svc = sum(1 for i in instances if i["LifecycleState"] == "InService")
+        logger.info("Initial provisioning: %d/%d InService", in_svc, len(instances))
+        return
+
+    # ALL must be tagged as provisioned
+    all_sgs = _discover_sg_instances(region)
     all_provisioned = all(sg["provisioned"] == "true" for sg in all_sgs)
     if not all_provisioned:
-        logger.info("Initial provisioning: %d/%d SGs provisioned",
-                     sum(1 for sg in all_sgs if sg["provisioned"] == "true"), len(all_sgs))
+        provisioned = sum(1 for sg in all_sgs if sg["provisioned"] == "true")
+        logger.info("Initial provisioning: %d/%d provisioned", provisioned, len(all_sgs))
         return
 
-    logger.info("All %d SGs provisioned — scaling desired to %d (extras go to warm pool)",
-                 len(all_sgs), min_count)
+    # Set the flag BEFORE scaling down — prevents re-entry
+    ssm.put_parameter(
+        Name=flag_param, Value="true", Type="String", Overwrite=True,
+    )
+
+    logger.info("All %d SGs provisioned and InService — scaling desired to %d",
+                 len(instances), min_count)
     autoscaling.update_auto_scaling_group(
         AutoScalingGroupName=asg_name,
         DesiredCapacity=min_count,
