@@ -51,18 +51,14 @@ Parameters:
     Description: Hostname prefix for Service Gateway appliances (numbered automatically)
     Type: String
     Default: FSVA-AWS
-  ServiceGatewayMinCount:
-    Description: Minimum Service Gateways (always running)
-    Type: Number
-    Default: 1
-    MinValue: 1
-  ServiceGatewayMaxCount:
-    Description: Maximum Service Gateways (includes warm pool)
+  ServiceGatewayCount:
+    Description: Number of Service Gateways to run
     Type: Number
     Default: 6
     MinValue: 1
+    MaxValue: 8
   ServiceGatewayInstanceType:
-    Description: EC2 instance type for Service Gateway appliances
+    Description: EC2 instance type for Service Gateway appliances (c5 family required by AMI)
     Type: String
     Default: c5.2xlarge
     AllowedValues:
@@ -75,20 +71,6 @@ Parameters:
     Default: 500
     MinValue: 10
     MaxValue: 2048
-  PMLEnabled:
-    Description: Enable Predictive Machine Learning (PML) for scans
-    Type: String
-    Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-  SmartFeedbackEnabled:
-    Description: Enable Smart Feedback (scan telemetry sent to TrendAI for threat intelligence)
-    Type: String
-    Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
   ExistingVPCId:
     Description: Use an existing VPC (e.g., vpc-0123456789abcdef0). Leave empty to create a new VPC.
     Type: String
@@ -103,6 +85,33 @@ Parameters:
     Default: ""
 Conditions:
   CreateNetworking: !Equals [!Ref ExistingVPCId, ""]
+  CreateSG2: !Not [!Equals [!Ref ServiceGatewayCount, "1"]]
+  CreateSG3: !And
+    - !Not [!Equals [!Ref ServiceGatewayCount, "1"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "2"]]
+  CreateSG4: !And
+    - !Not [!Equals [!Ref ServiceGatewayCount, "1"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "2"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "3"]]
+  CreateSG5: !And
+    - !Not [!Equals [!Ref ServiceGatewayCount, "1"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "2"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "3"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "4"]]
+  CreateSG6: !And
+    - !Not [!Equals [!Ref ServiceGatewayCount, "1"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "2"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "3"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "4"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "5"]]
+  CreateSG7: !And
+    - !Not [!Equals [!Ref ServiceGatewayCount, "1"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "2"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "3"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "4"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "5"]]
+    - !Not [!Equals [!Ref ServiceGatewayCount, "6"]]
+  CreateSG8: !Equals [!Ref ServiceGatewayCount, "8"]
 
 Resources:
   # ── VPC ──────────────────────────────────────────────────────────────
@@ -414,20 +423,6 @@ Resources:
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
-  AutoScalingEndpoint:
-    Condition: CreateNetworking
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcId: !Ref BaseVPC
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.autoscaling
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref VPCEndpointSecGroup
-
   STSEndpoint:
     Condition: CreateNetworking
     Type: AWS::EC2::VPCEndpoint
@@ -567,53 +562,109 @@ Resources:
               - Key: appliance-v1fs:stack
                 Value: !Ref "AWS::StackName"
 
-  # ── Service Gateway ASG + Warm Pool ──────────────────────────────
-  ServiceGatewayASG:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    DependsOn:
-      - ProvisionerEventPermission
+  # ── Service Gateway Instances (fixed fleet) ──────────────────────
+  ServiceGateway01:
+    Type: AWS::EC2::Instance
+    DependsOn: ProvisionerEventPermission
     Properties:
-      AutoScalingGroupName: !Sub sg-asg-${AWS::StackName}
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      MinSize: 0
-      MaxSize: !Ref ServiceGatewayMaxCount
-      DesiredCapacity: !Ref ServiceGatewayMaxCount
-      VPCZoneIdentifier:
-        - !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
-        - !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
-      HealthCheckType: EC2
-      HealthCheckGracePeriod: 600
-      LifecycleHookSpecificationList:
-        - LifecycleHookName: SGLaunchHook
-          LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
-          HeartbeatTimeout: 3600
-          DefaultResult: ABANDON
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
       Tags:
         - Key: Name
-          Value: !Sub ${ServiceGatewayHostname}
-          PropagateAtLaunch: true
+          Value: !Sub ${ServiceGatewayHostname}-01
 
-  SGScalingPolicy:
-    Type: AWS::AutoScaling::ScalingPolicy
+  ServiceGateway02:
+    Type: AWS::EC2::Instance
+    Condition: CreateSG2
+    DependsOn: ProvisionerEventPermission
     Properties:
-      AutoScalingGroupName: !Ref ServiceGatewayASG
-      PolicyType: TargetTrackingScaling
-      EstimatedInstanceWarmup: 90
-      TargetTrackingConfiguration:
-        PredefinedMetricSpecification:
-          PredefinedMetricType: ASGAverageCPUUtilization
-        TargetValue: 60
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-02
 
-  ServiceGatewayWarmPool:
-    Type: AWS::AutoScaling::WarmPool
+  ServiceGateway03:
+    Type: AWS::EC2::Instance
+    Condition: CreateSG3
+    DependsOn: ProvisionerEventPermission
     Properties:
-      AutoScalingGroupName: !Ref ServiceGatewayASG
-      PoolState: Stopped
-      MinSize: 0
-      InstanceReusePolicy:
-        ReuseOnScaleIn: true
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-03
+
+  ServiceGateway04:
+    Type: AWS::EC2::Instance
+    Condition: CreateSG4
+    DependsOn: ProvisionerEventPermission
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-04
+
+  ServiceGateway05:
+    Type: AWS::EC2::Instance
+    Condition: CreateSG5
+    DependsOn: ProvisionerEventPermission
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-05
+
+  ServiceGateway06:
+    Type: AWS::EC2::Instance
+    Condition: CreateSG6
+    DependsOn: ProvisionerEventPermission
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-06
+
+  ServiceGateway07:
+    Type: AWS::EC2::Instance
+    Condition: CreateSG7
+    DependsOn: ProvisionerEventPermission
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-07
+
+  ServiceGateway08:
+    Type: AWS::EC2::Instance
+    Condition: CreateSG8
+    DependsOn: ProvisionerEventPermission
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
+        Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceGatewayHostname}-08
 
   # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
   ProvisionerEventRule:
@@ -861,12 +912,9 @@ Resources:
                 Resource: !Sub "arn:aws:s3:::${ScannerDeployBucket}/awscli-runtime.zip"
               - Effect: Allow
                 Action:
-                  - autoscaling:CompleteLifecycleAction
-                  - autoscaling:UpdateAutoScalingGroup
-                Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/sg-asg-${AWS::StackName}"
-              - Effect: Allow
-                Action: autoscaling:DescribeAutoScalingGroups
-                Resource: "*"
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListResourceRecordSets
+                Resource: !Sub "arn:aws:route53:::hostedzone/${ScannerHostedZone}"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
@@ -894,8 +942,8 @@ Resources:
           AWS_REGION_NAME: !Ref "AWS::Region"
           DEPLOY_BUCKET: !Ref ScannerDeployBucket
           MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
-          SG_ASG_NAME: !Sub sg-asg-${AWS::StackName}
-          SG_MIN_COUNT: !Ref ServiceGatewayMinCount
+          SG_DNS_ZONE_ID: !Ref ScannerHostedZone
+          SG_DNS_NAME: sg.scanner.internal
 
   WatchdogSchedule:
     Type: AWS::Events::Rule
@@ -919,26 +967,33 @@ Resources:
 
   # ── EC2 Instance Connect Endpoint ──────────────────────────────────
   EICSecGroup:
-    Condition: CreateNetworking
     Type: AWS::EC2::SecurityGroup
     Properties:
-      VpcId: !Ref BaseVPC
+      VpcId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
       GroupDescription: EC2 Instance Connect Endpoint
       Tags:
         - Key: Name
           Value: !Sub EICSecGroup-${AWS::StackName}
 
   EICEndpoint:
-    Condition: CreateNetworking
     Type: AWS::EC2::InstanceConnectEndpoint
     Properties:
-      SubnetId: !Ref PrivateSubnet1
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
       SecurityGroupIds:
         - !Ref EICSecGroup
       PreserveClientIp: false
       Tags:
         - Key: Name
           Value: !Sub EICEndpoint-${AWS::StackName}
+
+  # ── Route 53 Private Hosted Zone (scanner DNS discovery) ──────────
+  ScannerHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: scanner.internal
+      VPCs:
+        - VPCId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
+          VPCRegion: !Ref "AWS::Region"
 
 Outputs:
   VPCId:
@@ -956,11 +1011,6 @@ Outputs:
     Value: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
     Export:
       Name: !Sub ${AWS::StackName}-PrivateSubnet2Id
-  ServiceGatewayASGName:
-    Description: Service Gateway Auto Scaling Group
-    Value: !Ref ServiceGatewayASG
-    Export:
-      Name: !Sub ${AWS::StackName}-ServiceGatewayASGName
   ServiceGatewaySecGroupId:
     Description: Service Gateway security group ID
     Value: !Ref ServiceGatewaySecGroup

@@ -15,86 +15,49 @@ logger.setLevel(logging.INFO)
 # SSM parameter for tracking scanner version per SG
 VERSION_PARAM_PREFIX = "/appliance-v1fs/scanner-version/"
 EXPECTED_REPLICAS = 1
-SG_LIFECYCLE_HOOK = "SGLaunchHook"
 
 
-def _complete_lifecycle_hook(instance_id, region):
-    """Complete the ASG launch lifecycle hook so the instance enters InService."""
-    asg_name = os.environ.get("SG_ASG_NAME", "")
-    if not asg_name:
-        return
-    try:
-        autoscaling = boto3.client("autoscaling", region_name=region)
-        autoscaling.complete_lifecycle_action(
-            LifecycleHookName=SG_LIFECYCLE_HOOK,
-            AutoScalingGroupName=asg_name,
-            InstanceId=instance_id,
-            LifecycleActionResult="CONTINUE",
-        )
-        logger.info("Completed lifecycle hook for %s", instance_id)
-    except Exception:
-        logger.warning("Could not complete lifecycle hook for %s", instance_id, exc_info=True)
-
-
-def _check_initial_provisioning_complete(region):
-    """One-time scale-down after all SGs are initially provisioned and InService.
-
-    Only runs once — sets an SSM flag so it never interferes with normal scaling.
-    Verifies all ASG instances are InService (not just tagged) before scaling down.
-    """
-    asg_name = os.environ.get("SG_ASG_NAME", "")
-    min_count = int(os.environ.get("SG_MIN_COUNT", "0"))
-    if not asg_name or not min_count:
+def _sync_dns_records(region):
+    """Sync Route 53 A records with running SG IPs."""
+    zone_id = os.environ.get("SG_DNS_ZONE_ID", "")
+    dns_name = os.environ.get("SG_DNS_NAME", "")
+    if not zone_id or not dns_name:
         return
 
-    ssm = boto3.client("ssm", region_name=region)
-    flag_param = f"/appliance-v1fs/initial-provisioning-complete/{asg_name}"
-
-    # Check if we've already done the initial scale-down
-    try:
-        ssm.get_parameter(Name=flag_param)
-        return  # Already completed — never run again
-    except ssm.exceptions.ParameterNotFound:
-        pass
-
-    autoscaling = boto3.client("autoscaling", region_name=region)
-    asg = autoscaling.describe_auto_scaling_groups(
-        AutoScalingGroupNames=[asg_name],
-    )["AutoScalingGroups"]
-    if not asg:
-        return
-
-    instances = asg[0]["Instances"]
-    desired = asg[0]["DesiredCapacity"]
-    if desired <= min_count:
-        return
-
-    # ALL instances must be InService (not Pending:Wait, not Pending:Proceed)
-    all_in_service = all(i["LifecycleState"] == "InService" for i in instances)
-    if not all_in_service:
-        in_svc = sum(1 for i in instances if i["LifecycleState"] == "InService")
-        logger.info("Initial provisioning: %d/%d InService", in_svc, len(instances))
-        return
-
-    # ALL must be tagged as provisioned
     all_sgs = _discover_sg_instances(region)
-    all_provisioned = all(sg["provisioned"] == "true" for sg in all_sgs)
-    if not all_provisioned:
-        provisioned = sum(1 for sg in all_sgs if sg["provisioned"] == "true")
-        logger.info("Initial provisioning: %d/%d provisioned", provisioned, len(all_sgs))
+    ips = []
+    ec2 = boto3.client("ec2", region_name=region)
+    for sg in all_sgs:
+        resp = ec2.describe_instances(InstanceIds=[sg["instance_id"]])
+        for res in resp["Reservations"]:
+            for inst in res["Instances"]:
+                if inst.get("PrivateIpAddress"):
+                    ips.append(inst["PrivateIpAddress"])
+
+    if not ips:
+        logger.warning("DNS sync: no running SG IPs found, skipping")
         return
 
-    # Set the flag BEFORE scaling down — prevents re-entry
-    ssm.put_parameter(
-        Name=flag_param, Value="true", Type="String", Overwrite=True,
-    )
-
-    logger.info("All %d SGs provisioned and InService — scaling desired to %d",
-                 len(instances), min_count)
-    autoscaling.update_auto_scaling_group(
-        AutoScalingGroupName=asg_name,
-        DesiredCapacity=min_count,
-    )
+    try:
+        r53 = boto3.client("route53")
+        records = [{"Value": ip} for ip in sorted(set(ips))]
+        r53.change_resource_record_sets(
+            HostedZoneId=zone_id,
+            ChangeBatch={
+                "Changes": [{
+                    "Action": "UPSERT",
+                    "ResourceRecordSet": {
+                        "Name": dns_name,
+                        "Type": "A",
+                        "TTL": 10,
+                        "ResourceRecords": records,
+                    },
+                }],
+            },
+        )
+        logger.info("DNS synced: %s → %s", dns_name, [r["Value"] for r in records])
+    except Exception:
+        logger.warning("DNS sync failed", exc_info=True)
 
 
 def handler(event, context):
@@ -255,28 +218,13 @@ def _handle_instance_running(event, context):
                       instance_id, tag_key, tags.get(tag_key))
         return {"status": "skipped", "reason": "not our instance"}
 
-    # Already provisioned (warm pool re-entry) — verify scanner, complete lifecycle hook
+    # Already provisioned — just sync DNS
     if tags.get("appliance-v1fs:provisioned") == "true":
-        logger.info("Instance %s already provisioned (warm pool re-entry), verifying scanner...", instance_id)
-        try:
-            endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
-            key_pair_id = os.environ.get("KEY_PAIR_ID", "")
-            private_key = _get_ssh_key(key_pair_id, region)
-            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-                _wait_for_scanner_pod("127.0.0.1", private_key, port=tunnel.local_port)
-            logger.info("Scanner pod running on %s, completing lifecycle hook", instance_id)
-        except Exception:
-            logger.warning("Could not verify scanner on %s", instance_id, exc_info=True)
-        _complete_lifecycle_hook(instance_id, region)
-        return {"status": "warm_pool_ready", "instance": instance_id}
+        logger.info("Instance %s already provisioned, syncing DNS", instance_id)
+        _sync_dns_records(region)
+        return {"status": "already_provisioned", "instance": instance_id}
 
-    # Assign numbered hostname based on position among stack SGs
-    hostname_prefix = tags.get("Name", "FSVA-AWS")
-    all_sgs = _discover_sg_instances(region)
-    sg_ids = sorted(sg["instance_id"] for sg in all_sgs)
-    sg_index = sg_ids.index(instance_id) + 1 if instance_id in sg_ids else len(sg_ids) + 1
-    hostname = f"{hostname_prefix}-{sg_index:02d}"
-    ec2.create_tags(Resources=[instance_id], Tags=[{"Key": "Name", "Value": hostname}])
+    hostname = tags.get("Name", instance_id)
     logger.info("Provisioning Service Gateway %s as %s", instance_id, hostname)
     endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
     key_pair_id = os.environ.get("KEY_PAIR_ID", "")
@@ -377,8 +325,7 @@ def _handle_instance_running(event, context):
         ec2.create_tags(Resources=[instance_id], Tags=[
             {"Key": "appliance-v1fs:provisioned", "Value": "true"},
         ])
-        _complete_lifecycle_hook(instance_id, region)
-        _check_initial_provisioning_complete(region)
+        _sync_dns_records(region)
 
         return {"status": "provisioned", "instance": instance_id, "hostname": hostname}
 
@@ -529,8 +476,6 @@ def _handle_watchdog(event, context):
                     ec2.create_tags(Resources=[instance_id], Tags=[
                         {"Key": "appliance-v1fs:provisioned", "Value": "true"},
                     ])
-                    _complete_lifecycle_hook(instance_id, region)
-                    _check_initial_provisioning_complete(region)
                     results.append({"instance": instance_id, "action": "provisioned"})
                     logger.info("Watchdog: %s (%s) now fully provisioned",
                                 instance_id, inst_info["hostname"])
@@ -568,5 +513,8 @@ def _handle_watchdog(event, context):
         except Exception:
             logger.exception("Watchdog: failed checking %s", instance_id)
             results.append({"instance": instance_id, "action": "error"})
+
+    # Sync DNS with running SGs
+    _sync_dns_records(region)
 
     return {"status": "complete", "results": results}
