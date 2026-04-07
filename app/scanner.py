@@ -171,6 +171,7 @@ async def _process_file(s3, scan_bucket, key, size, pml,
             Bucket=QUARANTINE_BUCKET, Key=quarantine_key,
             Body=file_bytes, Tagging=tags,
         )
+        await s3.delete_object(Bucket=scan_bucket, Key=key)
         verdict = "malicious"
     else:
         logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s",

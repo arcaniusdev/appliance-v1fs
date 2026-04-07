@@ -71,6 +71,22 @@ Parameters:
     Default: 500
     MinValue: 10
     MaxValue: 2048
+  VisionOneApiKey:
+    Description: TrendAI Vision One API key for File Security SDK
+    Type: String
+    NoEcho: true
+  SGRegistrationToken:
+    Description: Service Gateway registration token from Vision One console
+    Type: String
+    NoEcho: true
+  DNSZoneName:
+    Description: Private hosted zone name for scanner DNS discovery
+    Type: String
+    Default: scanner.internal
+  DNSRecordName:
+    Description: DNS record prefix (full name will be {prefix}.{zone})
+    Type: String
+    Default: sg
   ExistingVPCId:
     Description: Use an existing VPC (e.g., vpc-0123456789abcdef0). Leave empty to create a new VPC.
     Type: String
@@ -565,7 +581,7 @@ Resources:
   # ── Service Gateway Instances (fixed fleet) ──────────────────────
   ServiceGateway01:
     Type: AWS::EC2::Instance
-    DependsOn: ProvisionerEventPermission
+    DependsOn: WatchdogPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
@@ -578,7 +594,7 @@ Resources:
   ServiceGateway02:
     Type: AWS::EC2::Instance
     Condition: CreateSG2
-    DependsOn: ProvisionerEventPermission
+    DependsOn: WatchdogPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
@@ -591,7 +607,7 @@ Resources:
   ServiceGateway03:
     Type: AWS::EC2::Instance
     Condition: CreateSG3
-    DependsOn: ProvisionerEventPermission
+    DependsOn: WatchdogPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
@@ -604,7 +620,7 @@ Resources:
   ServiceGateway04:
     Type: AWS::EC2::Instance
     Condition: CreateSG4
-    DependsOn: ProvisionerEventPermission
+    DependsOn: WatchdogPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
@@ -617,7 +633,7 @@ Resources:
   ServiceGateway05:
     Type: AWS::EC2::Instance
     Condition: CreateSG5
-    DependsOn: ProvisionerEventPermission
+    DependsOn: WatchdogPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
@@ -630,7 +646,7 @@ Resources:
   ServiceGateway06:
     Type: AWS::EC2::Instance
     Condition: CreateSG6
-    DependsOn: ProvisionerEventPermission
+    DependsOn: WatchdogPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
@@ -643,7 +659,7 @@ Resources:
   ServiceGateway07:
     Type: AWS::EC2::Instance
     Condition: CreateSG7
-    DependsOn: ProvisionerEventPermission
+    DependsOn: WatchdogPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
@@ -656,7 +672,7 @@ Resources:
   ServiceGateway08:
     Type: AWS::EC2::Instance
     Condition: CreateSG8
-    DependsOn: ProvisionerEventPermission
+    DependsOn: WatchdogPermission
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
@@ -665,33 +681,6 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-08
-
-  # ── Provisioner EventBridge (EC2 state change → Lambda) ─────────
-  ProvisionerEventRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub sg-provision-${AWS::StackName}
-      Description: Trigger provisioner when SG instances reach running state
-      EventPattern:
-        source:
-          - aws.ec2
-        detail-type:
-          - "EC2 Instance State-change Notification"
-        detail:
-          state:
-            - running
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt ProvisionerLambda.Arn
-          Id: ProvisionerTarget
-
-  ProvisionerEventPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref ProvisionerLambda
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt ProvisionerEventRule.Arn
 
   # ── Scanner Deploy Bucket & CodeBuild ─────────────────────────────
   ScannerDeployBucket:
@@ -943,7 +932,7 @@ Resources:
           DEPLOY_BUCKET: !Ref ScannerDeployBucket
           MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
           SG_DNS_ZONE_ID: !Ref ScannerHostedZone
-          SG_DNS_NAME: sg.scanner.internal
+          SG_DNS_NAME: !Sub "${DNSRecordName}.${DNSZoneName}"
 
   WatchdogSchedule:
     Type: AWS::Events::Rule
@@ -990,10 +979,25 @@ Resources:
   ScannerHostedZone:
     Type: AWS::Route53::HostedZone
     Properties:
-      Name: scanner.internal
+      Name: !Ref DNSZoneName
       VPCs:
         - VPCId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
           VPCRegion: !Ref "AWS::Region"
+
+  # ── Secrets (API key + registration token) ─────────────────────────
+  VisionOneApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: appliance-v1fs/vision-one-api-key
+      Description: TrendAI Vision One API key for File Security SDK
+      SecretString: !Ref VisionOneApiKey
+
+  SGRegistrationTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: appliance-v1fs/sg-registration-token
+      Description: Service Gateway registration token from Vision One
+      SecretString: !Ref SGRegistrationToken
 
 Outputs:
   VPCId:
