@@ -55,43 +55,6 @@ Parameters:
 
 Resources:
   # ── S3 Buckets ──────────────────────────────────────────────────────
-  SourceBucket:
-    Type: AWS::S3::Bucket
-    DependsOn: ReplicationRole
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      BucketName: !Sub "source-${AWS::StackName}"
-      VersioningConfiguration:
-        Status: Enabled
-      ReplicationConfiguration:
-        Role: !GetAtt ReplicationRole.Arn
-        Rules:
-          - Id: replicate-to-scan-bucket
-            Status: Enabled
-            Destination:
-              Bucket: !Sub "arn:aws:s3:::scan-${AWS::StackName}"
-              StorageClass: STANDARD
-      Tags:
-        - Key: Name
-          Value: !Sub SourceBucket-${AWS::StackName}
-
-  SourceBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref SourceBucket
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: DenyMalwareAccess
-            Effect: Deny
-            Principal: "*"
-            Action: s3:GetObject
-            Resource: !Sub "${SourceBucket.Arn}/*"
-            Condition:
-              StringEquals:
-                "s3:ExistingObjectTag/ScanResult": "Malware"
-
   ScanBucket:
     Type: AWS::S3::Bucket
     DependsOn: ScanQueuePolicy
@@ -109,38 +72,21 @@ Resources:
         - Key: Name
           Value: !Sub ScanBucket-${AWS::StackName}
 
-  ReplicationRole:
-    Type: AWS::IAM::Role
+  ScanBucketPolicy:
+    Type: AWS::S3::BucketPolicy
     Properties:
-      AssumeRolePolicyDocument:
+      Bucket: !Ref ScanBucket
+      PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Effect: Allow
-            Principal:
-              Service: s3.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: ReplicationPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:GetReplicationConfiguration
-                  - s3:ListBucket
-                Resource: !Sub "arn:aws:s3:::source-${AWS::StackName}"
-              - Effect: Allow
-                Action:
-                  - s3:GetObjectVersionForReplication
-                  - s3:GetObjectVersionAcl
-                  - s3:GetObjectVersionTagging
-                Resource: !Sub "arn:aws:s3:::source-${AWS::StackName}/*"
-              - Effect: Allow
-                Action:
-                  - s3:ReplicateObject
-                  - s3:ReplicateDelete
-                  - s3:ReplicateTags
-                Resource: !Sub "arn:aws:s3:::scan-${AWS::StackName}/*"
+          - Sid: DenyMalwareAccess
+            Effect: Deny
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${ScanBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "s3:ExistingObjectTag/ScanResult": "Malware"
 
   QuarantineBucket:
     Type: AWS::S3::Bucket
@@ -229,14 +175,11 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                  - s3:DeleteObject
+                  - s3:PutObjectTagging
                 Resource: !Sub "${ScanBucket.Arn}/*"
               - Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub "${ScanBucket.Arn}"
-              - Effect: Allow
-                Action: s3:PutObjectTagging
-                Resource: !Sub "${SourceBucket.Arn}/*"
               - Effect: Allow
                 Action:
                   - s3:PutObject
@@ -321,7 +264,6 @@ Resources:
                 FEEDBACK_ENABLED=${SmartFeedbackEnabled}
                 MAX_FILE_SIZE_MB=${MaxFileSizeMB}
                 SCANNER_ACCOUNT_ID=${AWS::AccountId}
-                SOURCE_BUCKET=${SourceBucket}
                 QUARANTINE_BUCKET=${QuarantineBucket}
                 CUSTOMER_LOG_GROUP=v1fs-scan-audit
                 LOG_LEVEL=INFO
@@ -1406,9 +1348,6 @@ Resources:
       WorkerRoleArn: !GetAtt WorkerRole.Arn
 
 Outputs:
-  SourceBucketName:
-    Description: S3 source bucket
-    Value: !Ref SourceBucket
   ScanBucketName:
     Description: S3 scan bucket
     Value: !Ref ScanBucket

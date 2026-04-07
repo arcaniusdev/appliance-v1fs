@@ -21,7 +21,6 @@ logging.basicConfig(
 )
 
 SCANNER_ACCOUNT_ID = os.environ.get("SCANNER_ACCOUNT_ID", "")
-SOURCE_BUCKET = os.environ.get("SOURCE_BUCKET", "")
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
 
 
@@ -156,22 +155,17 @@ async def _process_file(s3, scan_bucket, key, size, pml,
             "MALICIOUS: s3://%s/%s malware=%s scan=%dms sg=%s",
             scan_bucket, key, malware_names, scan_ms, sg_addr,
         )
-        if SOURCE_BUCKET and SOURCE_BUCKET != scan_bucket:
-            try:
-                await s3.put_object_tagging(
-                    Bucket=SOURCE_BUCKET, Key=key,
-                    Tagging={"TagSet": [
-                        {"Key": "ScanResult", "Value": "Malware"},
-                        {"Key": "ScanTimestamp", "Value": scan_ts},
-                    ]},
-                )
-            except Exception:
-                logger.debug("Could not tag source object (may not exist)", exc_info=True)
-        quarantine_key = f"{SOURCE_BUCKET or scan_bucket}/{key}"
+        await s3.put_object_tagging(
+            Bucket=scan_bucket, Key=key,
+            Tagging={"TagSet": [
+                {"Key": "ScanResult", "Value": "Malware"},
+                {"Key": "ScanTimestamp", "Value": scan_ts},
+            ]},
+        )
+        quarantine_key = f"{scan_bucket}/{key}"
         tags = urlencode({
             "ScanResult": "Malware",
             "ScanTimestamp": scan_ts,
-            "SourceBucket": SOURCE_BUCKET,
         })
         await s3.put_object(
             Bucket=QUARANTINE_BUCKET, Key=quarantine_key,
@@ -181,9 +175,14 @@ async def _process_file(s3, scan_bucket, key, size, pml,
     else:
         logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s",
                      scan_bucket, key, scan_ms, sg_addr)
+        await s3.put_object_tagging(
+            Bucket=scan_bucket, Key=key,
+            Tagging={"TagSet": [
+                {"Key": "ScanResult", "Value": "Clean"},
+                {"Key": "ScanTimestamp", "Value": scan_ts},
+            ]},
+        )
         verdict = "clean"
-
-    await s3.delete_object(Bucket=scan_bucket, Key=key)
 
     await _audit(logs, audit_log_group, scan_bucket, key, size, verdict,
                  result, scan_ms, sg_addr, SCANNER_ACCOUNT_ID)
@@ -206,7 +205,7 @@ async def _audit(logs, log_group, bucket, key, size, verdict, result,
         "timestamp": time.time(),
         "file": key,
         "bucket": bucket,
-        "sourceBucket": SOURCE_BUCKET,
+        "scanBucket": bucket,
         "size": size,
         "verdict": verdict,
         "scanResult": result.get("scanResult", -1),
