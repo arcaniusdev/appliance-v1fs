@@ -336,6 +336,7 @@ async def async_main():
     consecutive_errors = 0
 
     scan_handles = _build_scan_handles()
+    dns_refresh_interval = int(os.environ.get("DNS_REFRESH_INTERVAL", "60"))
 
     logger.info(
         "Scanner worker starting — queue=%s concurrency=%d handles=%d hostname=%s",
@@ -348,6 +349,7 @@ async def async_main():
                session.create_client("logs") as logs:
 
         in_flight: set[asyncio.Task] = set()
+        last_dns_refresh = time.monotonic()
 
         async def guarded_process(message):
             async with semaphore:
@@ -355,6 +357,28 @@ async def async_main():
                                        scan_handles, visibility_timeout)
 
         while not shutdown_event.is_set():
+            # Periodic DNS refresh — re-resolve and rebuild channels if IPs changed
+            if time.monotonic() - last_dns_refresh > dns_refresh_interval:
+                last_dns_refresh = time.monotonic()
+                sg_dns = os.environ.get("SG_DNS_NAME", "")
+                if sg_dns:
+                    try:
+                        new_addrs = sorted(set(
+                            f"{info[4][0]}:443"
+                            for info in socket.getaddrinfo(sg_dns, 443, socket.AF_INET)
+                        ))
+                        old_addrs = sorted(addr for _, addr in scan_handles)
+                        if new_addrs != old_addrs:
+                            logger.info("DNS changed: %s → %s", old_addrs, new_addrs)
+                            old_handles = scan_handles
+                            scan_handles = _build_scan_handles()
+                            for handle, addr in old_handles:
+                                try:
+                                    await amaas.grpc.aio.quit(handle)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        logger.warning("DNS refresh failed", exc_info=True)
             if len(in_flight) >= max_concurrent * 2:
                 await asyncio.sleep(0.1)
                 done = {t for t in in_flight if t.done()}

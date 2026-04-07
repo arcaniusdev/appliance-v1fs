@@ -62,8 +62,6 @@ Resources:
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub "scan-${AWS::StackName}"
-      VersioningConfiguration:
-        Status: Enabled
       NotificationConfiguration:
         QueueConfigurations:
           - Event: s3:ObjectCreated:*
