@@ -996,6 +996,8 @@ Resources:
   # ── Secrets (API key + registration token) ─────────────────────────
   VisionOneApiKeySecret:
     Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Name: appliance-v1fs/vision-one-api-key
       Description: TrendAI Vision One API key for File Security SDK
@@ -1003,6 +1005,8 @@ Resources:
 
   SGRegistrationTokenSecret:
     Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Name: appliance-v1fs/sg-registration-token
       Description: Service Gateway registration token from Vision One
