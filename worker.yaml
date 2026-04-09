@@ -25,12 +25,6 @@ Parameters:
     Default: 10
     MinValue: 1
     MaxValue: 50
-  WorkerConcurrency:
-    Description: Concurrent scans per worker instance
-    Type: Number
-    Default: 50
-    MinValue: 1
-    MaxValue: 200
   RescanAfterDays:
     Description: Re-scan files whose last scan is older than this many days
     Type: Number
@@ -52,6 +46,11 @@ Parameters:
     Default: 500
     MinValue: 10
     MaxValue: 2048
+  EnableTLS:
+    Description: Enable TLS for gRPC connections to Service Gateways (disable for private VPC)
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
 
 Resources:
   # ── S3 Buckets ──────────────────────────────────────────────────────
@@ -79,6 +78,24 @@ Resources:
         - Key: Name
           Value: !Sub ScanBucket-${AWS::StackName}
 
+  ScanBucketHTTPSPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ScanBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ScanBucket.Arn
+              - !Sub "${ScanBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
   QuarantineBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
@@ -96,6 +113,24 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub QuarantineBucket-${AWS::StackName}
+
+  QuarantineBucketHTTPSPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref QuarantineBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt QuarantineBucket.Arn
+              - !Sub "${QuarantineBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
 
   # ── SQS ────────────────────────────────────────────────────────────
   ScanQueue:
@@ -199,7 +234,11 @@ Resources:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: "*"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:scan-audit-${AWS::StackName}"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:scan-audit-${AWS::StackName}:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:v1fs-scan-audit"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:v1fs-scan-audit:*"
               - Effect: Allow
                 Action: ec2:DescribeInstances
                 Resource: "*"
@@ -258,10 +297,9 @@ Resources:
                 AWS_DEFAULT_REGION=${AWS::Region}
                 SQS_QUEUE_URL=${ScanQueue}
                 SQS_VISIBILITY_TIMEOUT=300
-                MAX_CONCURRENT_SCANS=${WorkerConcurrency}
                 ASG_NAME=worker-asg-${AWS::StackName}
-                SG_DNS_NAME=sg.scanner.internal
                 SG_DISCOVERY_TAG=appliance-v1fs:stack=${ScannerStackName}
+                ENABLE_TLS=${EnableTLS}
                 SG_CA_CERT_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/sg-ca-cert
                 V1FS_API_KEY_SECRET_ARN=arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/vision-one-api-key
                 AUDIT_LOG_GROUP=scan-audit-${AWS::StackName}
@@ -407,6 +445,24 @@ Resources:
         - Key: Name
           Value: !Sub WorkerDeployBucket-${AWS::StackName}
 
+  WorkerDeployBucketHTTPSPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WorkerDeployBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt WorkerDeployBucket.Arn
+              - !Sub "${WorkerDeployBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
   WorkerCodeBuildRole:
     Type: AWS::IAM::Role
     Properties:
@@ -495,6 +551,8 @@ Resources:
       Handler: index.handler
       Role: !GetAtt WorkerCodeBuildTriggerRole.Arn
       Timeout: 900
+      TracingConfig:
+        Mode: Active
       Code:
         ZipFile: |
           import boto3, json, time, urllib.request
@@ -572,6 +630,7 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub scan-alarms-${AWS::StackName}
+      KmsMasterKeyId: alias/aws/sns
       Tags:
         - Key: Name
           Value: !Sub AlarmSNSTopic-${AWS::StackName}
@@ -1030,6 +1089,8 @@ Resources:
       Handler: index.handler
       Role: !GetAtt DLQRemediationRole.Arn
       Timeout: 60
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
           QUEUE_URL: !Ref ScanQueue
@@ -1123,6 +1184,8 @@ Resources:
       Handler: index.handler
       Role: !GetAtt ReconciliationRole.Arn
       Timeout: 900
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
           QUEUE_URL: !Ref ScanQueue
@@ -1299,6 +1362,8 @@ Resources:
       Handler: index.handler
       Role: !GetAtt EnrollmentTemplateRole.Arn
       Timeout: 60
+      TracingConfig:
+        Mode: Active
       Code:
         ZipFile: |
           import boto3, json, logging

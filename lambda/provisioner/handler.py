@@ -26,55 +26,12 @@ def _validate_hostname(hostname):
     return hostname
 
 
-def _sync_dns_records(region):
-    """Sync Route 53 A records with running SG IPs."""
-    zone_id = os.environ.get("SG_DNS_ZONE_ID", "")
-    dns_name = os.environ.get("SG_DNS_NAME", "")
-    if not zone_id or not dns_name:
-        return
-
-    all_sgs = _discover_sg_instances(region)
-    ips = []
-    ec2 = boto3.client("ec2", region_name=region)
-    for sg in all_sgs:
-        resp = ec2.describe_instances(InstanceIds=[sg["instance_id"]])
-        for res in resp["Reservations"]:
-            for inst in res["Instances"]:
-                if inst.get("PrivateIpAddress"):
-                    ips.append(inst["PrivateIpAddress"])
-
-    if not ips:
-        logger.warning("DNS sync: no running SG IPs found, skipping")
-        return
-
-    try:
-        r53 = boto3.client("route53")
-        records = [{"Value": ip} for ip in sorted(set(ips))]
-        r53.change_resource_record_sets(
-            HostedZoneId=zone_id,
-            ChangeBatch={
-                "Changes": [{
-                    "Action": "UPSERT",
-                    "ResourceRecordSet": {
-                        "Name": dns_name,
-                        "Type": "A",
-                        "TTL": 10,
-                        "ResourceRecords": records,
-                    },
-                }],
-            },
-        )
-        logger.info("DNS synced: %s → %s", dns_name, [r["Value"] for r in records])
-    except Exception:
-        logger.warning("DNS sync failed", exc_info=True)
-
-
 def handler(event, context):
     """Service Gateway provisioner (watchdog-only).
 
     Invoked on a 15-minute schedule. Discovers SG instances by tag,
     provisions any that are unprovisioned, checks scanner versions,
-    re-applies customizations, and syncs DNS.
+    and re-applies customizations.
     """
     return _handle_watchdog(event, context)
 
@@ -126,6 +83,21 @@ def _extract_cert(sgowner_client):
     return None
 
 
+def _store_cert(secret_name, cert_pem, region):
+    """Store or update the CA cert in Secrets Manager."""
+    sm = boto3.client("secretsmanager", region_name=region)
+    try:
+        sm.create_secret(
+            Name=secret_name,
+            Description="Service Gateway self-signed CA certificate (PEM)",
+            SecretString=cert_pem,
+        )
+        logger.info("CA cert stored as new secret: %s", secret_name)
+    except sm.exceptions.ResourceExistsException:
+        sm.put_secret_value(SecretId=secret_name, SecretString=cert_pem)
+        logger.info("CA cert updated in existing secret: %s", secret_name)
+
+
 def _get_scanner_version(sgowner_client):
     """Get the scanner pod image version from the SG."""
     stdin, stdout, stderr = sgowner_client.exec_command(
@@ -146,21 +118,6 @@ def _scale_replicas(sgowner_client, count):
     output = stdout.read().decode().strip()
     logger.info("Scale replicas to %d: %s", count, output)
     return output
-
-
-def _store_cert(secret_name, cert_pem, region):
-    """Store or update the CA cert in Secrets Manager."""
-    sm = boto3.client("secretsmanager", region_name=region)
-    try:
-        sm.create_secret(
-            Name=secret_name,
-            Description="Service Gateway self-signed CA certificate (PEM)",
-            SecretString=cert_pem,
-        )
-        logger.info("CA cert stored as new secret: %s", secret_name)
-    except sm.exceptions.ResourceExistsException:
-        sm.put_secret_value(SecretId=secret_name, SecretString=cert_pem)
-        logger.info("CA cert updated in existing secret: %s", secret_name)
 
 
 # ── Dynamic SG Discovery ─────────────────────────────────────────────
@@ -212,6 +169,25 @@ def _patch_nginx_body_size(sgowner_client):
         logger.warning("nginx patch may have failed: %s", output)
 
 
+def _set_scan_cache(sgowner_client):
+    """Set TM_AM_SCAN_CACHE env var on the scanner deployment.
+
+    Controlled by the ScanCacheEnabled stack parameter. The watchdog
+    re-applies every 15 minutes to enforce the desired state.
+    """
+    enabled = os.environ.get("SCAN_CACHE_ENABLED", "true")
+    cmd = (
+        "sudo microk8s kubectl set env deployment --all "
+        f"-n sg-sfs-scanner TM_AM_SCAN_CACHE={enabled} 2>&1"
+    )
+    stdin, stdout, stderr = sgowner_client.exec_command(cmd, timeout=15)
+    output = stdout.read().decode().strip()
+    if "updated" in output or "unchanged" in output:
+        logger.info("scan cache TM_AM_SCAN_CACHE=%s: %s", enabled, output)
+    else:
+        logger.warning("scan cache set may have failed: %s", output)
+
+
 def _wait_for_scanner_pod(host, private_key, port=22, max_attempts=20, interval=15):
     """Poll until the File Security scanner pod is running on the SG."""
     for attempt in range(max_attempts):
@@ -259,9 +235,8 @@ def _handle_watchdog(event, context):
     Invoked by EventBridge on a 15-minute schedule. For each SG instance:
     1. Not registered → set hostname, register with Vision One, tag
     2. Registered but no scanner pod → wait (FS must be installed via V1 console)
-    3. Scanner pod running but not provisioned → extract cert, patch nginx, tag
+    3. Scanner pod running but not provisioned → extract cert, patch nginx, set cache, tag
     4. Already provisioned → check scanner version, re-extract cert if changed
-    Also syncs DNS A records with running SG IPs after each run.
     """
     region = event.get("region", os.environ.get("AWS_REGION_NAME", "us-east-1"))
     sg_instances = _discover_sg_instances(region)
@@ -280,7 +255,6 @@ def _handle_watchdog(event, context):
     pubkey_b64 = rsa_key.get_base64()
 
     results = []
-    cert_updated = False
 
     for inst_info in sg_instances:
         instance_id = inst_info["instance_id"]
@@ -384,9 +358,10 @@ def _handle_watchdog(event, context):
                     results.append({"instance": instance_id, "action": "waiting"})
                     continue
 
-                # Get version, cert, re-apply nginx patch, and scale replicas via sgowner
+                # Re-apply customizations and check version via sgowner
                 client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
                 _patch_nginx_body_size(client)
+                _set_scan_cache(client)
                 current_version = _get_scanner_version(client)
 
                 # Complete provisioning for SGs that have the scanner pod but
@@ -399,7 +374,6 @@ def _handle_watchdog(event, context):
                     cert_pem = _extract_cert(client)
                     if cert_pem:
                         _store_cert(cert_secret_name, cert_pem, region)
-                        cert_updated = True
                     ssm.put_parameter(
                         Name=param_name, Value=current_version,
                         Type="String", Overwrite=True,
@@ -416,26 +390,21 @@ def _handle_watchdog(event, context):
                         "Watchdog: version changed on %s: %s -> %s",
                         instance_id, stored or "(none)", current_version,
                     )
-
                     cert_pem = _extract_cert(client)
                     if cert_pem:
                         _store_cert(cert_secret_name, cert_pem, region)
-                        cert_updated = True
-                        logger.info("Watchdog: CA cert extracted from %s", instance_id)
-
+                        logger.info("Watchdog: CA cert re-extracted from %s", instance_id)
                     ssm.put_parameter(
                         Name=param_name,
                         Value=current_version,
                         Type="String",
                         Overwrite=True,
                     )
-
                     results.append({
                         "instance": instance_id,
                         "action": "updated",
                         "oldVersion": stored,
                         "newVersion": current_version,
-                        "certUpdated": cert_updated,
                     })
                 else:
                     logger.info("Watchdog: %s unchanged (%s)", instance_id, current_version)
@@ -445,8 +414,5 @@ def _handle_watchdog(event, context):
         except Exception:
             logger.exception("Watchdog: failed checking %s", instance_id)
             results.append({"instance": instance_id, "action": "error"})
-
-    # Sync DNS with running SGs
-    _sync_dns_records(region)
 
     return {"status": "complete", "results": results}

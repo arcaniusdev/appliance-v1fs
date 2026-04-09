@@ -71,6 +71,13 @@ Parameters:
     Default: 500
     MinValue: 10
     MaxValue: 2048
+  ScanCacheEnabled:
+    Description: Enable Redis scan cache on Service Gateways (disable only for baseline testing)
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
   VisionOneApiKey:
     Description: TrendAI Vision One API key for File Security SDK
     Type: String
@@ -79,14 +86,6 @@ Parameters:
     Description: Service Gateway registration token from Vision One console
     Type: String
     NoEcho: true
-  DNSZoneName:
-    Description: Private hosted zone name for scanner DNS discovery
-    Type: String
-    Default: scanner.internal
-  DNSRecordName:
-    Description: DNS record prefix (full name will be {prefix}.{zone})
-    Type: String
-    Default: sg
   ExistingVPCId:
     Description: Use an existing VPC (e.g., vpc-0123456789abcdef0). Leave empty to create a new VPC.
     Type: String
@@ -354,6 +353,55 @@ Resources:
       RouteTableId: !Ref PrivateRT2
       SubnetId: !Ref PrivateSubnet2
 
+  # ── VPC Flow Logs ──────────────────────────────────────────────────
+  FlowLogGroup:
+    Condition: CreateNetworking
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub vpc-flow-logs-${AWS::StackName}
+      RetentionInDays: 30
+
+  FlowLogRole:
+    Condition: CreateNetworking
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:vpc-flow-logs-${AWS::StackName}"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:vpc-flow-logs-${AWS::StackName}:*"
+
+  VPCFlowLog:
+    Condition: CreateNetworking
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref BaseVPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub VPCFlowLog-${AWS::StackName}
+
   # ── S3 Gateway VPC Endpoint ────────────────────────────────────────
   S3GatewayEndpoint:
     Condition: CreateNetworking
@@ -513,10 +561,15 @@ Resources:
       GroupDescription: Service Gateway appliance - inbound scan traffic and management
       SecurityGroupIngress:
         - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.2.0.0/16
+          Description: HTTP from VPC (gRPC h2c, no TLS)
+        - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 10.2.0.0/16
-          Description: HTTPS from VPC (SDK gRPC, management)
+          Description: HTTPS from VPC (gRPC TLS, management)
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
@@ -572,6 +625,7 @@ Resources:
               Encrypted: true
         MetadataOptions:
           HttpTokens: required
+        DisableApiTermination: true
         TagSpecifications:
           - ResourceType: instance
             Tags:
@@ -682,6 +736,105 @@ Resources:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-08
 
+  # ── Private Hosted Zone (TLS hostname matching) ────────────────────
+  # The SG wildcard cert (*.sgi.xdr.trendmicro.com) requires connections
+  # to a matching hostname for TLS to validate. This private zone resolves
+  # per-SG hostnames to their private IPs within the VPC.
+  ScannerHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: sgi.xdr.trendmicro.com
+      VPCs:
+        - VPCId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
+          VPCRegion: !Ref "AWS::Region"
+
+  ServiceGateway01DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ScannerHostedZone
+      Name: !Sub "${ServiceGatewayHostname}-01.sgi.xdr.trendmicro.com"
+      Type: A
+      TTL: 10
+      ResourceRecords:
+        - !GetAtt ServiceGateway01.PrivateIp
+
+  ServiceGateway02DNS:
+    Condition: CreateSG2
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ScannerHostedZone
+      Name: !Sub "${ServiceGatewayHostname}-02.sgi.xdr.trendmicro.com"
+      Type: A
+      TTL: 10
+      ResourceRecords:
+        - !GetAtt ServiceGateway02.PrivateIp
+
+  ServiceGateway03DNS:
+    Condition: CreateSG3
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ScannerHostedZone
+      Name: !Sub "${ServiceGatewayHostname}-03.sgi.xdr.trendmicro.com"
+      Type: A
+      TTL: 10
+      ResourceRecords:
+        - !GetAtt ServiceGateway03.PrivateIp
+
+  ServiceGateway04DNS:
+    Condition: CreateSG4
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ScannerHostedZone
+      Name: !Sub "${ServiceGatewayHostname}-04.sgi.xdr.trendmicro.com"
+      Type: A
+      TTL: 10
+      ResourceRecords:
+        - !GetAtt ServiceGateway04.PrivateIp
+
+  ServiceGateway05DNS:
+    Condition: CreateSG5
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ScannerHostedZone
+      Name: !Sub "${ServiceGatewayHostname}-05.sgi.xdr.trendmicro.com"
+      Type: A
+      TTL: 10
+      ResourceRecords:
+        - !GetAtt ServiceGateway05.PrivateIp
+
+  ServiceGateway06DNS:
+    Condition: CreateSG6
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ScannerHostedZone
+      Name: !Sub "${ServiceGatewayHostname}-06.sgi.xdr.trendmicro.com"
+      Type: A
+      TTL: 10
+      ResourceRecords:
+        - !GetAtt ServiceGateway06.PrivateIp
+
+  ServiceGateway07DNS:
+    Condition: CreateSG7
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ScannerHostedZone
+      Name: !Sub "${ServiceGatewayHostname}-07.sgi.xdr.trendmicro.com"
+      Type: A
+      TTL: 10
+      ResourceRecords:
+        - !GetAtt ServiceGateway07.PrivateIp
+
+  ServiceGateway08DNS:
+    Condition: CreateSG8
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ScannerHostedZone
+      Name: !Sub "${ServiceGatewayHostname}-08.sgi.xdr.trendmicro.com"
+      Type: A
+      TTL: 10
+      ResourceRecords:
+        - !GetAtt ServiceGateway08.PrivateIp
+
   # ── Scanner Deploy Bucket & CodeBuild ─────────────────────────────
   ScannerDeployBucket:
     Type: AWS::S3::Bucket
@@ -698,6 +851,24 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ScannerDeployBucket-${AWS::StackName}
+
+  ScannerDeployBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ScannerDeployBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ScannerDeployBucket.Arn
+              - !Sub "${ScannerDeployBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
 
   ScannerCodeBuildRole:
     Type: AWS::IAM::Role
@@ -787,6 +958,8 @@ Resources:
       Handler: index.handler
       Role: !GetAtt ScannerCodeBuildTriggerRole.Arn
       Timeout: 900
+      TracingConfig:
+        Mode: Active
       Code:
         ZipFile: |
           import boto3, json, time, urllib.request
@@ -892,11 +1065,18 @@ Resources:
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
               - Effect: Allow
                 Action:
-                  - ec2-instance-connect:OpenTunnel
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceConnectEndpoints
-                  - ec2:CreateTags
                 Resource: "*"
+              - Effect: Allow
+                Action: ec2-instance-connect:OpenTunnel
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance-connect-endpoint/${EICEndpoint}"
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance:*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/appliance-v1fs:stack": !Ref "AWS::StackName"
               - Effect: Allow
                 Action:
                   - ssm:PutParameter
@@ -908,12 +1088,6 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${ScannerDeployBucket}/awscli-runtime.zip"
-              - Effect: Allow
-                Action:
-                  - route53:ChangeResourceRecordSets
-                  - route53:ListResourceRecordSets
-                Resource: !Sub "arn:aws:route53:::hostedzone/${ScannerHostedZone}"
-
   ProvisionerLambda:
     Type: AWS::Lambda::Function
     DependsOn: ScannerCodeBuild
@@ -929,6 +1103,8 @@ Resources:
       Role: !GetAtt ProvisionerLambdaRole.Arn
       Timeout: 900
       MemorySize: 256
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
           SG_TAG_KEY: "appliance-v1fs:stack"
@@ -940,8 +1116,7 @@ Resources:
           AWS_REGION_NAME: !Ref "AWS::Region"
           DEPLOY_BUCKET: !Ref ScannerDeployBucket
           MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
-          SG_DNS_ZONE_ID: !Ref ScannerHostedZone
-          SG_DNS_NAME: !Sub "${DNSRecordName}.${DNSZoneName}"
+          SCAN_CACHE_ENABLED: !Ref ScanCacheEnabled
 
   WatchdogSchedule:
     Type: AWS::Events::Rule
@@ -983,15 +1158,6 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub EICEndpoint-${AWS::StackName}
-
-  # ── Route 53 Private Hosted Zone (scanner DNS discovery) ──────────
-  ScannerHostedZone:
-    Type: AWS::Route53::HostedZone
-    Properties:
-      Name: !Ref DNSZoneName
-      VPCs:
-        - VPCId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
-          VPCRegion: !Ref "AWS::Region"
 
   # ── Secrets (API key + registration token) ─────────────────────────
   VisionOneApiKeySecret:
