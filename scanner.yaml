@@ -1761,7 +1761,7 @@ Resources:
                 Resource: "*"
               - Effect: Allow
                 Action: ec2:CreateTags
-                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance:*"
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                 Condition:
                   StringEquals:
                     "aws:ResourceTag/appliance-v1fs:stack": !Ref "AWS::StackName"
