@@ -233,7 +233,7 @@ def _handle_watchdog(event, context):
             version_out = _ssm_run(ssm, iid, [
                 "kubectl get pod -n sg-sfs-scanner "
                 "-o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null"
-            ], timeout=15)
+            ], timeout=30)
             current_version = version_out.strip("'\n ")
 
             # ── Step 4: complete provisioning or check for updates ──
