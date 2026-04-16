@@ -1850,27 +1850,6 @@ Resources:
         - Key: Name
           Value: !Sub ProvisionerLambdaSG-${AWS::StackName}
 
-  # ── EC2 Instance Connect Endpoint (manual ops SSH access) ──────────
-  EICSecGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      VpcId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
-      GroupDescription: EC2 Instance Connect Endpoint
-      Tags:
-        - Key: Name
-          Value: !Sub EICSecGroup-${AWS::StackName}
-
-  EICEndpoint:
-    Type: AWS::EC2::InstanceConnectEndpoint
-    Properties:
-      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
-      SecurityGroupIds:
-        - !Ref EICSecGroup
-      PreserveClientIp: false
-      Tags:
-        - Key: Name
-          Value: !Sub EICEndpoint-${AWS::StackName}
-
   # ── Secrets (API key + registration token) ─────────────────────────
   VisionOneApiKeySecret:
     Type: AWS::SecretsManager::Secret
