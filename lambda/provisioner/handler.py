@@ -8,7 +8,6 @@ import boto3
 import paramiko
 
 from ssh_helper import ClishSession
-from eice_tunnel import EICETunnel
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -47,11 +46,8 @@ def _get_ssh_key(key_pair_id: str, region: str) -> str:
     return resp["Parameter"]["Value"]
 
 
-def _get_sgowner_session(tunnel, admin_key, rsa_key, pubkey_b64):
+def _get_sgowner_session(host, port, admin_key, rsa_key, pubkey_b64):
     """Install a temp SSH key via admin clish and return an sgowner SSH client."""
-    host = "127.0.0.1"
-    port = tunnel.local_port
-
     with ClishSession(host, "admin", admin_key, port=port) as session:
         session.connect(timeout=30)
         session.send_command("enable", expect="# ", timeout=15)
@@ -141,6 +137,7 @@ def _discover_sg_instances(region):
             instances.append({
                 "instance_id": inst["InstanceId"],
                 "hostname": tags.get("Name", inst["InstanceId"]),
+                "private_ip": inst.get("PrivateIpAddress", ""),
                 "registered": tags.get("appliance-v1fs:registered", "false"),
                 "provisioned": tags.get("appliance-v1fs:provisioned", "false"),
             })
@@ -240,11 +237,10 @@ def _handle_watchdog(event, context):
     """
     region = event.get("region", os.environ.get("AWS_REGION_NAME", "us-east-1"))
     sg_instances = _discover_sg_instances(region)
-    endpoint_id = os.environ.get("EICE_ENDPOINT_ID", "")
     key_pair_id = os.environ.get("KEY_PAIR_ID", "")
     cert_secret_name = os.environ.get("CERT_SECRET_NAME", "appliance-v1fs/sg-ca-cert")
 
-    if not sg_instances or not endpoint_id or not key_pair_id:
+    if not sg_instances or not key_pair_id:
         logger.warning("Watchdog: missing configuration (found %d SGs), skipping", len(sg_instances))
         return {"status": "skipped", "reason": "missing config"}
 
@@ -260,6 +256,13 @@ def _handle_watchdog(event, context):
         instance_id = inst_info["instance_id"]
         logger.info("Watchdog: checking %s (%s)", instance_id, inst_info["hostname"])
         try:
+            host = inst_info.get("private_ip", "")
+            if not host:
+                logger.warning("Watchdog: no private IP for %s, skipping", instance_id)
+                results.append({"instance": instance_id, "action": "error"})
+                continue
+            port = 22
+
             # Get stored version
             param_name = f"{VERSION_PARAM_PREFIX}{instance_id}"
             try:
@@ -267,150 +270,145 @@ def _handle_watchdog(event, context):
             except ssm.exceptions.ParameterNotFound:
                 stored = ""
 
-            # Single tunnel per SG for all checks
-            with EICETunnel(instance_id, endpoint_id, remote_port=22) as tunnel:
-                host = "127.0.0.1"
-                port = tunnel.local_port
+            # Register with Vision One if not yet registered
+            if inst_info["registered"] != "true":
+                logger.info("Watchdog: %s not registered, checking status", instance_id)
+                try:
+                    with ClishSession(host, "admin", private_key, port=port) as session:
+                        banner = session.connect(timeout=30)
 
-                # Register with Vision One if not yet registered
-                if inst_info["registered"] != "true":
-                    logger.info("Watchdog: %s not registered, checking status", instance_id)
-                    try:
+                    if "Status: Registered" in banner:
+                        logger.info("Watchdog: %s already registered (banner)", instance_id)
+                    else:
+                        # Set hostname via sgowner
+                        hostname = _validate_hostname(inst_info["hostname"])
+                        logger.info("Watchdog: setting hostname to %s", hostname)
+                        temp_rsa = paramiko.RSAKey.generate(4096)
+                        temp_pub = temp_rsa.get_base64()
+                        sgowner = _get_sgowner_session(host, port, private_key, temp_rsa, temp_pub)
+                        sgowner.exec_command(f"sudo hostnamectl set-hostname {hostname}", timeout=15)
+                        sgowner.close()
+
+                        # Set clish endpoint name
                         with ClishSession(host, "admin", private_key, port=port) as session:
-                            banner = session.connect(timeout=30)
+                            session.connect(timeout=30)
+                            session.send_command("enable", expect="# ", timeout=15)
+                            session.send_command(
+                                f"configure endpoint {hostname}",
+                                expect="# ", timeout=30,
+                            )
 
-                        if "Status: Registered" in banner:
-                            logger.info("Watchdog: %s already registered (banner)", instance_id)
-                        else:
-                            # Set hostname via sgowner
-                            hostname = _validate_hostname(inst_info["hostname"])
-                            logger.info("Watchdog: setting hostname to %s", hostname)
-                            temp_rsa = paramiko.RSAKey.generate(4096)
-                            temp_pub = temp_rsa.get_base64()
-                            sgowner = _get_sgowner_session(tunnel, private_key, temp_rsa, temp_pub)
-                            sgowner.exec_command(f"sudo hostnamectl set-hostname {hostname}", timeout=15)
-                            sgowner.close()
+                        # Register
+                        sm_client = boto3.client("secretsmanager", region_name=region)
+                        token_secret = os.environ.get("REGISTRATION_TOKEN_SECRET", "appliance-v1fs/sg-registration-token")
+                        token = sm_client.get_secret_value(SecretId=token_secret)["SecretString"]
 
-                            # Set clish endpoint name
+                        reg_output = ""
+                        for reg_attempt in range(3):
+                            logger.info("Watchdog: registering %s (attempt %d/3)", instance_id, reg_attempt + 1)
                             with ClishSession(host, "admin", private_key, port=port) as session:
                                 session.connect(timeout=30)
                                 session.send_command("enable", expect="# ", timeout=15)
-                                session.send_command(
-                                    f"configure endpoint {hostname}",
-                                    expect="# ", timeout=30,
+                                reg_output = session.send_command(
+                                    f"register {token}",
+                                    expect="# ", timeout=300,
                                 )
-
-                            # Register
-                            sm_client = boto3.client("secretsmanager", region_name=region)
-                            token_secret = os.environ.get("REGISTRATION_TOKEN_SECRET", "appliance-v1fs/sg-registration-token")
-                            token = sm_client.get_secret_value(SecretId=token_secret)["SecretString"]
-
-                            reg_output = ""
-                            for reg_attempt in range(3):
-                                logger.info("Watchdog: registering %s (attempt %d/3)", instance_id, reg_attempt + 1)
-                                with ClishSession(host, "admin", private_key, port=port) as session:
-                                    session.connect(timeout=30)
-                                    session.send_command("enable", expect="# ", timeout=15)
-                                    reg_output = session.send_command(
-                                        f"register {token}",
-                                        expect="# ", timeout=300,
-                                    )
-                                    logger.info("Watchdog: register complete (output length: %d)", len(reg_output))
-                                if "Try again later" not in reg_output:
-                                    break
-                                logger.warning("Watchdog: register blocked, retrying in 30s")
-                                time.sleep(30)
-
-                            # Verify registration
+                                logger.info("Watchdog: register complete (output length: %d)", len(reg_output))
+                            if "Try again later" not in reg_output:
+                                break
+                            logger.warning("Watchdog: register blocked, retrying in 30s")
                             time.sleep(30)
-                            with ClishSession(host, "admin", private_key, port=port) as session:
-                                banner = session.connect(timeout=30)
-                            if "Status: Registered" not in banner:
-                                logger.warning("Watchdog: %s registration not confirmed yet", instance_id)
-                                results.append({"instance": instance_id, "action": "registering"})
-                                continue
 
-                            logger.info("Watchdog: %s registered successfully", instance_id)
+                        # Verify registration
+                        time.sleep(30)
+                        with ClishSession(host, "admin", private_key, port=port) as session:
+                            banner = session.connect(timeout=30)
+                        if "Status: Registered" not in banner:
+                            logger.warning("Watchdog: %s registration not confirmed yet", instance_id)
+                            results.append({"instance": instance_id, "action": "registering"})
+                            continue
 
-                        # Tag as registered
-                        ec2 = boto3.client("ec2", region_name=region)
-                        ec2.create_tags(Resources=[instance_id], Tags=[
-                            {"Key": "appliance-v1fs:registered", "Value": "true"},
-                        ])
-                    except Exception:
-                        logger.warning("Watchdog: registration failed for %s", instance_id, exc_info=True)
-                        results.append({"instance": instance_id, "action": "registration_failed"})
-                        continue
+                        logger.info("Watchdog: %s registered successfully", instance_id)
 
-                # Check if scanner pod is running via admin clish
-                with ClishSession(host, "admin", private_key, port=port) as session:
-                    session.connect(timeout=30)
-                    session.send_command("enable", expect="# ", timeout=15)
-                    plat_output = session.send_command(
-                        "configure verify plat",
-                        expect="# ", timeout=60,
-                    )
-
-                scanner_running = "sg-sfs-scanner" in plat_output and "Running" in plat_output
-
-                if not scanner_running:
-                    logger.info("Watchdog: %s — scanner pod not running yet", instance_id)
-                    results.append({"instance": instance_id, "action": "waiting"})
-                    continue
-
-                # Re-apply customizations and check version via sgowner
-                client = _get_sgowner_session(tunnel, private_key, rsa_key, pubkey_b64)
-                _patch_nginx_body_size(client)
-                _set_scan_cache(client)
-                current_version = _get_scanner_version(client)
-
-                # Complete provisioning for SGs that have the scanner pod but
-                # were never fully provisioned (e.g., File Security was installed
-                # manually via the Vision One console after the provisioner timed out)
-                if inst_info["provisioned"] != "true":
-                    logger.info("Watchdog: completing provisioning for %s (%s)",
-                                instance_id, inst_info["hostname"])
-                    _scale_replicas(client, EXPECTED_REPLICAS)
-                    cert_pem = _extract_cert(client)
-                    if cert_pem:
-                        _store_cert(cert_secret_name, cert_pem, region)
-                    ssm.put_parameter(
-                        Name=param_name, Value=current_version,
-                        Type="String", Overwrite=True,
-                    )
+                    # Tag as registered
                     ec2 = boto3.client("ec2", region_name=region)
                     ec2.create_tags(Resources=[instance_id], Tags=[
-                        {"Key": "appliance-v1fs:provisioned", "Value": "true"},
+                        {"Key": "appliance-v1fs:registered", "Value": "true"},
                     ])
-                    results.append({"instance": instance_id, "action": "provisioned"})
-                    logger.info("Watchdog: %s (%s) now fully provisioned",
-                                instance_id, inst_info["hostname"])
-                elif current_version != stored:
-                    logger.info(
-                        "Watchdog: version changed on %s: %s -> %s",
-                        instance_id, stored or "(none)", current_version,
-                    )
-                    cert_pem = _extract_cert(client)
-                    if cert_pem:
-                        _store_cert(cert_secret_name, cert_pem, region)
-                        logger.info("Watchdog: CA cert re-extracted from %s", instance_id)
-                    ssm.put_parameter(
-                        Name=param_name,
-                        Value=current_version,
-                        Type="String",
-                        Overwrite=True,
-                    )
-                    results.append({
-                        "instance": instance_id,
-                        "action": "updated",
-                        "oldVersion": stored,
-                        "newVersion": current_version,
-                    })
-                else:
-                    logger.info("Watchdog: %s unchanged (%s)", instance_id, current_version)
-                    results.append({"instance": instance_id, "action": "unchanged"})
+                except Exception:
+                    logger.warning("Watchdog: registration failed for %s", instance_id, exc_info=True)
+                    results.append({"instance": instance_id, "action": "registration_failed"})
+                    continue
 
-                client.close()
+            # Check if scanner pod is running via admin clish
+            with ClishSession(host, "admin", private_key, port=port) as session:
+                session.connect(timeout=30)
+                session.send_command("enable", expect="# ", timeout=15)
+                plat_output = session.send_command(
+                    "configure verify plat",
+                    expect="# ", timeout=60,
+                )
+
+            scanner_running = "sg-sfs-scanner" in plat_output and "Running" in plat_output
+
+            if not scanner_running:
+                logger.info("Watchdog: %s — scanner pod not running yet", instance_id)
+                results.append({"instance": instance_id, "action": "waiting"})
+                continue
+
+            # Re-apply customizations and check version via sgowner
+            client = _get_sgowner_session(host, port, private_key, rsa_key, pubkey_b64)
+            _patch_nginx_body_size(client)
+            _set_scan_cache(client)
+            current_version = _get_scanner_version(client)
+
+            # Complete provisioning for SGs that have the scanner pod but
+            # were never fully provisioned (e.g., File Security was installed
+            # manually via the Vision One console after the provisioner timed out)
+            if inst_info["provisioned"] != "true":
+                logger.info("Watchdog: completing provisioning for %s (%s)",
+                            instance_id, inst_info["hostname"])
+                _scale_replicas(client, EXPECTED_REPLICAS)
+                cert_pem = _extract_cert(client)
+                if cert_pem:
+                    _store_cert(cert_secret_name, cert_pem, region)
+                ssm.put_parameter(
+                    Name=param_name, Value=current_version,
+                    Type="String", Overwrite=True,
+                )
+                ec2 = boto3.client("ec2", region_name=region)
+                ec2.create_tags(Resources=[instance_id], Tags=[
+                    {"Key": "appliance-v1fs:provisioned", "Value": "true"},
+                ])
+                results.append({"instance": instance_id, "action": "provisioned"})
+                logger.info("Watchdog: %s (%s) now fully provisioned",
+                            instance_id, inst_info["hostname"])
+            elif current_version != stored:
+                logger.info(
+                    "Watchdog: version changed on %s: %s -> %s",
+                    instance_id, stored or "(none)", current_version,
+                )
+                cert_pem = _extract_cert(client)
+                if cert_pem:
+                    _store_cert(cert_secret_name, cert_pem, region)
+                    logger.info("Watchdog: CA cert re-extracted from %s", instance_id)
+                ssm.put_parameter(
+                    Name=param_name,
+                    Value=current_version,
+                    Type="String",
+                    Overwrite=True,
+                )
+                results.append({
+                    "instance": instance_id,
+                    "action": "updated",
+                    "oldVersion": stored,
+                    "newVersion": current_version,
+                })
+            else:
+                logger.info("Watchdog: %s unchanged (%s)", instance_id, current_version)
+                results.append({"instance": instance_id, "action": "unchanged"})
+
+            client.close()
         except Exception:
             logger.exception("Watchdog: failed checking %s", instance_id)
             results.append({"instance": instance_id, "action": "error"})

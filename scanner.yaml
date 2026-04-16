@@ -39,12 +39,36 @@ Mappings:
       AMI: ami-0bcbbe1b09927f3d7
 
 Parameters:
-  PrimaryAZ:
-    Description: Availability Zone 1
+  AZ1:
+    Description: Availability Zone for Service Gateway 1
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1a
-  SecondaryAZ:
-    Description: Availability Zone 2
+  AZ2:
+    Description: Availability Zone for Service Gateway 2 (used when ServiceGatewayCount >= 2)
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1b
+  AZ3:
+    Description: Availability Zone for Service Gateway 3 (used when ServiceGatewayCount >= 3)
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1c
+  AZ4:
+    Description: Availability Zone for Service Gateway 4 (used when ServiceGatewayCount >= 4)
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1d
+  AZ5:
+    Description: Availability Zone for Service Gateway 5 (used when ServiceGatewayCount >= 5)
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1e
+  AZ6:
+    Description: Availability Zone for Service Gateway 6 (used when ServiceGatewayCount >= 6)
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1f
+  AZ7:
+    Description: Availability Zone for Service Gateway 7 (used when ServiceGatewayCount >= 7). Must be a valid AZ — update default for your region.
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+  AZ8:
+    Description: Availability Zone for Service Gateway 8 (used when ServiceGatewayCount = 8). Must be a valid AZ — update default for your region.
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1b
   ServiceGatewayHostname:
@@ -52,7 +76,7 @@ Parameters:
     Type: String
     Default: FSVA-AWS
   ServiceGatewayCount:
-    Description: Number of Service Gateways to run
+    Description: Number of Service Gateways to run. One SG is deployed per AZ (AZ1..AZN).
     Type: Number
     Default: 6
     MinValue: 1
@@ -95,9 +119,34 @@ Parameters:
     Type: String
     Default: ""
   ExistingPrivateSubnet2Id:
-    Description: Existing private subnet in AZ2. Required if ExistingVPCId is set.
+    Description: Existing private subnet in AZ2. Required if ExistingVPCId is set and ServiceGatewayCount >= 2.
     Type: String
     Default: ""
+  ExistingPrivateSubnet3Id:
+    Description: Existing private subnet in AZ3. Required if ExistingVPCId is set and ServiceGatewayCount >= 3.
+    Type: String
+    Default: ""
+  ExistingPrivateSubnet4Id:
+    Description: Existing private subnet in AZ4. Required if ExistingVPCId is set and ServiceGatewayCount >= 4.
+    Type: String
+    Default: ""
+  ExistingPrivateSubnet5Id:
+    Description: Existing private subnet in AZ5. Required if ExistingVPCId is set and ServiceGatewayCount >= 5.
+    Type: String
+    Default: ""
+  ExistingPrivateSubnet6Id:
+    Description: Existing private subnet in AZ6. Required if ExistingVPCId is set and ServiceGatewayCount >= 6.
+    Type: String
+    Default: ""
+  ExistingPrivateSubnet7Id:
+    Description: Existing private subnet in AZ7. Required if ExistingVPCId is set and ServiceGatewayCount >= 7.
+    Type: String
+    Default: ""
+  ExistingPrivateSubnet8Id:
+    Description: Existing private subnet in AZ8. Required if ExistingVPCId is set and ServiceGatewayCount = 8.
+    Type: String
+    Default: ""
+
 Conditions:
   CreateNetworking: !Equals [!Ref ExistingVPCId, ""]
   CreateSG2: !Not [!Equals [!Ref ServiceGatewayCount, "1"]]
@@ -127,6 +176,31 @@ Conditions:
     - !Not [!Equals [!Ref ServiceGatewayCount, "5"]]
     - !Not [!Equals [!Ref ServiceGatewayCount, "6"]]
   CreateSG8: !Equals [!Ref ServiceGatewayCount, "8"]
+  # Per-AZ subnet conditions (CreateNetworking AND CreateSGN)
+  CreateSubnet3:
+    Fn::And:
+      - Condition: CreateNetworking
+      - Condition: CreateSG3
+  CreateSubnet4:
+    Fn::And:
+      - Condition: CreateNetworking
+      - Condition: CreateSG4
+  CreateSubnet5:
+    Fn::And:
+      - Condition: CreateNetworking
+      - Condition: CreateSG5
+  CreateSubnet6:
+    Fn::And:
+      - Condition: CreateNetworking
+      - Condition: CreateSG6
+  CreateSubnet7:
+    Fn::And:
+      - Condition: CreateNetworking
+      - Condition: CreateSG7
+  CreateSubnet8:
+    Fn::And:
+      - Condition: CreateNetworking
+      - Condition: CreateSG8
 
 Resources:
   # ── VPC ──────────────────────────────────────────────────────────────
@@ -166,7 +240,7 @@ Resources:
       CidrBlock: 10.2.0.0/22
       MapPublicIpOnLaunch: true
       VpcId: !Ref BaseVPC
-      AvailabilityZone: !Ref PrimaryAZ
+      AvailabilityZone: !Ref AZ1
       Tags:
         - Key: Name
           Value: !Sub PublicSubnet1-${AWS::StackName}
@@ -178,10 +252,82 @@ Resources:
       CidrBlock: 10.2.4.0/22
       MapPublicIpOnLaunch: true
       VpcId: !Ref BaseVPC
-      AvailabilityZone: !Ref SecondaryAZ
+      AvailabilityZone: !Ref AZ2
       Tags:
         - Key: Name
           Value: !Sub PublicSubnet2-${AWS::StackName}
+
+  PublicSubnet3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.8.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ3
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet3-${AWS::StackName}
+
+  PublicSubnet4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.9.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ4
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet4-${AWS::StackName}
+
+  PublicSubnet5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.10.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ5
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet5-${AWS::StackName}
+
+  PublicSubnet6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.11.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ6
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet6-${AWS::StackName}
+
+  PublicSubnet7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.12.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ7
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet7-${AWS::StackName}
+
+  PublicSubnet8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.13.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ8
+      Tags:
+        - Key: Name
+          Value: !Sub PublicSubnet8-${AWS::StackName}
 
   # ── Private Subnets ─────────────────────────────────────────────────
   PrivateSubnet1:
@@ -191,7 +337,7 @@ Resources:
       CidrBlock: 10.2.32.0/20
       MapPublicIpOnLaunch: false
       VpcId: !Ref BaseVPC
-      AvailabilityZone: !Ref PrimaryAZ
+      AvailabilityZone: !Ref AZ1
       Tags:
         - Key: Name
           Value: !Sub PrivateSubnet1-${AWS::StackName}
@@ -203,10 +349,82 @@ Resources:
       CidrBlock: 10.2.48.0/20
       MapPublicIpOnLaunch: false
       VpcId: !Ref BaseVPC
-      AvailabilityZone: !Ref SecondaryAZ
+      AvailabilityZone: !Ref AZ2
       Tags:
         - Key: Name
           Value: !Sub PrivateSubnet2-${AWS::StackName}
+
+  PrivateSubnet3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.64.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ3
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet3-${AWS::StackName}
+
+  PrivateSubnet4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.80.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ4
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet4-${AWS::StackName}
+
+  PrivateSubnet5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.96.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ5
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet5-${AWS::StackName}
+
+  PrivateSubnet6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.112.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ6
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet6-${AWS::StackName}
+
+  PrivateSubnet7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.128.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ7
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet7-${AWS::StackName}
+
+  PrivateSubnet8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.2.144.0/20
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref BaseVPC
+      AvailabilityZone: !Ref AZ8
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateSubnet8-${AWS::StackName}
 
   # ── NAT Gateway EIPs ────────────────────────────────────────────────
   NGWEIP1:
@@ -228,6 +446,66 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub NGWEIP2-${AWS::StackName}
+
+  NGWEIP3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP3-${AWS::StackName}
+
+  NGWEIP4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP4-${AWS::StackName}
+
+  NGWEIP5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP5-${AWS::StackName}
+
+  NGWEIP6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP6-${AWS::StackName}
+
+  NGWEIP7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP7-${AWS::StackName}
+
+  NGWEIP8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::EIP
+    DependsOn: VPCIG
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub NGWEIP8-${AWS::StackName}
 
   # ── NAT Gateways ────────────────────────────────────────────────────
   NGW1:
@@ -251,6 +529,72 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub NGW2-${AWS::StackName}
+
+  NGW3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP3.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet3
+      Tags:
+        - Key: Name
+          Value: !Sub NGW3-${AWS::StackName}
+
+  NGW4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP4.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet4
+      Tags:
+        - Key: Name
+          Value: !Sub NGW4-${AWS::StackName}
+
+  NGW5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP5.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet5
+      Tags:
+        - Key: Name
+          Value: !Sub NGW5-${AWS::StackName}
+
+  NGW6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP6.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet6
+      Tags:
+        - Key: Name
+          Value: !Sub NGW6-${AWS::StackName}
+
+  NGW7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP7.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet7
+      Tags:
+        - Key: Name
+          Value: !Sub NGW7-${AWS::StackName}
+
+  NGW8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NGWEIP8.AllocationId
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnet8
+      Tags:
+        - Key: Name
+          Value: !Sub NGW8-${AWS::StackName}
 
   # ── Public Route Tables ─────────────────────────────────────────────
   PublicRT1:
@@ -289,6 +633,114 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref IG
 
+  PublicRT3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT3-${AWS::StackName}
+
+  PublicRoute3:
+    Condition: CreateSubnet3
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT3
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  PublicRT4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT4-${AWS::StackName}
+
+  PublicRoute4:
+    Condition: CreateSubnet4
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT4
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  PublicRT5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT5-${AWS::StackName}
+
+  PublicRoute5:
+    Condition: CreateSubnet5
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT5
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  PublicRT6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT6-${AWS::StackName}
+
+  PublicRoute6:
+    Condition: CreateSubnet6
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT6
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  PublicRT7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT7-${AWS::StackName}
+
+  PublicRoute7:
+    Condition: CreateSubnet7
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT7
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
+  PublicRT8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PublicRT8-${AWS::StackName}
+
+  PublicRoute8:
+    Condition: CreateSubnet8
+    DependsOn: VPCIG
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT8
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IG
+
   # ── Private Route Tables ────────────────────────────────────────────
   PrivateRT1:
     Condition: CreateNetworking
@@ -324,6 +776,108 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NGW2
 
+  PrivateRT3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT3-${AWS::StackName}
+
+  PrivateRoute3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT3
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW3
+
+  PrivateRT4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT4-${AWS::StackName}
+
+  PrivateRoute4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT4
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW4
+
+  PrivateRT5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT5-${AWS::StackName}
+
+  PrivateRoute5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT5
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW5
+
+  PrivateRT6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT6-${AWS::StackName}
+
+  PrivateRoute6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT6
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW6
+
+  PrivateRT7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT7-${AWS::StackName}
+
+  PrivateRoute7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT7
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW7
+
+  PrivateRT8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BaseVPC
+      Tags:
+        - Key: Name
+          Value: !Sub PrivateRT8-${AWS::StackName}
+
+  PrivateRoute8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRT8
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NGW8
+
   # ── Route Table Associations ────────────────────────────────────────
   PublicSubnetRT1:
     Condition: CreateNetworking
@@ -339,6 +893,48 @@ Resources:
       RouteTableId: !Ref PublicRT2
       SubnetId: !Ref PublicSubnet2
 
+  PublicSubnetRT3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT3
+      SubnetId: !Ref PublicSubnet3
+
+  PublicSubnetRT4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT4
+      SubnetId: !Ref PublicSubnet4
+
+  PublicSubnetRT5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT5
+      SubnetId: !Ref PublicSubnet5
+
+  PublicSubnetRT6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT6
+      SubnetId: !Ref PublicSubnet6
+
+  PublicSubnetRT7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT7
+      SubnetId: !Ref PublicSubnet7
+
+  PublicSubnetRT8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT8
+      SubnetId: !Ref PublicSubnet8
+
   PrivateSubnetRT1:
     Condition: CreateNetworking
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -352,6 +948,48 @@ Resources:
     Properties:
       RouteTableId: !Ref PrivateRT2
       SubnetId: !Ref PrivateSubnet2
+
+  PrivateSubnetRT3:
+    Condition: CreateSubnet3
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT3
+      SubnetId: !Ref PrivateSubnet3
+
+  PrivateSubnetRT4:
+    Condition: CreateSubnet4
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT4
+      SubnetId: !Ref PrivateSubnet4
+
+  PrivateSubnetRT5:
+    Condition: CreateSubnet5
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT5
+      SubnetId: !Ref PrivateSubnet5
+
+  PrivateSubnetRT6:
+    Condition: CreateSubnet6
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT6
+      SubnetId: !Ref PrivateSubnet6
+
+  PrivateSubnetRT7:
+    Condition: CreateSubnet7
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT7
+      SubnetId: !Ref PrivateSubnet7
+
+  PrivateSubnetRT8:
+    Condition: CreateSubnet8
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRT8
+      SubnetId: !Ref PrivateSubnet8
 
   # ── VPC Flow Logs ──────────────────────────────────────────────────
   FlowLogGroup:
@@ -413,6 +1051,12 @@ Resources:
       RouteTableIds:
         - !Ref PrivateRT1
         - !Ref PrivateRT2
+        - !If [CreateSG3, !Ref PrivateRT3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateRT4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateRT5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateRT6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateRT7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateRT8, !Ref AWS::NoValue]
 
   # ── Interface VPC Endpoints (keep AWS API traffic off the internet) ─
   VPCEndpointSecGroup:
@@ -442,6 +1086,12 @@ Resources:
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
+        - !If [CreateSG3, !Ref PrivateSubnet3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateSubnet4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateSubnet5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateSubnet6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateSubnet7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateSubnet8, !Ref AWS::NoValue]
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
@@ -456,6 +1106,12 @@ Resources:
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
+        - !If [CreateSG3, !Ref PrivateSubnet3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateSubnet4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateSubnet5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateSubnet6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateSubnet7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateSubnet8, !Ref AWS::NoValue]
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
@@ -470,6 +1126,12 @@ Resources:
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
+        - !If [CreateSG3, !Ref PrivateSubnet3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateSubnet4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateSubnet5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateSubnet6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateSubnet7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateSubnet8, !Ref AWS::NoValue]
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
@@ -484,6 +1146,12 @@ Resources:
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
+        - !If [CreateSG3, !Ref PrivateSubnet3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateSubnet4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateSubnet5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateSubnet6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateSubnet7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateSubnet8, !Ref AWS::NoValue]
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
@@ -498,6 +1166,12 @@ Resources:
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
+        - !If [CreateSG3, !Ref PrivateSubnet3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateSubnet4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateSubnet5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateSubnet6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateSubnet7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateSubnet8, !Ref AWS::NoValue]
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
@@ -512,6 +1186,12 @@ Resources:
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
+        - !If [CreateSG3, !Ref PrivateSubnet3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateSubnet4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateSubnet5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateSubnet6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateSubnet7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateSubnet8, !Ref AWS::NoValue]
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
@@ -526,6 +1206,12 @@ Resources:
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
+        - !If [CreateSG3, !Ref PrivateSubnet3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateSubnet4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateSubnet5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateSubnet6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateSubnet7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateSubnet8, !Ref AWS::NoValue]
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
@@ -540,6 +1226,12 @@ Resources:
       SubnetIds:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
+        - !If [CreateSG3, !Ref PrivateSubnet3, !Ref AWS::NoValue]
+        - !If [CreateSG4, !Ref PrivateSubnet4, !Ref AWS::NoValue]
+        - !If [CreateSG5, !Ref PrivateSubnet5, !Ref AWS::NoValue]
+        - !If [CreateSG6, !Ref PrivateSubnet6, !Ref AWS::NoValue]
+        - !If [CreateSG7, !Ref PrivateSubnet7, !Ref AWS::NoValue]
+        - !If [CreateSG8, !Ref PrivateSubnet8, !Ref AWS::NoValue]
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
@@ -553,7 +1245,7 @@ Resources:
         - Key: Name
           Value: !Sub ServiceGatewayKeyPair-${AWS::StackName}
 
-  # ── Service Gateway ────────────────────────────────────────────────
+  # ── Service Gateway Security Group ───────────────────────────────────
   ServiceGatewaySecGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -585,7 +1277,7 @@ Resources:
         - Key: Name
           Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
 
-  # ── Service Gateway ──────────────────────────────────────────────
+  # ── Service Gateway IAM ───────────────────────────────────────────────
   ServiceGatewayRole:
     Type: AWS::IAM::Role
     Properties:
@@ -632,7 +1324,7 @@ Resources:
               - Key: appliance-v1fs:stack
                 Value: !Ref "AWS::StackName"
 
-  # ── Service Gateway Instances (fixed fleet) ──────────────────────
+  # ── Service Gateway Instances (one per AZ) ──────────────────────────
   ServiceGateway01:
     Type: AWS::EC2::Instance
     DependsOn: WatchdogPermission
@@ -666,7 +1358,7 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet3, !Ref ExistingPrivateSubnet3Id]
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-03
@@ -679,7 +1371,7 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet4, !Ref ExistingPrivateSubnet4Id]
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-04
@@ -692,7 +1384,7 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet5, !Ref ExistingPrivateSubnet5Id]
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-05
@@ -705,7 +1397,7 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet6, !Ref ExistingPrivateSubnet6Id]
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-06
@@ -718,7 +1410,7 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet7, !Ref ExistingPrivateSubnet7Id]
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-07
@@ -731,7 +1423,7 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref ServiceGatewayLaunchTemplate
         Version: !GetAtt ServiceGatewayLaunchTemplate.LatestVersionNumber
-      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+      SubnetId: !If [CreateNetworking, !Ref PrivateSubnet8, !Ref ExistingPrivateSubnet8Id]
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-08
@@ -1064,13 +1756,8 @@ Resources:
                   - secretsmanager:PutSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
               - Effect: Allow
-                Action:
-                  - ec2:DescribeInstances
-                  - ec2:DescribeInstanceConnectEndpoints
+                Action: ec2:DescribeInstances
                 Resource: "*"
-              - Effect: Allow
-                Action: ec2-instance-connect:OpenTunnel
-                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance-connect-endpoint/${EICEndpoint}"
               - Effect: Allow
                 Action: ec2:CreateTags
                 Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance:*"
@@ -1085,9 +1772,7 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
-              - Effect: Allow
-                Action: s3:GetObject
-                Resource: !Sub "arn:aws:s3:::${ScannerDeployBucket}/awscli-runtime.zip"
+
   ProvisionerLambda:
     Type: AWS::Lambda::Function
     DependsOn: ScannerCodeBuild
@@ -1105,11 +1790,16 @@ Resources:
       MemorySize: 256
       TracingConfig:
         Mode: Active
+      VpcConfig:
+        SubnetIds:
+          - !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+          - !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+        SecurityGroupIds:
+          - !Ref ProvisionerLambdaSecGroup
       Environment:
         Variables:
           SG_TAG_KEY: "appliance-v1fs:stack"
           SG_TAG_VALUE: !Ref "AWS::StackName"
-          EICE_ENDPOINT_ID: !Ref EICEndpoint
           KEY_PAIR_ID: !GetAtt ServiceGatewayKeyPair.KeyPairId
           CERT_SECRET_NAME: appliance-v1fs/sg-ca-cert
           REGISTRATION_TOKEN_SECRET: appliance-v1fs/sg-registration-token
@@ -1138,7 +1828,28 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt WatchdogSchedule.Arn
 
-  # ── EC2 Instance Connect Endpoint ──────────────────────────────────
+  # ── Provisioner Lambda Security Group ─────────────────────────────
+  ProvisionerLambdaSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
+      GroupDescription: Provisioner Lambda - outbound SSH to Service Gateways and HTTPS to VPC endpoints
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.2.0.0/16
+          Description: SSH to Service Gateway instances
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.2.0.0/16
+          Description: HTTPS to VPC endpoints (Secrets Manager, SSM, EC2)
+      Tags:
+        - Key: Name
+          Value: !Sub ProvisionerLambdaSG-${AWS::StackName}
+
+  # ── EC2 Instance Connect Endpoint (manual ops SSH access) ──────────
   EICSecGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -1185,15 +1896,51 @@ Outputs:
     Export:
       Name: !Sub ${AWS::StackName}-VPCId
   PrivateSubnet1Id:
-    Description: Private subnet 1
+    Description: Private subnet in AZ1
     Value: !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
     Export:
       Name: !Sub ${AWS::StackName}-PrivateSubnet1Id
   PrivateSubnet2Id:
-    Description: Private subnet 2
+    Description: Private subnet in AZ2
     Value: !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
     Export:
       Name: !Sub ${AWS::StackName}-PrivateSubnet2Id
+  PrivateSubnet3Id:
+    Condition: CreateSG3
+    Description: Private subnet in AZ3
+    Value: !If [CreateNetworking, !Ref PrivateSubnet3, !Ref ExistingPrivateSubnet3Id]
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet3Id
+  PrivateSubnet4Id:
+    Condition: CreateSG4
+    Description: Private subnet in AZ4
+    Value: !If [CreateNetworking, !Ref PrivateSubnet4, !Ref ExistingPrivateSubnet4Id]
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet4Id
+  PrivateSubnet5Id:
+    Condition: CreateSG5
+    Description: Private subnet in AZ5
+    Value: !If [CreateNetworking, !Ref PrivateSubnet5, !Ref ExistingPrivateSubnet5Id]
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet5Id
+  PrivateSubnet6Id:
+    Condition: CreateSG6
+    Description: Private subnet in AZ6
+    Value: !If [CreateNetworking, !Ref PrivateSubnet6, !Ref ExistingPrivateSubnet6Id]
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet6Id
+  PrivateSubnet7Id:
+    Condition: CreateSG7
+    Description: Private subnet in AZ7
+    Value: !If [CreateNetworking, !Ref PrivateSubnet7, !Ref ExistingPrivateSubnet7Id]
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet7Id
+  PrivateSubnet8Id:
+    Condition: CreateSG8
+    Description: Private subnet in AZ8
+    Value: !If [CreateNetworking, !Ref PrivateSubnet8, !Ref ExistingPrivateSubnet8Id]
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet8Id
   ServiceGatewaySecGroupId:
     Description: Service Gateway security group ID
     Value: !Ref ServiceGatewaySecGroup

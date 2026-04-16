@@ -11,17 +11,6 @@ phases:
       - ls -lh /tmp/provisioner-layer.zip
       - aws s3 cp /tmp/provisioner-layer.zip s3://$DEPLOY_BUCKET/provisioner-layer.zip
 
-      # ── AWS CLI v2 binary (stored on S3, downloaded to /tmp at runtime) ──
-      - curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
-      - cd /tmp && unzip -q awscli.zip && ./aws/install --install-dir /tmp/awscli-dist --bin-dir /tmp/awscli-bin
-      # Zip just the versioned dist dir (the actual PyInstaller binary + libs)
-      - |
-        VERSION=$(ls /tmp/awscli-dist/v2/ | grep -v current | head -1)
-        echo "AWS CLI version: $VERSION"
-        cd /tmp/awscli-dist/v2/$VERSION && zip -r /tmp/awscli-runtime.zip dist/
-        ls -lh /tmp/awscli-runtime.zip
-      - aws s3 cp /tmp/awscli-runtime.zip s3://$DEPLOY_BUCKET/awscli-runtime.zip
-
       # ── Provisioner Lambda code ───────────────────────────────────
-      - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py ssh_helper.py eice_tunnel.py
+      - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py ssh_helper.py
       - aws s3 cp /tmp/provisioner-code.zip s3://$DEPLOY_BUCKET/provisioner-code.zip
