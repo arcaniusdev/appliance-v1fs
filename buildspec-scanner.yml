@@ -3,14 +3,6 @@ version: 0.2
 phases:
   build:
     commands:
-      # ── Provisioner Lambda layer (paramiko only) ──────────────────
-      - cd $CODEBUILD_SRC_DIR
-      - mkdir -p /tmp/prov-layer/python
-      - "pip install -r lambda/provisioner/requirements.txt -t /tmp/prov-layer/python --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 --implementation cp"
-      - cd /tmp/prov-layer && zip -r /tmp/provisioner-layer.zip python/
-      - ls -lh /tmp/provisioner-layer.zip
-      - aws s3 cp /tmp/provisioner-layer.zip s3://$DEPLOY_BUCKET/provisioner-layer.zip
-
       # ── Provisioner Lambda code ───────────────────────────────────
-      - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py ssh_helper.py
+      - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py
       - aws s3 cp /tmp/provisioner-code.zip s3://$DEPLOY_BUCKET/provisioner-code.zip
