@@ -89,7 +89,7 @@
     <text x="815" y="189" text-anchor="middle" font-size="10.5" fill="#545B64">"the watchdog" (§5)</text>
     <text x="815" y="205" text-anchor="middle" font-size="10.5" fill="#545B64">EventBridge rule · rate(15 min)</text>
     <path d="M 700 187 L 668 187 L 668 435 L 629 435" fill="none" stroke="#0073BB" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrA)"/>
-    <text x="663" y="330" text-anchor="end" font-size="10" font-weight="600" fill="#0073BB" transform="rotate(-90 663 330)">SSM RunCommand (root)</text>
+    <text x="663" y="330" text-anchor="end" font-size="10" font-weight="600" fill="#0073BB" transform="rotate(-90 663 330)">SSH: admin + sgowner (root)</text>
 
     <rect x="700" y="252" width="230" height="66" rx="6" fill="#fff" stroke="#0073BB" stroke-width="1.5"/>
     <text x="815" y="274" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">Secrets Manager</text>
@@ -110,7 +110,7 @@
 
     <rect x="700" y="536" width="230" height="60" rx="6" fill="#fff" stroke="#545B64" stroke-width="1.5" stroke-dasharray="5 4"/>
     <text x="815" y="558" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">AWS Systems Manager</text>
-    <text x="815" y="575" text-anchor="middle" font-size="10.5" fill="#545B64">RunCommand · Session Manager (§12)</text>
+    <text x="815" y="575" text-anchor="middle" font-size="10.5" fill="#545B64">Session Manager · Parameter Store</text>
 
     <!-- Legend -->
     <rect x="50" y="692" width="16" height="16" rx="3" fill="#fff" stroke="#0073BB" stroke-width="1.8"/>

@@ -8,7 +8,7 @@ Everything needed to evaluate Vision One File Security on Service Gateway virtua
 |---|---|
 | **Part I — Deploy** | [1. What you're evaluating](#1-what-youre-evaluating) · [2. Vision One setup](#2-vision-one-setup) · [3. AWS setup](#3-aws-setup) · [4. Deploy the scanner stack](#4-deploy-the-scanner-stack) · [5. Meet the watchdog](#5-meet-the-watchdog) · [6. Install File Security](#6-install-file-security) · [7. Deploy the worker stack](#7-deploy-the-worker-stack) |
 | **Part II — Verify & Integrate** | [8. Prove it works](#8-prove-it-works) · [9. Success criteria](#9-success-criteria) · [10. Scan from your own code (Java)](#10-scan-from-your-own-code-java) |
-| **Part III — Under the Hood** | [11. Inside the scanner application](#11-inside-the-scanner-application) · [12. SSM instead of SSH](#12-ssm-instead-of-ssh) · [13. Drift from the default deployment](#13-drift-from-the-default-deployment) · [14. Performance expectations](#14-performance-expectations) |
+| **Part III — Under the Hood** | [11. Inside the scanner application](#11-inside-the-scanner-application) · [12. How the provisioner reaches the appliance](#12-how-the-provisioner-reaches-the-appliance) · [13. Drift from the default deployment](#13-drift-from-the-default-deployment) · [14. Performance expectations](#14-performance-expectations) |
 | **Part IV — Operate & Wrap Up** | [15. Day-to-day operation](#15-day-to-day-operation) · [16. Troubleshooting](#16-troubleshooting) · [17. Teardown](#17-teardown) · [18. Cost](#18-cost) · [19. References](#19-references) |
 
 ---
@@ -47,7 +47,7 @@ You deploy two independent stacks:
 | `scanner.yaml` | Networking | VPC (10.2.0.0/16) · Internet Gateway · 2 public subnets · 2 NAT Gateways + EIPs · up to 8 private subnets (one per appliance) · route tables · VPC Flow Logs (all traffic, 30-day retention). All skipped in existing-VPC mode. |
 | `scanner.yaml` | VPC endpoints | S3 (gateway) + 8 interface endpoints: SSM, SSMMessages, EC2Messages, Secrets Manager, SQS, CloudWatch Logs, STS, EC2 — with their security group |
 | `scanner.yaml` | Appliances | 1–8 Service Gateway EC2 instances (c5.2xlarge default; stock Marketplace AMI; IMDSv2, encrypted EBS, termination protection) · launch template · security group (80/443/22 from the VPC CIDR, egress 443 only) · IAM role + instance profile (`AmazonSSMManagedInstanceCore`) |
-| `scanner.yaml` | Provisioner | Watchdog Lambda (Python 3.12, 256 MB, X-Ray) · IAM role (SSM SendCommand scoped to stack-tagged instances) · EventBridge schedule rate(15 min) |
+| `scanner.yaml` | Provisioner | Watchdog Lambda (Python 3.12, 256 MB, X-Ray) · IAM role (reads the launch key + appliance-v1fs secrets/params, tags its own instances) · in private subnets to SSH the appliances · paramiko layer · EventBridge schedule rate(15 min) |
 | `scanner.yaml` | Build | CodeBuild project (packages the watchdog from GitHub) · deploy bucket · one-shot trigger Lambda |
 | `scanner.yaml` | Secrets | `appliance-v1fs/vision-one-api-key` · `…/sg-registration-token` (from parameters) · `…/sg-ca-cert` (created by the watchdog). Retained on stack deletion. |
 | `worker.yaml` | S3 | Scan bucket (event notifications → SQS) · quarantine bucket — both AES256, HTTPS-only policies, all public access blocked |
@@ -55,7 +55,7 @@ You deploy two independent stacks:
 | `worker.yaml` | Workers | Auto Scaling group (t3.medium ×2–10) + launch template (IMDSv2, encrypted EBS) · SQS-depth step scaling · IAM role (S3 + SQS + Secrets read + audit logs + EC2 discovery) |
 | `worker.yaml` | Observability | CloudWatch dashboard · alarms + SNS topic (KMS-encrypted) · `scan-audit-<stack>` log group |
 
-Worth validating as you go: hands-free appliance provisioning ([§5](#5-meet-the-watchdog)), no SSH keys anywhere ([§12](#12-ssm-instead-of-ssh)), appliances running essentially stock TrendAI software ([§13](#13-drift-from-the-default-deployment)), and linear scaling — add appliances, get throughput ([§14](#14-performance-expectations)).
+Worth validating as you go: hands-free appliance provisioning ([§5](#5-meet-the-watchdog)), appliance access over SSH via the documented root path, VPC-internal only ([§12](#12-how-the-provisioner-reaches-the-appliance)), appliances running essentially stock TrendAI software ([§13](#13-drift-from-the-default-deployment)), and linear scaling — add appliances, get throughput ([§14](#14-performance-expectations)).
 
 ## 2. Vision One setup
 
@@ -160,7 +160,7 @@ Watch these in the CloudFormation **Resources** (or **Events**) tab. The moment 
 
 ## 5. Meet the watchdog
 
-The **watchdog** is a small Lambda (`provisioner-<stack>`) that runs every 15 minutes and owns the entire appliance lifecycle. It's the reason this deployment needs no manual appliance setup: no console sessions, no SSH, no copy-pasting into terminals. If an appliance exists, the watchdog finds it, registers it, configures it, and keeps it configured. (During deployment, the `WaitForRegistration` and `WaitForFileSecurity` gates from [§4](#4-deploy-the-scanner-stack) invoke this same watchdog on a tight loop, so the stack progresses without waiting on the 15-minute schedule.)
+The **watchdog** is a small Lambda (`provisioner-<stack>`) that runs every 15 minutes and owns the entire appliance lifecycle. It's the reason this deployment needs no manual appliance setup: no console sessions, no copy-pasting into terminals. If an appliance exists, the watchdog finds it, registers it, configures it, and keeps it configured. (During deployment, the `WaitForRegistration` and `WaitForFileSecurity` gates from [§4](#4-deploy-the-scanner-stack) invoke this same watchdog on a tight loop, so the stack progresses without waiting on the 15-minute schedule.)
 
 On every pass, for every appliance (found by EC2 tag), it walks this state machine:
 
@@ -185,21 +185,21 @@ aws lambda invoke --function-name provisioner-scanner-1 \
 
 ### What it automates for you
 
-Without the watchdog you would SSH into each appliance and run every one of these by hand — then repeat on every appliance and re-check after each scanner update. Instead the watchdog runs them all through **SSM RunCommand (`AWS-RunShellScript`) as root** — no SSH, no key pair. Each `clish` command runs via a temp script file (`clish -u admin /tmp/.clish_cmds`); `clish` can't be driven by piped stdin.
+Without the watchdog you would SSH into each appliance and run every one of these by hand — then repeat on every appliance and re-check after each scanner update. The watchdog runs them all for you over SSH, using TrendAI's documented root path ([§12](#12-how-the-provisioner-reaches-the-appliance)): as `admin` (the launch key pair) for the clish steps, and as `sgowner` (root) for the shell steps.
 
-| Manual step it replaces | What the watchdog runs (as root, via SSM) | What it does |
-|---|---|---|
-| Set the appliance's OS hostname | `hostnamectl set-hostname FSVA-AWS-NN` | Gives the appliance a stable, identifiable name |
-| Name the endpoint in the CLI | `clish → enable → configure endpoint FSVA-AWS-NN` | Sets the Vision One endpoint name to match the hostname |
-| Register the appliance | `clish → enable → register <token>` (retried up to 3×) | Registers the SG with Vision One using the token from Secrets Manager |
-| Confirm registration succeeded | `clish → show version` (checks `Status: Registered`) | Gates the next steps until the appliance is actually registered |
-| Harden TLS ciphers | `clish → enable → configure nginx-ingress-controller-cipher disable-weak` | Disables weak/legacy TLS ciphers on ports 80/443 |
-| Wait for the scanner to come up | `kubectl get pods --all-namespaces \| grep sg-sfs-scanner` | Detects when File Security's scanner pod is `Running` |
-| Raise the upload size limit | `kubectl -n ingress patch configmap nginx-load-balancer-microk8s-conf --type merge -p '{"data":{"proxy-body-size":"<MaxFileSizeMB>m"}}'` *(only when the live value differs)* | Lets gRPC scan files larger than the 10 MB default |
-| Apply the scan-cache setting | `kubectl set env deployment --all -n sg-sfs-scanner TM_AM_SCAN_CACHE=false` *(only when `ScanCacheEnabled=false`; otherwise the override is removed)* | Honors your parameter; leaves the appliance default untouched otherwise |
-| Extract the TLS CA certificate | `openssl s_client -connect localhost:443 -servername sg.sgi.xdr.trendmicro.com </dev/null \| openssl x509` → stored in Secrets Manager (`appliance-v1fs/sg-ca-cert`) | Captures the appliance's self-signed cert so SDK clients can trust it ([§10](#10-scan-from-your-own-code-java)) |
-| Track the scanner version | `kubectl get pod -n sg-sfs-scanner -o jsonpath='{.items[0].spec.containers[0].image}'` → SSM parameter | Notices TrendAI scanner updates so it can re-extract the cert if it rotates |
-| Record lifecycle state | `aws ec2 create-tags … appliance-v1fs:registered=true` / `…:provisioned=true` | Marks progress; the workers and the deploy gates ([§4](#4-deploy-the-scanner-stack)) read these tags |
+| Manual step it replaces | What the watchdog runs | As | What it does |
+|---|---|---|---|
+| Set the appliance's OS hostname | `hostnamectl set-hostname FSVA-AWS-NN` | sgowner | Gives the appliance a stable, identifiable name |
+| Name the endpoint in the CLI | `configure endpoint FSVA-AWS-NN` | admin clish | Sets the Vision One endpoint name to match the hostname |
+| Register the appliance | `register <token>` (retried up to 3×) | admin clish | Registers the SG with Vision One using the token from Secrets Manager |
+| Confirm registration succeeded | `show version` (checks `Status: Registered`) | admin clish | Gates the next steps until the appliance is actually registered |
+| Harden TLS ciphers | `configure nginx-ingress-controller-cipher disable-weak` | admin clish | Disables weak/legacy TLS ciphers on ports 80/443 |
+| Wait for the scanner to come up | `configure verify plat` (checks for `sg-sfs-scanner … Running`) | admin clish | Detects when File Security's scanner pod is running |
+| Raise the upload size limit | `sudo microk8s kubectl -n ingress patch configmap nginx-load-balancer-microk8s-conf … proxy-body-size=<MaxFileSizeMB>m` *(only when the live value differs)* | sgowner | Lets gRPC scan files larger than the 10 MB default |
+| Apply the scan-cache setting | `sudo microk8s kubectl set env deployment --all -n sg-sfs-scanner TM_AM_SCAN_CACHE=false` *(only when `ScanCacheEnabled=false`; otherwise the override is removed)* | sgowner | Honors your parameter; leaves the appliance default untouched otherwise |
+| Extract the TLS CA certificate | `openssl s_client -connect localhost:443 -servername sg.sgi.xdr.trendmicro.com </dev/null \| openssl x509` → Secrets Manager (`appliance-v1fs/sg-ca-cert`) | sgowner | Captures the appliance's self-signed cert so SDK clients can trust it ([§10](#10-scan-from-your-own-code-java)) |
+| Track the scanner version | `sudo microk8s kubectl get pod -n sg-sfs-scanner -o jsonpath='…image'` → SSM Parameter Store | sgowner | Notices TrendAI scanner updates so it can re-extract the cert if it rotates |
+| Record lifecycle state | `aws ec2 create-tags … appliance-v1fs:registered=true` / `…:provisioned=true` | AWS API | Marks progress; the workers and the deploy gates ([§4](#4-deploy-the-scanner-stack)) read these tags |
 
 Everything above is idempotent and re-checked every 15 minutes, so a scanner update that reverts the upload limit or rotates the certificate is corrected on the next pass without you touching the appliance.
 
@@ -649,38 +649,33 @@ Each design choice replaced something we tested and rejected — the simplicity 
 
 The only business logic is the verdict-routing block inside `_process_file()` — roughly 30 lines covering three outcomes: clean (tag in place), malicious (tag, quarantine, delete), and *not fully scanned* (a decompression limit was hit — tagged `ScanResult=NotFullyScanned` and left in place, never marked Clean; the limit names land in the audit entry). To make the pipeline do something else on any of these, that block is the one place to edit. Discovery, TLS, concurrency, retries, and shutdown all keep working untouched. The module docstring at the top of `app/scanner.py` is the 20-line version of this section.
 
-## 12. SSM instead of SSH
+## 12. How the provisioner reaches the appliance
 
-This deployment contains **no SSH keys at all**. Nothing generates one, nothing stores one, port 22 is never used. All appliance automation — registration, certificate extraction, configuration — runs through **AWS Systems Manager (SSM)**, and so does interactive access when a human needs a shell.
+The provisioner reaches each appliance over **SSH, using TrendAI's documented root path** (KB-0014380). All of it stays inside the VPC — **there is no inbound SSH from the outside world**: appliances have no public IP, and port 22 on the appliance security group is scoped to the VPC CIDR. The provisioner (a Lambda in the private subnets) connects only from within the VPC.
 
-### How it works
+### The two hats
 
-The TrendAI appliance AMI ships with the SSM agent pre-installed. The scanner stack attaches an IAM instance profile that lets the agent check in with the SSM service through a VPC endpoint. From then on:
+| Role | How it authenticates | Used for |
+|---|---|---|
+| **`admin`** (clish) | the EC2 **launch key pair** — CloudFormation stores its private key in SSM Parameter Store at `/ec2/keypair/<id>`, which the Lambda reads | `configure endpoint`, `register`, cipher hardening, `show version`, pod-status checks |
+| **`sgowner`** (root) | a key the provisioner generates each run and authorizes through `admin` clish `configure verify cli support <pubkey>` | `hostnamectl`, `sudo microk8s kubectl` (nginx patch, scan-cache, version), `openssl` cert extraction |
 
-```bash
-# Automation: the watchdog runs commands via SSM RunCommand — no inbound path needed
-# Humans: a shell on any instance, from anywhere your AWS credentials work
-aws ssm start-session --target <instance-id>
-```
+### Why SSH, not the SSM agent
 
-### Easier than SSH
+The earlier design drove these same commands through the SSM agent (`AWS-RunShellScript`). We moved off it because **the Service Gateway firmware self-upgrade removes/disables the pre-installed SSM agent** — after a fresh appliance self-upgrades to the newest firmware, SSM goes `ConnectionLost` and doesn't recover (a reboot doesn't fix it). That stranded post-install provisioning entirely. The SSH root path doesn't have this problem: the `sgowner` key is authorized through the appliance's **own supported clish mechanism**, so it's part of the appliance's managed config and survives the firmware config-sync that wipes the foreign agent.
 
-| With SSH | With SSM |
-|---|---|
-| Generate a key pair, distribute the private key, protect it, rotate it, revoke it when people leave | No keys exist. Access = your normal AWS credentials |
-| Open port 22, maintain a bastion or VPN path into private subnets | No inbound ports; the agent connects outward via a VPC endpoint |
-| Appliance root access is a documented multi-step procedure (generate an RSA key, install it via the appliance CLI, SSH as a special user, `sudo`) | One API call runs the command with the needed privileges |
+An upside of the switch: provisioning now uses TrendAI's **documented** root procedure rather than an agent the appliance doesn't manage — so it's *less* drift from the supported deployment, not more (see [§13](#13-drift-from-the-default-deployment)).
 
-### More secure than SSH
+### Keeping it safe
 
-| Property | Why it matters |
-|---|---|
-| **No long-lived secrets** | SSH private keys are bearer credentials that never expire and travel badly. SSM uses your short-lived, MFA-able IAM session. |
-| **Least privilege, enforced by policy** | The watchdog's permission is scoped to one SSM document (`AWS-RunShellScript`) and only to instances tagged as its own stack. A leaked worker credential can't touch the appliances. |
-| **Every action audited** | Each RunCommand and shell session lands in CloudTrail — who, what, when, on which instance. SSH gives you none of that centrally. |
-| **Smaller attack surface** | No listening SSH daemon exposed beyond the VPC, no port-22 noise, no bastion to harden and patch. |
+- **No internet exposure** — no public IP, port 22 scoped to the VPC CIDR, provisioner connects only from inside the VPC.
+- **Scoped credentials** — the `admin` private key lives in SSM Parameter Store (KMS-encrypted, IAM-scoped); the `sgowner` key is generated per invocation, ed25519, and never stored.
+- **Least privilege** — the provisioner's IAM role can read only `/ec2/keypair/*` and `appliance-v1fs/*`, tag only its own stack's instances, and reach the appliances only on port 22 within the VPC.
 
-Trade-off, stated honestly: SSM commands run as root via AWS's agent rather than through TrendAI's documented SSH procedure — same access level, different (and undocumented) transport. See the drift table below.
+### Interactive access for a human
+
+- **Service Gateway:** SSH to its private IP from inside the VPC (as `admin`, or `sgowner` via the documented key method). If SSH is ever unavailable too, the **EC2 Serial Console** is the out-of-band fallback (no network required).
+- **Workers:** `aws ssm start-session --target <instance-id>` — the worker fleet runs Amazon Linux with a working SSM agent, so Session Manager is the simplest shell there.
 
 ## 13. Drift from the default deployment
 
@@ -688,7 +683,7 @@ This project deliberately stays as close as possible to the deployment TrendAI d
 
 | # | Deviation | Why | Posture |
 |---|---|---|---|
-| 1 | **Automation transport: SSM RunCommand (as root)** instead of interactive SSH; hostname set with `hostnamectl` (docs only cover the CLI `configure endpoint`) | Hands-free provisioning, no key management, full audit trail ([§12](#12-ssm-instead-of-ssh)) | Method drift only — the commands run are the documented ones; TrendAI's own KB provides an equivalent root path via SSH |
+| 1 | **Automated access via SSH** to `admin` clish and `sgowner` root, from a VPC-resident Lambda; hostname set with `hostnamectl` (docs cover the CLI `configure endpoint`, not the OS hostname) | Hands-free provisioning that survives the firmware self-upgrade (which removes the SSM agent) ([§12](#12-how-the-provisioner-reaches-the-appliance)) | Uses TrendAI's **documented** root path (KB-0014380); low drift. VPC-internal only, no inbound SSH from outside |
 | 2 | **nginx upload-limit patch.** The appliance's ingress defaults to 10 MB request bodies, blocking gRPC scans of larger files; the watchdog raises it to `MaxFileSizeMB` — only when the live value differs | Without it, files >10 MB fail to scan, while the product supports far larger files | The one true modification of appliance internals. Self-heals if an update reverts it. Flagged for re-test on current builds — if TrendAI has raised the default, this disappears |
 | 3 | **Scan-cache override — only when disabled.** The appliance default (cache on) is untouched; `ScanCacheEnabled=false` applies an env override for worst-case benchmarking | Honest baseline numbers during testing | No override in normal operation; uses an internal variable when engaged |
 | 4 | **TLS certificate extraction.** The watchdog reads the certificate the appliance serves (`openssl s_client`) into Secrets Manager | Python SDK clients can only trust the appliance via an explicit CA file — there is no "accept the appliance cert" switch in Python (verified by test; Java has one) | Read-only — nothing on the appliance changes. The cert feeds the SDK's documented `ca_cert` input |
@@ -860,8 +855,9 @@ Every public resource that pertains to deploying the File Security Virtual Appli
 | Resource | What it covers |
 |---|---|
 | [AWS Marketplace — TrendAI Service Gateway BYOL](https://aws.amazon.com/marketplace/search/results?searchTerms=TrendAI+Service+Gateway) | The appliance AMI subscription ([§3](#3-aws-setup) prerequisite) |
-| [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html) | Keyless interactive shell access ([§12](#12-ssm-instead-of-ssh)) |
-| [AWS Systems Manager Run Command](https://docs.aws.amazon.com/systems-manager/latest/userguide/run-command.html) | The mechanism behind the watchdog's appliance automation ([§5](#5-meet-the-watchdog), [§12](#12-ssm-instead-of-ssh)) |
+| [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html) | Keyless interactive shell access to the worker fleet ([§12](#12-how-the-provisioner-reaches-the-appliance)) |
+| [How to log in to Service Gateway with root permission (KB-0014380)](https://success.trendmicro.com/en-US/solution/KA-0014380) | The documented root path the provisioner uses over SSH ([§12](#12-how-the-provisioner-reaches-the-appliance)) |
+| [EC2 Serial Console](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-serial-console.html) | Out-of-band appliance access when neither SSH nor SSM is available ([§12](#12-how-the-provisioner-reaches-the-appliance)) |
 | [IAM roles for Amazon EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html) | Instance profiles — how the appliances get SSM access without credentials |
 | [Amazon S3 Event Notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html) | The S3 → SQS trigger that starts every scan |
 
