@@ -2,6 +2,8 @@
 
 CloudFormation-deployed S3 malware scanning built on the TrendAI Vision One File Security Virtual Appliance. Files arriving in an S3 bucket trigger SQS notifications to an EC2 worker fleet that scans them through Service Gateway appliances using the official File Security SDK over gRPC/TLS.
 
+**📘 [The POC Guide](POC-GUIDE.md)** — the complete walkthrough: Vision One account setup, deployment, verification, success criteria, Java SDK integration, architecture, and teardown.
+
 ```
 Scan Bucket → S3 Notification → SQS → EC2 Worker Fleet → gRPC/TLS :443 → Service Gateways
   ├── Clean:     tag ScanResult=Clean, leave in scan bucket

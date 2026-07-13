@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 745" style="width:100%;height:auto;margin:1rem 0 .25rem" font-family="Avenir Next, Avenir, Segoe UI, system-ui, sans-serif" role="img" aria-label="AWS architecture diagram">
+    <rect x="0" y="0" width="960" height="745" fill="#FFFFFF"/>
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#545B64"/>
+      </marker>
+      <marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#0073BB"/>
+      </marker>
+    </defs>
+
+    <!-- External: Vision One -->
+    <rect x="710" y="34" width="220" height="66" rx="8" fill="#fff" stroke="#545B64" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="820" y="60" text-anchor="middle" font-size="14" font-weight="600" fill="#16191F">TrendAI Vision One</text>
+    <text x="820" y="79" text-anchor="middle" font-size="10.5" fill="#545B64">console · registration · pattern updates · telemetry</text>
+
+    <!-- Worker stack: scan bucket, SQS, quarantine -->
+    <rect x="40" y="60" width="170" height="56" rx="6" fill="#fff" stroke="#16191F" stroke-width="1.5"/>
+    <text x="125" y="84" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">S3 scan bucket</text>
+    <text x="125" y="101" text-anchor="middle" font-size="10.5" fill="#545B64">AES256 · HTTPS-only · tags</text>
+
+    <rect x="270" y="60" width="180" height="56" rx="6" fill="#fff" stroke="#16191F" stroke-width="1.5"/>
+    <text x="360" y="84" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">SQS scan queue</text>
+    <text x="360" y="101" text-anchor="middle" font-size="10.5" fill="#545B64">+ DLQ after 5 failures · SSE</text>
+
+    <rect x="40" y="140" width="170" height="52" rx="6" fill="#fff" stroke="#16191F" stroke-width="1.5"/>
+    <text x="125" y="162" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">S3 quarantine bucket</text>
+    <text x="125" y="179" text-anchor="middle" font-size="10.5" fill="#545B64">malicious copies + tags</text>
+
+    <!-- Arrows: bucket → SQS → workers ; workers → quarantine -->
+    <line x1="210" y1="88" x2="266" y2="88" stroke="#545B64" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="238" y="80" text-anchor="middle" font-size="10" fill="#545B64">S3 event</text>
+    <path d="M 360 116 L 360 205 L 195 205 L 195 281" fill="none" stroke="#545B64" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="285" y="199" text-anchor="middle" font-size="10" fill="#545B64">workers long-poll</text>
+    <path d="M 100 281 L 100 196" fill="none" stroke="#545B64" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="96" y="243" text-anchor="end" font-size="10" fill="#545B64">verdicts: tag /</text>
+    <text x="96" y="255" text-anchor="end" font-size="10" fill="#545B64">copy + delete</text>
+
+    <!-- VPC container (scanner stack) -->
+    <rect x="30" y="225" width="630" height="445" rx="10" fill="none" stroke="#0073BB" stroke-width="2"/>
+    <text x="46" y="247" font-size="12" font-weight="600" fill="#0073BB">VPC 10.2.0.0/16 (or your existing VPC) · Flow Logs → CloudWatch</text>
+
+    <!-- Private subnet AZ1 -->
+    <rect x="50" y="258" width="290" height="238" rx="8" fill="#0073BB0A" stroke="#0073BB" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="62" y="277" font-size="11" font-weight="600" fill="#545B64">PRIVATE SUBNET · AZ1</text>
+    <rect x="70" y="285" width="250" height="56" rx="6" fill="#fff" stroke="#16191F" stroke-width="1.5"/>
+    <text x="195" y="308" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">Worker instances</text>
+    <text x="195" y="325" text-anchor="middle" font-size="10.5" fill="#545B64">t3.medium ASG ×2–10 · scanner.py</text>
+    <rect x="70" y="392" width="250" height="86" rx="6" fill="#F1FAFF" stroke="#0073BB" stroke-width="2"/>
+    <text x="195" y="416" text-anchor="middle" font-size="13.5" font-weight="600" fill="#16191F">FSVA-AWS-01 · c5.2xlarge</text>
+    <text x="195" y="434" text-anchor="middle" font-size="10.5" fill="#545B64">Service Gateway appliance (stock AMI)</text>
+    <text x="195" y="449" text-anchor="middle" font-size="10.5" fill="#545B64">MicroK8s · scanner pod: scanner ·</text>
+    <text x="195" y="463" text-anchor="middle" font-size="10.5" fill="#545B64">connector · uploader · redis cache</text>
+    <line x1="195" y1="341" x2="195" y2="388" stroke="#0073BB" stroke-width="1.6" marker-end="url(#arrA)"/>
+    <text x="202" y="368" font-size="10" font-weight="600" fill="#0073BB">gRPC/TLS :443</text>
+
+    <!-- Private subnet AZ2 -->
+    <rect x="355" y="258" width="290" height="238" rx="8" fill="#0073BB0A" stroke="#0073BB" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="367" y="277" font-size="11" font-weight="600" fill="#545B64">PRIVATE SUBNET · AZ2</text>
+    <rect x="375" y="285" width="250" height="56" rx="6" fill="#fff" stroke="#16191F" stroke-width="1.5"/>
+    <text x="500" y="308" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">Worker instances</text>
+    <text x="500" y="325" text-anchor="middle" font-size="10.5" fill="#545B64">same fleet, AZ-balanced</text>
+    <rect x="375" y="392" width="250" height="86" rx="6" fill="#F1FAFF" stroke="#0073BB" stroke-width="2"/>
+    <text x="500" y="416" text-anchor="middle" font-size="13.5" font-weight="600" fill="#16191F">FSVA-AWS-02 · c5.2xlarge</text>
+    <text x="500" y="434" text-anchor="middle" font-size="10.5" fill="#545B64">…up to 8 appliances, alternating</text>
+    <text x="500" y="449" text-anchor="middle" font-size="10.5" fill="#545B64">AZs · IMDSv2 · encrypted EBS ·</text>
+    <text x="500" y="463" text-anchor="middle" font-size="10.5" fill="#545B64">termination protection</text>
+    <line x1="500" y1="341" x2="500" y2="388" stroke="#0073BB" stroke-width="1.6" marker-end="url(#arrA)"/>
+    <text x="507" y="368" font-size="10" font-weight="600" fill="#0073BB">gRPC/TLS :443</text>
+
+    <!-- Public subnets / NAT -->
+    <rect x="50" y="516" width="595" height="54" rx="8" fill="#fff" stroke="#0073BB" stroke-width="1.2"/>
+    <text x="347" y="539" text-anchor="middle" font-size="12.5" font-weight="600" fill="#16191F">Public subnets ×2 — NAT Gateway ×2 (+EIPs) · Internet Gateway</text>
+    <text x="347" y="557" text-anchor="middle" font-size="10.5" fill="#545B64">the appliances' only path out — TCP 443 to Vision One, nothing inbound</text>
+
+    <!-- VPC endpoints -->
+    <rect x="50" y="592" width="595" height="58" rx="8" fill="#fff" stroke="#0073BB" stroke-width="1.2"/>
+    <text x="347" y="615" text-anchor="middle" font-size="12.5" font-weight="600" fill="#16191F">VPC endpoints — all AWS API traffic stays private</text>
+    <text x="347" y="633" text-anchor="middle" font-size="10.5" fill="#545B64">S3 (gateway) · SSM · SSMMessages · EC2Messages · Secrets Manager · SQS · CW Logs · STS · EC2</text>
+
+    <!-- SG → NAT → Vision One -->
+    <line x1="500" y1="478" x2="500" y2="512" stroke="#545B64" stroke-width="1.3" marker-end="url(#arr)"/>
+    <path d="M 645 543 L 680 543 L 680 67 L 706 67" fill="none" stroke="#545B64" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="674" y="300" text-anchor="end" font-size="10" fill="#545B64" transform="rotate(-90 674 300)">outbound 443 only</text>
+
+    <!-- Right column: scanner-stack services -->
+    <rect x="700" y="150" width="230" height="74" rx="6" fill="#fff" stroke="#0073BB" stroke-width="1.5"/>
+    <text x="815" y="172" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">Provisioner Lambda</text>
+    <text x="815" y="189" text-anchor="middle" font-size="10.5" fill="#545B64">"the watchdog" (§5)</text>
+    <text x="815" y="205" text-anchor="middle" font-size="10.5" fill="#545B64">EventBridge rule · rate(15 min)</text>
+    <path d="M 700 187 L 668 187 L 668 435 L 629 435" fill="none" stroke="#0073BB" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrA)"/>
+    <text x="663" y="330" text-anchor="end" font-size="10" font-weight="600" fill="#0073BB" transform="rotate(-90 663 330)">SSM RunCommand (root)</text>
+
+    <rect x="700" y="252" width="230" height="66" rx="6" fill="#fff" stroke="#0073BB" stroke-width="1.5"/>
+    <text x="815" y="274" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">Secrets Manager</text>
+    <text x="815" y="291" text-anchor="middle" font-size="10.5" fill="#545B64">V1 API key · registration token</text>
+    <text x="815" y="306" text-anchor="middle" font-size="10.5" fill="#545B64">appliance CA cert (extracted)</text>
+    <line x1="815" y1="224" x2="815" y2="248" stroke="#545B64" stroke-width="1.3" marker-end="url(#arr)"/>
+
+    <rect x="700" y="346" width="230" height="74" rx="6" fill="#fff" stroke="#16191F" stroke-width="1.5"/>
+    <text x="815" y="368" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">CloudWatch</text>
+    <text x="815" y="385" text-anchor="middle" font-size="10.5" fill="#545B64">dashboard · alarms + SNS (KMS)</text>
+    <text x="815" y="401" text-anchor="middle" font-size="10.5" fill="#545B64">scan-audit log group · flow logs</text>
+    <path d="M 629 313 L 690 313 L 690 383 L 696 383" fill="none" stroke="#545B64" stroke-width="1.3" stroke-dasharray="2 3" marker-end="url(#arr)"/>
+    <text x="700" y="336" text-anchor="middle" font-size="10" fill="#545B64">audit</text>
+
+    <rect x="700" y="448" width="230" height="60" rx="6" fill="#fff" stroke="#0073BB" stroke-width="1.5"/>
+    <text x="815" y="470" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">CodeBuild + deploy bucket</text>
+    <text x="815" y="487" text-anchor="middle" font-size="10.5" fill="#545B64">packages the watchdog at create</text>
+
+    <rect x="700" y="536" width="230" height="60" rx="6" fill="#fff" stroke="#545B64" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="815" y="558" text-anchor="middle" font-size="13" font-weight="600" fill="#16191F">AWS Systems Manager</text>
+    <text x="815" y="575" text-anchor="middle" font-size="10.5" fill="#545B64">RunCommand · Session Manager (§12)</text>
+
+    <!-- Legend -->
+    <rect x="50" y="692" width="16" height="16" rx="3" fill="#fff" stroke="#0073BB" stroke-width="1.8"/>
+    <text x="74" y="705" font-size="11.5" fill="#545B64">scanner stack (scanner.yaml)</text>
+    <rect x="262" y="692" width="16" height="16" rx="3" fill="#fff" stroke="#16191F" stroke-width="1.6"/>
+    <text x="286" y="705" font-size="11.5" fill="#545B64">worker stack (worker.yaml)</text>
+    <rect x="466" y="692" width="16" height="16" rx="3" fill="#fff" stroke="#545B64" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="490" y="705" font-size="11.5" fill="#545B64">external / AWS-managed service</text>
+    <rect x="704" y="692" width="16" height="16" rx="3" fill="#F1FAFF" stroke="#0073BB" stroke-width="1.8"/>
+    <text x="728" y="705" font-size="11.5" fill="#545B64">the product under evaluation</text>
+  </svg>
