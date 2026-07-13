@@ -1,10 +1,10 @@
 CLAUDE.md
 .claude/
 sp-api-open-*.json
-docs/
-.DS_Store
-*.pyc
-.claude/
+docs/*
 guide/
 *.html
+!docs/evaluation-guide.html
+.DS_Store
+*.pyc
 settings.json
