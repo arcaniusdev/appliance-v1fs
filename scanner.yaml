@@ -1282,6 +1282,44 @@ Resources:
         - Key: Name
           Value: !Sub ServiceGatewaySecGroup-${AWS::StackName}
 
+  # ── Provisioner Lambda Security Group ────────────────────────────────
+  # The provisioner runs in the VPC and reaches appliances over SSH (22) and
+  # AWS APIs over the interface endpoints (443). Egress is scoped to the VPC
+  # CIDR; there is no inbound rule (Lambda ENIs only originate connections).
+  ProvisionerLambdaSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
+      GroupDescription: Provisioner Lambda - outbound SSH to Service Gateways and HTTPS to VPC endpoints
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !If [CreateNetworking, !GetAtt BaseVPC.CidrBlock, !Ref ExistingVPCCidr]
+          Description: SSH to Service Gateway instances
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !If [CreateNetworking, !GetAtt BaseVPC.CidrBlock, !Ref ExistingVPCCidr]
+          Description: HTTPS to VPC endpoints (Secrets Manager, SSM, EC2, STS)
+      Tags:
+        - Key: Name
+          Value: !Sub ProvisionerLambdaSG-${AWS::StackName}
+
+  # ── Service Gateway SSH key pair ─────────────────────────────────────
+  # The launch key pair is the 'admin' SSH credential; CloudFormation stores
+  # its private key in SSM Parameter Store at /ec2/keypair/<KeyPairId>, which
+  # the provisioner reads. From admin clish it authorizes a root (sgowner) key
+  # per the documented method (KB-0014380).
+  ServiceGatewayKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ServiceGatewayKeyPair-${AWS::StackName}
+      KeyType: ed25519
+      Tags:
+        - Key: Name
+          Value: !Sub ServiceGatewayKeyPair-${AWS::StackName}
+
   # ── Service Gateway IAM ───────────────────────────────────────────────
   ServiceGatewayRole:
     Type: AWS::IAM::Role
@@ -1309,6 +1347,7 @@ Resources:
       LaunchTemplateData:
         ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
         InstanceType: !Ref ServiceGatewayInstanceType
+        KeyName: !Ref ServiceGatewayKeyPair
         IamInstanceProfile:
           Arn: !GetAtt ServiceGatewayInstanceProfile.Arn
         SecurityGroupIds:
@@ -1635,6 +1674,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
       Policies:
         - PolicyName: ProvisionerPolicy
           PolicyDocument:
@@ -1662,18 +1702,11 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:appliance-v1fs/*"
+              # Read the EC2 launch key pair's private key (the 'admin' SSH
+              # credential) that CloudFormation stores in Parameter Store.
               - Effect: Allow
-                Action: ssm:SendCommand
-                Resource: !Sub "arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript"
-              - Effect: Allow
-                Action: ssm:SendCommand
-                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
-                Condition:
-                  StringEquals:
-                    "aws:ResourceTag/appliance-v1fs:stack": !Ref "AWS::StackName"
-              - Effect: Allow
-                Action: ssm:GetCommandInvocation
-                Resource: "*"
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ec2/keypair/*"
               # Self-invoke: deployment gates re-invoke the function to wait
               # longer than one Lambda timeout. Scoped to this function by name
               # (not !GetAtt) to avoid a role<->function circular dependency.
@@ -1691,20 +1724,44 @@ Resources:
       Code:
         S3Bucket: !Ref ScannerDeployBucket
         S3Key: provisioner-code.zip
+      Layers:
+        - !Ref ProvisionerLayer
       Role: !GetAtt ProvisionerLambdaRole.Arn
       Timeout: 900
       MemorySize: 256
       TracingConfig:
         Mode: Active
+      # In-VPC so it can SSH to the appliances' private IPs (port 22, VPC-CIDR
+      # scoped — never exposed to the internet). Provisioning is SSH-only via
+      # the documented root path; it does not use the on-appliance SSM agent.
+      VpcConfig:
+        SubnetIds:
+          - !If [CreateNetworking, !Ref PrivateSubnet1, !Ref ExistingPrivateSubnet1Id]
+          - !If [CreateNetworking, !Ref PrivateSubnet2, !Ref ExistingPrivateSubnet2Id]
+        SecurityGroupIds:
+          - !Ref ProvisionerLambdaSecGroup
       Environment:
         Variables:
           SG_TAG_KEY: "appliance-v1fs:stack"
           SG_TAG_VALUE: !Ref "AWS::StackName"
+          KEY_PAIR_ID: !GetAtt ServiceGatewayKeyPair.KeyPairId
           CERT_SECRET_NAME: appliance-v1fs/sg-ca-cert
           REGISTRATION_TOKEN_SECRET: appliance-v1fs/sg-registration-token
           AWS_REGION_NAME: !Ref "AWS::Region"
           MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
           SCAN_CACHE_ENABLED: !Ref ScanCacheEnabled
+
+  ProvisionerLayer:
+    Type: AWS::Lambda::LayerVersion
+    DependsOn: ScannerCodeBuild
+    Properties:
+      LayerName: !Sub provisioner-deps-${AWS::StackName}
+      Description: paramiko (SSH) for the provisioner
+      Content:
+        S3Bucket: !Ref ScannerDeployBucket
+        S3Key: provisioner-layer.zip
+      CompatibleRuntimes:
+        - python3.12
 
   WatchdogSchedule:
     Type: AWS::Events::Rule

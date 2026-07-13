@@ -1,8 +1,27 @@
 version: 0.2
 
+# Packages the provisioner Lambda for the scanner stack:
+#   - provisioner-layer.zip  paramiko + deps (Lambda layer, python3.12)
+#   - provisioner-code.zip   handler.py + ssh_helper.py
+#
+# --platform manylinux2014_x86_64 --only-binary=:all: forces Linux x86_64
+# wheels so paramiko's native crypto deps work on the Lambda runtime rather
+# than picking up the CodeBuild host's platform.
+
 phases:
   build:
     commands:
+      # ── Provisioner dependency layer (paramiko) ───────────────────
+      - mkdir -p /tmp/layer/python
+      - >
+        pip install -r $CODEBUILD_SRC_DIR/lambda/provisioner/requirements.txt
+        -t /tmp/layer/python
+        --platform manylinux2014_x86_64
+        --only-binary=:all:
+        --python-version 3.12
+      - cd /tmp/layer && zip -r /tmp/provisioner-layer.zip python/
+      - aws s3 cp /tmp/provisioner-layer.zip s3://$DEPLOY_BUCKET/provisioner-layer.zip
+
       # ── Provisioner Lambda code ───────────────────────────────────
-      - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py
+      - cd $CODEBUILD_SRC_DIR/lambda/provisioner && zip /tmp/provisioner-code.zip handler.py ssh_helper.py
       - aws s3 cp /tmp/provisioner-code.zip s3://$DEPLOY_BUCKET/provisioner-code.zip
