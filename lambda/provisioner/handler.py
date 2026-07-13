@@ -133,7 +133,8 @@ def _handle_watchdog(event, context):
     For each SG instance:
     1. Not registered → set hostname, register with Vision One, tag
     2. Registered but no scanner pod → wait (FS must be installed via V1 console)
-    3. Scanner pod running but not provisioned → extract cert, patch nginx, set cache, tag
+    3. Scanner pod running but not provisioned → harden ciphers, extract cert,
+       patch nginx if needed, tag
     4. Already provisioned → check scanner version, re-extract cert if changed
     """
     region = event.get("region", os.environ.get("AWS_REGION_NAME", "us-east-1"))
@@ -216,19 +217,35 @@ def _handle_watchdog(event, context):
                 continue
 
             # ── Step 3: re-apply customizations ────────────────────
+            # nginx proxy-body-size: only patch when the live value differs.
+            # If the appliance default ever grows to >= our target, this
+            # stops touching the configmap entirely.
             max_size = os.environ.get("MAX_FILE_SIZE_MB", "500")
-            nginx_out = _ssm_run(ssm, iid, [
-                f"kubectl -n ingress patch configmap nginx-load-balancer-microk8s-conf "
-                f"--type merge -p '{{\"data\":{{\"proxy-body-size\":\"{max_size}m\"}}}}' 2>&1"
-            ], timeout=30)
-            logger.info("nginx patch: %s", nginx_out.strip())
+            desired_body_size = f"{max_size}m"
+            current_body_size = _ssm_run(ssm, iid, [
+                "kubectl -n ingress get configmap nginx-load-balancer-microk8s-conf "
+                "-o jsonpath='{.data.proxy-body-size}' 2>/dev/null"
+            ], timeout=30).strip("'\n ")
+            if current_body_size != desired_body_size:
+                nginx_out = _ssm_run(ssm, iid, [
+                    f"kubectl -n ingress patch configmap nginx-load-balancer-microk8s-conf "
+                    f"--type merge -p '{{\"data\":{{\"proxy-body-size\":\"{desired_body_size}\"}}}}' 2>&1"
+                ], timeout=30)
+                logger.info("nginx proxy-body-size patched %s -> %s: %s",
+                            current_body_size or "(default)", desired_body_size,
+                            nginx_out.strip())
+            else:
+                logger.info("nginx proxy-body-size already %s", desired_body_size)
 
+            # Scan cache: the appliance default is enabled. Only override the
+            # env var when the cache is explicitly disabled (baseline testing);
+            # otherwise remove any override so the default applies.
             scan_cache = os.environ.get("SCAN_CACHE_ENABLED", "true")
+            cache_env = "TM_AM_SCAN_CACHE=false" if scan_cache == "false" else "TM_AM_SCAN_CACHE-"
             cache_out = _ssm_run(ssm, iid, [
-                f"kubectl set env deployment --all -n sg-sfs-scanner "
-                f"TM_AM_SCAN_CACHE={scan_cache} 2>&1"
+                f"kubectl set env deployment --all -n sg-sfs-scanner {cache_env} 2>&1"
             ], timeout=30)
-            logger.info("scan cache: %s", cache_out.strip())
+            logger.info("scan cache (%s): %s", cache_env, cache_out.strip())
 
             version_out = _ssm_run(ssm, iid, [
                 "kubectl get pod -n sg-sfs-scanner "
@@ -240,9 +257,14 @@ def _handle_watchdog(event, context):
             if inst["provisioned"] != "true":
                 logger.info("Watchdog: completing provisioning for %s (%s)",
                             iid, inst["hostname"])
-                _ssm_run(ssm, iid, [
-                    "kubectl scale deployment --all -n sg-sfs-scanner --replicas=1 2>&1"
-                ], timeout=30)
+                try:
+                    _clish(ssm, iid, "enable",
+                           "configure nginx-ingress-controller-cipher disable-weak",
+                           timeout=60)
+                    logger.info("Watchdog: weak TLS ciphers disabled on %s", iid)
+                except Exception:
+                    logger.warning("Watchdog: cipher hardening failed on %s", iid,
+                                   exc_info=True)
                 cert_pem = _extract_cert(ssm, iid)
                 if cert_pem:
                     _store_cert(cert_secret, cert_pem, region)
