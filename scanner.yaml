@@ -154,6 +154,13 @@ Parameters:
     Description: Existing private subnet in AZ8. Required if ExistingVPCId is set and ServiceGatewayCount = 8.
     Type: String
     Default: ""
+  ExistingVPCCidr:
+    Description: >-
+      CIDR block of the existing VPC - allowed to reach the appliances on
+      ports 80/443/22. Required if ExistingVPCId is set; ignored otherwise.
+    Type: String
+    Default: 10.2.0.0/16
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$'
 
 Conditions:
   CreateNetworking: !Equals [!Ref ExistingVPCId, ""]
@@ -1253,17 +1260,17 @@ Resources:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          CidrIp: 10.2.0.0/16
+          CidrIp: !If [CreateNetworking, !GetAtt BaseVPC.CidrBlock, !Ref ExistingVPCCidr]
           Description: HTTP from VPC (gRPC h2c, no TLS)
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 10.2.0.0/16
+          CidrIp: !If [CreateNetworking, !GetAtt BaseVPC.CidrBlock, !Ref ExistingVPCCidr]
           Description: HTTPS from VPC (gRPC TLS, management)
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: 10.2.0.0/16
+          CidrIp: !If [CreateNetworking, !GetAtt BaseVPC.CidrBlock, !Ref ExistingVPCCidr]
           Description: SSH from VPC (CLI management)
       SecurityGroupEgress:
         - IpProtocol: tcp
