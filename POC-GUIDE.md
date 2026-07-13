@@ -183,6 +183,26 @@ aws lambda invoke --function-name provisioner-scanner-1 \
 > [!NOTE]
 > **Why a watchdog instead of one-time provisioning?** Appliance updates arrive from Vision One on TrendAI's schedule, and an update can revert local configuration or rotate the TLS certificate. A one-shot provisioner would silently drift; a 15-minute reconciliation loop self-heals. It also makes scaling trivial — raise `ServiceGatewayCount` and new appliances are registered and provisioned automatically.
 
+### What it automates for you
+
+Without the watchdog you would SSH into each appliance and run every one of these by hand — then repeat on every appliance and re-check after each scanner update. Instead the watchdog runs them all through **SSM RunCommand (`AWS-RunShellScript`) as root** — no SSH, no key pair. Each `clish` command runs via a temp script file (`clish -u admin /tmp/.clish_cmds`); `clish` can't be driven by piped stdin.
+
+| Manual step it replaces | What the watchdog runs (as root, via SSM) | What it does |
+|---|---|---|
+| Set the appliance's OS hostname | `hostnamectl set-hostname FSVA-AWS-NN` | Gives the appliance a stable, identifiable name |
+| Name the endpoint in the CLI | `clish → enable → configure endpoint FSVA-AWS-NN` | Sets the Vision One endpoint name to match the hostname |
+| Register the appliance | `clish → enable → register <token>` (retried up to 3×) | Registers the SG with Vision One using the token from Secrets Manager |
+| Confirm registration succeeded | `clish → show version` (checks `Status: Registered`) | Gates the next steps until the appliance is actually registered |
+| Harden TLS ciphers | `clish → enable → configure nginx-ingress-controller-cipher disable-weak` | Disables weak/legacy TLS ciphers on ports 80/443 |
+| Wait for the scanner to come up | `kubectl get pods --all-namespaces \| grep sg-sfs-scanner` | Detects when File Security's scanner pod is `Running` |
+| Raise the upload size limit | `kubectl -n ingress patch configmap nginx-load-balancer-microk8s-conf --type merge -p '{"data":{"proxy-body-size":"<MaxFileSizeMB>m"}}'` *(only when the live value differs)* | Lets gRPC scan files larger than the 10 MB default |
+| Apply the scan-cache setting | `kubectl set env deployment --all -n sg-sfs-scanner TM_AM_SCAN_CACHE=false` *(only when `ScanCacheEnabled=false`; otherwise the override is removed)* | Honors your parameter; leaves the appliance default untouched otherwise |
+| Extract the TLS CA certificate | `openssl s_client -connect localhost:443 -servername sg.sgi.xdr.trendmicro.com </dev/null \| openssl x509` → stored in Secrets Manager (`appliance-v1fs/sg-ca-cert`) | Captures the appliance's self-signed cert so SDK clients can trust it ([§10](#10-scan-from-your-own-code-java)) |
+| Track the scanner version | `kubectl get pod -n sg-sfs-scanner -o jsonpath='{.items[0].spec.containers[0].image}'` → SSM parameter | Notices TrendAI scanner updates so it can re-extract the cert if it rotates |
+| Record lifecycle state | `aws ec2 create-tags … appliance-v1fs:registered=true` / `…:provisioned=true` | Marks progress; the workers and the deploy gates ([§4](#4-deploy-the-scanner-stack)) read these tags |
+
+Everything above is idempotent and re-checked every 15 minutes, so a scanner update that reverts the upload limit or rotates the certificate is corrected on the next pass without you touching the appliance.
+
 ## 6. Install File Security
 
 This is the **one manual step** in the whole deployment: TrendAI requires the File Security service to be installed onto each appliance from the Vision One console, and provides no API for it.
