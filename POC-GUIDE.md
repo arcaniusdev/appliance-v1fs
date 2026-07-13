@@ -71,14 +71,16 @@ Console → *Cloud Security → File Security* → on first visit, click **Conti
 
 ### Create the API key
 
-| Step | Where |
-|---|---|
-| 1. Confirm a role exists with the **"Run file scan via SDK"** permission (create one if not) | *Administration → User Roles* |
-| 2. Add an API key with that role; set a 30–90 day expiry | *Administration → API Keys → Add API Key* |
-| 3. **Copy the key immediately** — it is shown once | You'll pass it to CloudFormation, which stores it in Secrets Manager |
+The API key authenticates every scan request, and it needs one specific permission. Click by click:
+
+1. Sign in to the Vision One console.
+2. In the left navigation, go to **Administration → User Roles**. Confirm a role exists with the **"Run file scan via SDK"** permission enabled. If none does, click **Add Role**, tick that permission, give the role a name, and click **Save**.
+3. In the left navigation, go to **Administration → API Keys**, then click **Add API Key**.
+4. In the dialog: enter a **Name** (e.g. `fs-scanner-eval`), select the **Role** from step 2, and set an **Expiry** (30–90 days for an evaluation).
+5. Click **Add**. The key value appears **once** — click **Copy** and paste it somewhere safe for now. You'll hand it to CloudFormation in [§4](#4-deploy-the-scanner-stack), which stores it in Secrets Manager.
 
 > [!IMPORTANT]
-> **The registration token expires after 24 hours — don't get it yet.** Generate it in [§4](#4-deploy-the-scanner-stack), immediately before deploying: *Workflow and Automation → Service Gateway Management → Download Virtual Appliance* → copy the **Registration Token**. (You are not downloading anything — the AMI comes from AWS Marketplace; the dialog is just where the token lives.)
+> **Don't get the registration token yet** — it expires 24 hours after you generate it. You'll grab it as the first click-by-click step of [§4](#4-deploy-the-scanner-stack), immediately before deploying.
 
 ## 3. AWS setup
 
@@ -94,7 +96,18 @@ Console → *Cloud Security → File Security* → on first visit, click **Conti
 > [!NOTE]
 > **Evaluation sizing:** 2 appliances (c5.2xlarge) — enough to demonstrate load balancing with ~29M files/day of capacity, at roughly $17/day of EC2 cost. Scale to 8 later with a single stack update.
 
-Get a **fresh registration token** ([§2](#2-vision-one-setup)), then:
+### Step 4a — Get the registration token (console, click by click)
+
+> [!IMPORTANT]
+> The token expires **24 hours** after you generate it, so do this right before the deploy in Step 4b — not earlier.
+
+1. Sign in to the Vision One console.
+2. In the left navigation, go to **Workflow and Automation → Service Gateway Management**.
+3. Click **Download Virtual Appliance** (top-right of the page). A dialog opens.
+4. In the dialog, find **Registration Token** and click **Copy**. Paste it somewhere safe for the next step.
+5. Close the dialog. **You are not downloading anything** — our appliance AMI comes from AWS Marketplace, so ignore the image-type and download-disk options; the dialog is only where the token lives.
+
+### Step 4b — Launch the stack (CLI)
 
 ```bash
 # 1. Stage the template
@@ -151,16 +164,42 @@ aws lambda invoke --function-name provisioner-scanner-1 \
 
 ## 6. Install File Security
 
-TrendAI requires the File Security service to be installed onto registered appliances from the Vision One console — there is no API for it. This is the only clicking you'll do:
+This is the **one manual step** in the whole deployment: TrendAI requires the File Security service to be installed onto each appliance from the Vision One console, and provides no API for it. Everything before and after this is automated.
 
-| Step | Detail |
-|---|---|
-| 1. Wait for `registered=true` | [§4](#4-deploy-the-scanner-stack) watch command |
-| 2. Open Service Gateway Management | *Workflow and Automation → Service Gateway Management* — appliances appear as **FSVA-AWS-01**, **-02**, … |
-| 3. Install per appliance | Click the appliance → **Manage Services** → install **File Security Virtual Appliance** |
-| 4. Wait for Healthy | A few minutes; then the watchdog finishes provisioning on its next pass — done when `provisioned=true` |
+**First, confirm the appliance is ready to receive it.** Wait until its `registered` tag is `true` (the watchdog sets this — see [§5](#5-meet-the-watchdog)):
 
-Timeline check: from `create-stack` to fully provisioned is typically **30–45 minutes** including one or two watchdog cycles.
+```bash
+aws ec2 describe-instances \
+  --filters "Name=tag:appliance-v1fs:stack,Values=scanner-1" \
+  --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,
+           Tags[?Key==`appliance-v1fs:registered`]|[0].Value]' --output table
+# Wait for the second column to read: true
+```
+
+**Then, click by click in the Vision One console:**
+
+1. Sign in to the Vision One console.
+2. In the left navigation, go to **Workflow and Automation → Service Gateway Management**.
+3. The inventory lists your appliances by hostname — **FSVA-AWS-01**, **FSVA-AWS-02**, and so on. Click the **name** of the first appliance.
+4. On the appliance details page, click **Manage Services**. A drawer opens listing the services you can install.
+5. Find **File Security Virtual Appliance** in the list and click its **install** icon (the download-arrow icon next to the name). A resource check runs first, then installation begins.
+6. Wait until the **Status** column for File Security reads **Healthy** — usually a few minutes.
+7. **Repeat steps 3–6 for each remaining appliance** (FSVA-AWS-02, …). A single-appliance evaluation is done after the first.
+
+> [!NOTE]
+> **No mount points to configure.** This pipeline scans by sending file bytes over gRPC (the SDK), not by mounting NFS/SMB shares — so once File Security shows **Healthy**, ignore the gear/configure icon and the "Add mount point" flow. Those are only for the appliance's file-share scanning mode, which we don't use.
+
+**That's the last thing you click.** On its next pass (within 15 minutes, or trigger it manually — [§5](#5-meet-the-watchdog)), the watchdog detects the running scanner, finishes provisioning, and flips the tag to `provisioned=true`:
+
+```bash
+aws ec2 describe-instances \
+  --filters "Name=tag:appliance-v1fs:stack,Values=scanner-1" \
+  --query 'Reservations[].Instances[].Tags[?Key==`appliance-v1fs:provisioned`]|[0].Value' \
+  --output text
+# → true  (ready to scan)
+```
+
+Timeline check: from `create-stack` to fully provisioned is typically **30–45 minutes**, including one or two watchdog cycles.
 
 ## 7. Deploy the worker stack
 
