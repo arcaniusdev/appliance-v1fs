@@ -1674,6 +1674,12 @@ Resources:
               - Effect: Allow
                 Action: ssm:GetCommandInvocation
                 Resource: "*"
+              # Self-invoke: deployment gates re-invoke the function to wait
+              # longer than one Lambda timeout. Scoped to this function by name
+              # (not !GetAtt) to avoid a role<->function circular dependency.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:provisioner-${AWS::StackName}"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
@@ -1719,6 +1725,35 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt WatchdogSchedule.Arn
+
+  # ── Deployment gates ────────────────────────────────────────────────
+  # These hold the stack in CREATE_IN_PROGRESS until the fleet is genuinely
+  # ready, so CREATE_COMPLETE is a trustworthy signal — no tag-polling.
+  #
+  #   WaitForRegistration  → all appliances registered with Vision One
+  #                          (automated; its completion is the cue to go
+  #                          install File Security in the console).
+  #   WaitForFileSecurity  → File Security installed (console) and each
+  #                          appliance provisioned & scan-ready.
+  #
+  # Each drives the watchdog itself, so neither waits on the 15-min schedule.
+  WaitForRegistration:
+    Type: Custom::AwaitRegistration
+    DependsOn:
+      - ServiceGateway01
+      - ProvisionerLambda
+    Properties:
+      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      Phase: registration
+      ExpectedCount: !Ref ServiceGatewayCount
+
+  WaitForFileSecurity:
+    Type: Custom::AwaitInstallation
+    DependsOn: WaitForRegistration
+    Properties:
+      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      Phase: installation
+      ExpectedCount: !Ref ServiceGatewayCount
 
   # ── Secrets (API key + registration token) ─────────────────────────
   VisionOneApiKeySecret:
@@ -1796,3 +1831,11 @@ Outputs:
     Value: !Ref ServiceGatewaySecGroup
     Export:
       Name: !Sub ${AWS::StackName}-ServiceGatewaySecGroupId
+  NextSteps:
+    Description: What to do now that the stack is complete
+    Value: !Sub >-
+      All ${ServiceGatewayCount} Service Gateway(s) are registered, File
+      Security is installed, and the fleet is scan-ready. Deploy worker.yaml
+      with ScannerStackName=${AWS::StackName} to start scanning. (The stack
+      paused at WaitForFileSecurity for the one manual console step; if you
+      are reading this, it is done.)

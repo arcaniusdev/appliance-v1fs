@@ -1,7 +1,9 @@
+import json
 import logging
 import os
 import re
 import time
+import urllib.request
 
 import boto3
 
@@ -11,6 +13,13 @@ logger.setLevel(logging.INFO)
 VERSION_PARAM_PREFIX = "/appliance-v1fs/scanner-version/"
 _SAFE_HOSTNAME = re.compile(r'^[A-Za-z0-9\-]{1,63}$')
 
+# Deployment gates (Custom::AwaitRegistration / Custom::AwaitInstallation).
+# The registration wait is fully automated; the File Security install wait
+# depends on a human console step, so it gets a much longer deadline.
+GATE_DEADLINES = {"registration": 25 * 60, "installation": 60 * 60}
+GATE_POLL_SECONDS = 30
+GATE_REINVOKE_MARGIN_MS = 120 * 1000  # re-invoke self when <2 min of runtime left
+
 
 def _validate_hostname(hostname):
     if not _SAFE_HOSTNAME.match(hostname):
@@ -19,12 +28,16 @@ def _validate_hostname(hostname):
 
 
 def handler(event, context):
-    """Service Gateway provisioner (watchdog-only).
+    """Service Gateway provisioner.
 
-    Invoked on a 15-minute schedule. Discovers SG instances by tag,
-    provisions any that are unprovisioned, checks scanner versions,
-    and re-applies customizations.
+    Two entry points share the registration/provisioning logic:
+    * Scheduled watchdog (EventBridge, every 15 min) — the steady-state driver.
+    * CloudFormation custom resource — blocks stack creation until the fleet
+      reaches a target state (all registered, then all provisioned), driving
+      the watchdog itself so the stack doesn't wait on the 15-min schedule.
     """
+    if isinstance(event, dict) and "RequestType" in event and "ResponseURL" in event:
+        return _handle_gate(event, context)
     return _handle_watchdog(event, context)
 
 
@@ -297,3 +310,95 @@ def _handle_watchdog(event, context):
             results.append({"instance": iid, "action": "error"})
 
     return {"status": "complete", "results": results}
+
+
+# ── Deployment gates (CloudFormation custom resource) ─────────────────
+
+def _cfn_respond(event, status, data=None, reason=None, physical_id=None):
+    """PUT a response to the CloudFormation pre-signed URL."""
+    body = json.dumps({
+        "Status": status,
+        "Reason": reason or "See CloudWatch logs for the provisioner Lambda",
+        "PhysicalResourceId": physical_id or event.get("PhysicalResourceId")
+                              or event.get("LogicalResourceId", "gate"),
+        "StackId": event["StackId"],
+        "RequestId": event["RequestId"],
+        "LogicalResourceId": event["LogicalResourceId"],
+        "Data": data or {},
+    }).encode("utf-8")
+    req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT")
+    req.add_header("content-type", "")
+    req.add_header("content-length", str(len(body)))
+    urllib.request.urlopen(req, timeout=15)
+
+
+def _count_ready(region, tag_value):
+    """How many discovered SG instances carry the given readiness tag = true."""
+    ready = 0
+    for inst in _discover_sg_instances(region):
+        if inst.get(tag_value) == "true":
+            ready += 1
+    return ready
+
+
+def _handle_gate(event, context):
+    """Block a CloudFormation stack until the SG fleet reaches a target state.
+
+    Phase 'registration' waits for all appliances to register with Vision One;
+    phase 'installation' waits for File Security to be installed (via the
+    console) and provisioned. Each poll drives a watchdog pass so progress does
+    not depend on the 15-minute schedule. To outlast the Lambda timeout (the
+    installation wait can take much longer than 15 min), the function
+    re-invokes itself asynchronously, carrying an absolute deadline, until the
+    target is met or the deadline passes — only then does it answer CFN.
+    """
+    if event["RequestType"] == "Delete":
+        _cfn_respond(event, "SUCCESS")
+        return
+
+    props = event.get("ResourceProperties", {})
+    phase = props.get("Phase", "registration")
+    expected = int(props.get("ExpectedCount", "1"))
+    region = event.get("region", os.environ.get("AWS_REGION_NAME", "us-east-1"))
+    tag_key = "registered" if phase == "registration" else "provisioned"
+
+    # Absolute deadline persists across self-reinvocations.
+    deadline = event.get("_deadline")
+    if deadline is None:
+        deadline = time.time() + GATE_DEADLINES.get(phase, 25 * 60)
+        event["_deadline"] = deadline
+
+    try:
+        while True:
+            try:
+                _handle_watchdog({}, context)
+            except Exception:
+                logger.exception("Gate(%s): watchdog pass failed, will retry", phase)
+
+            ready = _count_ready(region, tag_key)
+            logger.info("Gate(%s): %d/%d appliances ready", phase, ready, expected)
+            if ready >= expected:
+                _cfn_respond(event, "SUCCESS", {"Ready": str(ready), "Phase": phase})
+                return
+
+            if time.time() >= deadline:
+                _cfn_respond(event, "FAILED", reason=(
+                    f"{ready}/{expected} appliances reached '{tag_key}' before timeout. "
+                    + ("Check the registration token and provisioner logs."
+                       if phase == "registration"
+                       else "Install File Security on each appliance in the Vision One "
+                            "console (Service Gateway Management > Manage Services).")))
+                return
+
+            if context.get_remaining_time_in_millis() < GATE_REINVOKE_MARGIN_MS:
+                boto3.client("lambda").invoke(
+                    FunctionName=context.invoked_function_arn,
+                    InvocationType="Event",
+                    Payload=json.dumps(event).encode("utf-8"))
+                logger.info("Gate(%s): re-invoking self to continue waiting", phase)
+                return
+
+            time.sleep(GATE_POLL_SECONDS)
+    except Exception as exc:
+        logger.exception("Gate(%s): unexpected error", phase)
+        _cfn_respond(event, "FAILED", reason=f"Gate error: {exc}")

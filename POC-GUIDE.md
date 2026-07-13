@@ -88,8 +88,18 @@ The API key authenticates every scan request, and it needs one specific permissi
 |---|---|
 | **Credentials** | A role that can create VPCs, EC2, IAM roles, Lambda, S3, SQS. Verify: `aws sts get-caller-identity` |
 | **A region** | Pick one and stay in it. Defaults assume us-east-1 AZs — override `PrimaryAZ`/`SecondaryAZ` elsewhere. |
-| **Marketplace subscription** | One-time, free: AWS Marketplace → search **"TrendAI Service Gateway BYOL"** → Subscribe → Accept terms. Without it, appliance launch fails with an authorization error. |
 | **Staging bucket** | The templates exceed CloudFormation's inline limit: `aws s3 mb s3://<staging-bucket>` |
+
+### Subscribe to the appliance AMI (required, one-time, free)
+
+The Service Gateway image is an AWS Marketplace product. Your account **must accept its terms before deploying** — otherwise the stack fails when it tries to launch an appliance, with `401 / AccessDenied` on the EC2 instance. Click by click:
+
+1. Open the product page: **https://aws.amazon.com/marketplace/pp?sku=a4akc5rzzt5b2a9trld1chlf**
+2. Click **Continue to Subscribe**.
+3. Click **Accept Terms**, then wait until the subscription shows active (usually under a minute).
+
+> [!TIP]
+> Alternatively, in the AWS Marketplace console search for **"TrendAI Service Gateway BYOL"** and subscribe there. You only do this once per AWS account.
 
 ## 4. Deploy the scanner stack
 
@@ -132,14 +142,21 @@ aws ec2 describe-instances \
            Tags[?Key==`appliance-v1fs:provisioned`]|[0].Value]' --output table
 ```
 
-After the stack completes, hands-free provisioning begins — that's the watchdog's job, explained next.
+**This stack does not report `CREATE_COMPLETE` the moment its resources exist.** Two built-in gates hold it open until the fleet is genuinely scan-ready, so completion is a signal you can trust — no tag-polling:
+
+| Gate (a resource in the stack) | The stack pauses here while… |
+|---|---|
+| **`WaitForRegistration`** | the watchdog registers every appliance with Vision One (automated, a few minutes) |
+| **`WaitForFileSecurity`** | it waits for **you** to install File Security ([§6](#6-install-file-security)) and for each appliance to finish provisioning |
+
+Watch these in the CloudFormation **Resources** (or **Events**) tab. The moment **`WaitForRegistration`** turns `CREATE_COMPLETE` and **`WaitForFileSecurity`** goes `CREATE_IN_PROGRESS` is your cue to do [§6](#6-install-file-security). When the whole stack reaches **`CREATE_COMPLETE`**, every appliance is registered, File-Security-installed, and scan-ready — your all-clear to deploy the worker stack ([§7](#7-deploy-the-worker-stack)).
 
 > [!IMPORTANT]
 > **Redeploying later? Three rules.** Always use a fresh, incrementing stack name (`scanner-2`, `scanner-3`…); always generate a fresh registration token; and delete leftover `appliance-v1fs/*` secrets first — they're retained on stack deletion, and a new stack fails with *AlreadyExists* if they linger (command in [§17](#17-teardown)).
 
 ## 5. Meet the watchdog
 
-The **watchdog** is a small Lambda (`provisioner-<stack>`) that runs every 15 minutes and owns the entire appliance lifecycle. It's the reason this deployment needs no manual appliance setup: no console sessions, no SSH, no copy-pasting into terminals. If an appliance exists, the watchdog finds it, registers it, configures it, and keeps it configured.
+The **watchdog** is a small Lambda (`provisioner-<stack>`) that runs every 15 minutes and owns the entire appliance lifecycle. It's the reason this deployment needs no manual appliance setup: no console sessions, no SSH, no copy-pasting into terminals. If an appliance exists, the watchdog finds it, registers it, configures it, and keeps it configured. (During deployment, the `WaitForRegistration` and `WaitForFileSecurity` gates from [§4](#4-deploy-the-scanner-stack) invoke this same watchdog on a tight loop, so the stack progresses without waiting on the 15-minute schedule.)
 
 On every pass, for every appliance (found by EC2 tag), it walks this state machine:
 
@@ -164,19 +181,14 @@ aws lambda invoke --function-name provisioner-scanner-1 \
 
 ## 6. Install File Security
 
-This is the **one manual step** in the whole deployment: TrendAI requires the File Security service to be installed onto each appliance from the Vision One console, and provides no API for it. Everything before and after this is automated.
+This is the **one manual step** in the whole deployment: TrendAI requires the File Security service to be installed onto each appliance from the Vision One console, and provides no API for it.
 
-**First, confirm the appliance is ready to receive it.** Wait until its `registered` tag is `true` (the watchdog sets this — see [§5](#5-meet-the-watchdog)):
+**You're here because the scanner stack told you so.** It has finished `WaitForRegistration` and is now paused at **`WaitForFileSecurity`** ([§4](#4-deploy-the-scanner-stack)) — that pause *is* the "install now" signal, and it means the appliance is already registered and ready to receive File Security. No tag-checking required.
 
-```bash
-aws ec2 describe-instances \
-  --filters "Name=tag:appliance-v1fs:stack,Values=scanner-1" \
-  --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,
-           Tags[?Key==`appliance-v1fs:registered`]|[0].Value]' --output table
-# Wait for the second column to read: true
-```
+> [!IMPORTANT]
+> Do this within **~60 minutes** — that's the gate's timeout. If it lapses, the stack fails at `WaitForFileSecurity` (nothing is lost; you install File Security, then redeploy). 60 minutes is plenty for the clicks below.
 
-**Then, click by click in the Vision One console:**
+**Click by click in the Vision One console:**
 
 1. Sign in to the Vision One console.
 2. In the left navigation, go to **Workflow and Automation → Service Gateway Management**.
@@ -189,17 +201,9 @@ aws ec2 describe-instances \
 > [!NOTE]
 > **No mount points to configure.** This pipeline scans by sending file bytes over gRPC (the SDK), not by mounting NFS/SMB shares — so once File Security shows **Healthy**, ignore the gear/configure icon and the "Add mount point" flow. Those are only for the appliance's file-share scanning mode, which we don't use.
 
-**That's the last thing you click.** On its next pass (within 15 minutes, or trigger it manually — [§5](#5-meet-the-watchdog)), the watchdog detects the running scanner, finishes provisioning, and flips the tag to `provisioned=true`:
+**That's the last thing you click — the stack takes it from here.** The `WaitForFileSecurity` gate is driving the watchdog for you; as soon as File Security is **Healthy** on every appliance, it finishes provisioning (cert extraction, nginx patch, cipher hardening), releases the gate, and the **scanner stack reaches `CREATE_COMPLETE`**. That completion is your all-clear for [§7](#7-deploy-the-worker-stack) — no tag-watching needed.
 
-```bash
-aws ec2 describe-instances \
-  --filters "Name=tag:appliance-v1fs:stack,Values=scanner-1" \
-  --query 'Reservations[].Instances[].Tags[?Key==`appliance-v1fs:provisioned`]|[0].Value' \
-  --output text
-# → true  (ready to scan)
-```
-
-Timeline check: from `create-stack` to fully provisioned is typically **30–45 minutes**, including one or two watchdog cycles.
+Timeline check: from `create-stack` to `CREATE_COMPLETE` is typically **30–45 minutes**, most of it the automated registration/provisioning around your single console visit.
 
 ## 7. Deploy the worker stack
 
@@ -697,9 +701,9 @@ Scaling is linear at ~170 scans/s per appliance: 1 ≈ 14.7M files/day · 4 ≈ 
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Appliances fail to launch (authorization error) | No Marketplace subscription | Subscribe ([§3](#3-aws-setup)), redeploy |
-| Never `registered=true` | Registration token expired (24 h) or appliance still booting | Fresh token, new stack name; allow 1–2 watchdog cycles |
-| `registered=true` but never `provisioned=true` | File Security not installed via console | [§6](#6-install-file-security), then one watchdog cycle |
+| Appliances fail to launch (`401 / AccessDenied`) | Marketplace subscription not accepted | Subscribe ([§3](#3-aws-setup)), redeploy |
+| Stack stuck / fails at `WaitForRegistration` | Registration token expired (24 h) or appliance still booting | Check the provisioner Lambda logs; use a fresh token + new stack name |
+| Stack stuck / fails at `WaitForFileSecurity` | File Security not yet installed via console, or install exceeded the 60-min gate | Complete [§6](#6-install-file-security); if the gate already timed out, redeploy and install within the window |
 | Files sit untagged in the scan bucket | Appliances not provisioned, or workers can't discover them | Check both tags; dashboard queue depth; worker logs via SSM session |
 | Small files scan, >10 MB files fail | Appliance upload limit reverted by an update | Self-heals within 15 min; or trigger the watchdog and check its log |
 | SDK client: immediate UNAVAILABLE | No route/SG rule to port 443, or TLS trust problem | Verify reachability from your subnet; re-read [§10](#10-scan-from-your-own-code-java) |
