@@ -1300,8 +1300,13 @@ Resources:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: !If [CreateNetworking, !GetAtt BaseVPC.CidrBlock, !Ref ExistingVPCCidr]
-          Description: HTTPS to VPC endpoints (Secrets Manager, SSM, EC2, STS)
+          CidrIp: 0.0.0.0/0
+          Description: >-
+            HTTPS to the interface endpoints (Secrets Manager, SSM, EC2, STS)
+            and — via the S3 gateway endpoint — to S3, which the deploy gates
+            need to PUT their CloudFormation response. The gateway endpoint
+            keeps S3 traffic private; the destination is the S3 prefix list
+            (not the VPC CIDR), so this rule must allow it.
       Tags:
         - Key: Name
           Value: !Sub ProvisionerLambdaSG-${AWS::StackName}
