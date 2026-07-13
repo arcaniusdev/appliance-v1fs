@@ -548,7 +548,7 @@ eicar → {"scanResult": 1, "fileName": "eicar.txt",
 
 ## 11. Inside the scanner application
 
-The worker fleet runs a single Python file — `app/scanner.py`, about 400 lines — and that's the entire application. It was kept deliberately small so an evaluator can read it in one sitting and adapt it with confidence.
+The worker fleet runs a single Python file — `app/scanner.py`, about 430 lines — and that's the entire application. It was kept deliberately small so an evaluator can read it in one sitting and adapt it with confidence.
 
 ### The whole thing in five steps
 
