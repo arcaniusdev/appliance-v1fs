@@ -33,12 +33,13 @@ import signal
 import socket
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlencode
+from urllib.parse import unquote_plus, urlencode
 
 import amaas.grpc.aio
 import boto3
 import grpc
 from aiobotocore.session import AioSession
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger("scanner")
 logging.basicConfig(
@@ -47,6 +48,7 @@ logging.basicConfig(
 )
 
 QUARANTINE_BUCKET = os.environ.get("QUARANTINE_BUCKET", "")
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
 
 
 # ── SG Discovery ────────────────────────────────────────────────────
@@ -117,12 +119,29 @@ async def _process_file(s3, scan_bucket, key, size, pml, feedback, handle, sg_na
                         logs, audit_log_group):
     logger.info("Processing s3://%s/%s (%d bytes)", scan_bucket, key, size)
 
+    # Files beyond the gRPC/nginx limit can't be scanned — tag and skip
+    # instead of downloading (protects worker memory) and poisoning the DLQ.
+    if size and size > MAX_FILE_BYTES:
+        logger.warning("TOO LARGE: s3://%s/%s (%d bytes > %d)",
+                       scan_bucket, key, size, MAX_FILE_BYTES)
+        await s3.put_object_tagging(
+            Bucket=scan_bucket, Key=key,
+            Tagging={"TagSet": [
+                {"Key": "ScanResult", "Value": "SkippedTooLarge"},
+                {"Key": "ScanTimestamp",
+                 "Value": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
+            ]},
+        )
+        await _audit(logs, audit_log_group, scan_bucket, key, size,
+                     "skipped_too_large", {}, 0, sg_name)
+        return
+
     try:
         resp = await s3.get_object(Bucket=scan_bucket, Key=key)
         async with resp["Body"] as stream:
             file_bytes = await stream.read()
-    except Exception as exc:
-        if "NoSuchKey" in str(type(exc).__name__) or "NoSuchKey" in str(exc):
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
             logger.warning("s3://%s/%s gone, skipping", scan_bucket, key)
             return
         raise
@@ -162,10 +181,13 @@ async def _process_file(s3, scan_bucket, key, size, pml, feedback, handle, sg_na
                 {"Key": "ScanTimestamp", "Value": scan_ts},
             ]},
         )
-        await s3.put_object(
+        # Server-side copy — no re-upload of bytes we already hold, and the
+        # quarantine copy preserves the original object's metadata.
+        await s3.copy_object(
             Bucket=QUARANTINE_BUCKET,
             Key=f"{scan_bucket}/{key}",
-            Body=file_bytes,
+            CopySource={"Bucket": scan_bucket, "Key": key},
+            TaggingDirective="REPLACE",
             Tagging=urlencode({"ScanResult": "Malware", "ScanTimestamp": scan_ts}),
         )
         await s3.delete_object(Bucket=scan_bucket, Key=key)
@@ -253,10 +275,20 @@ async def _process_message(sqs, s3, logs, queue_url, message, handles,
     heartbeat_task = asyncio.create_task(heartbeat())
     try:
         body = json.loads(message["Body"])
-        record = body.get("Records", [{}])[0].get("s3", {})
-        scan_bucket = record.get("bucket", {}).get("name")
-        key = record.get("object", {}).get("key")
-        size = record.get("object", {}).get("size", 0)
+        if "Records" in body:
+            # Native S3 event notification. Keys are URL-encoded in S3
+            # events (spaces become '+') — decode or the object 404s.
+            record = body.get("Records", [{}])[0].get("s3", {})
+            scan_bucket = record.get("bucket", {}).get("name")
+            key = record.get("object", {}).get("key")
+            key = unquote_plus(key) if key else key
+            size = record.get("object", {}).get("size", 0)
+        else:
+            # EventBridge-shaped message (reconciliation/rescan Lambda).
+            detail = body.get("detail", {})
+            scan_bucket = detail.get("bucket", {}).get("name")
+            key = detail.get("object", {}).get("key")
+            size = detail.get("object", {}).get("size", 0)
 
         if not scan_bucket or not key:
             logger.error("Missing bucket/key in event: %s", json.dumps(body)[:200])

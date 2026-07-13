@@ -1,3 +1,5 @@
-visionone-filesecurity>=1.4.4
+# Pinned to the latest published SDK release (PyPI currently tops out at
+# 1.4.1 — a floor of >=1.4.4 does not resolve and breaks fresh installs).
+visionone-filesecurity==1.4.1
 aiobotocore>=2.21.0
 boto3>=1.35.0
