@@ -4,39 +4,39 @@ Description: TrendAI Service Gateway Scanner Infrastructure
 Mappings:
   ServiceGatewayAMI:
     ap-northeast-1:
-      AMI: ami-061b8e13afe1358d6
+      AMI: ami-0b1629a705c534b73
     ap-northeast-2:
-      AMI: ami-06d290f555649e7cf
+      AMI: ami-02de430abe54b7409
     ap-northeast-3:
-      AMI: ami-00f25d39db251653f
+      AMI: ami-01bb3eb983fc75d44
     ap-south-1:
-      AMI: ami-0a2f9a344b741d105
+      AMI: ami-01a7edb8099b831f0
     ap-southeast-1:
-      AMI: ami-0314c89685371c51b
+      AMI: ami-0cd9e66a80dd39ce3
     ap-southeast-2:
-      AMI: ami-041754942552affa3
+      AMI: ami-0471d1171f209cb67
     ca-central-1:
-      AMI: ami-07402a3cb195e17fc
+      AMI: ami-08e46e8fdd0184057
     eu-central-1:
-      AMI: ami-052395dc73896c7e9
+      AMI: ami-04d3d7291a55523ab
     eu-north-1:
-      AMI: ami-01da7559532215e43
+      AMI: ami-04164c1aaa0e68c45
     eu-west-1:
-      AMI: ami-0464d17a390eaa185
+      AMI: ami-095ec2d1614b70441
     eu-west-2:
-      AMI: ami-074a722115304208d
+      AMI: ami-0de8bca994d27198c
     eu-west-3:
-      AMI: ami-0fb56479bb67150e8
+      AMI: ami-0cea17d0462180c5a
     sa-east-1:
-      AMI: ami-0fceef1ddaea68074
+      AMI: ami-0d035f304e4100b0b
     us-east-1:
-      AMI: ami-0cc07c329eab4df1c
+      AMI: ami-0fd26474308bb040f
     us-east-2:
-      AMI: ami-070f04f9bc3eea5f5
+      AMI: ami-02f0c1e045d559a0b
     us-west-1:
-      AMI: ami-0d82ee727bafa15e8
+      AMI: ami-0d50873468639fe96
     us-west-2:
-      AMI: ami-0bcbbe1b09927f3d7
+      AMI: ami-0629b54d99f82b2d2
 
 Parameters:
   AZ1:
