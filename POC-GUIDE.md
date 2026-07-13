@@ -207,10 +207,13 @@ Everything above is idempotent and re-checked every 15 minutes, so a scanner upd
 
 This is the **one manual step** in the whole deployment: TrendAI requires the File Security service to be installed onto each appliance from the Vision One console, and provides no API for it.
 
-**You're here because the scanner stack told you so.** It has finished `WaitForRegistration` and is now paused at **`WaitForFileSecurity`** ([§4](#4-deploy-the-scanner-stack)) — that pause *is* the "install now" signal, and it means the appliance is already registered and ready to receive File Security. No tag-checking required.
+**You're here because the scanner stack told you so.** It has finished `WaitForRegistration` and is now paused at **`WaitForFileSecurity`** ([§4](#4-deploy-the-scanner-stack)) — that pause *is* the "install now" signal, and it means the appliance is already registered. No tag-checking required.
 
 > [!IMPORTANT]
-> Do this within **~60 minutes** — that's the gate's timeout. If it lapses, the stack fails at `WaitForFileSecurity` (nothing is lost; you install File Security, then redeploy). 60 minutes is plenty for the clicks below.
+> **Wait for any firmware upgrade to finish first.** A freshly launched appliance often self-upgrades to the newest Service Gateway firmware on first boot — this update is delivered over-the-air by Vision One and is **independent of the AMI version**, so it happens even on the latest AMI. If the appliance's page shows *"An update is in progress (Version: 3.0.x…)"*, **wait for it to clear** (usually ~10–20 minutes) before installing File Security; the install won't proceed mid-upgrade.
+
+> [!IMPORTANT]
+> The `WaitForFileSecurity` gate times out after **90 minutes** — enough to absorb a firmware upgrade plus the install. If it lapses, the stack fails at `WaitForFileSecurity` (nothing is lost; you finish the install, then redeploy).
 
 **Click by click in the Vision One console:**
 
@@ -747,7 +750,7 @@ You resize by updating the scanner stack's `ServiceGatewayCount` (1–8) — but
 |---|---|---|
 | Appliances fail to launch (`401 / AccessDenied`) | Marketplace subscription not accepted | Subscribe ([§3](#3-aws-setup)), redeploy |
 | Stack stuck / fails at `WaitForRegistration` | Registration token expired (24 h) or appliance still booting | Check the provisioner Lambda logs; use a fresh token + new stack name |
-| Stack stuck / fails at `WaitForFileSecurity` | File Security not yet installed via console, or install exceeded the 60-min gate | Complete [§6](#6-install-file-security); if the gate already timed out, redeploy and install within the window |
+| Stack stuck / fails at `WaitForFileSecurity` | File Security not yet installed via console, appliance still self-upgrading firmware, or install exceeded the 90-min gate | Wait out any in-progress firmware upgrade, then complete [§6](#6-install-file-security); if the gate already timed out, redeploy and install within the window |
 | Files sit untagged in the scan bucket | Appliances not provisioned, or workers can't discover them | Check both tags; dashboard queue depth; worker logs via SSM session |
 | Small files scan, >10 MB files fail | Appliance upload limit reverted by an update | Self-heals within 15 min; or trigger the watchdog and check its log |
 | SDK client: immediate UNAVAILABLE | No route/SG rule to port 443, or TLS trust problem | Verify reachability from your subnet; re-read [§10](#10-scan-from-your-own-code-java) |

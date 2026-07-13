@@ -16,7 +16,10 @@ _SAFE_HOSTNAME = re.compile(r'^[A-Za-z0-9\-]{1,63}$')
 # Deployment gates (Custom::AwaitRegistration / Custom::AwaitInstallation).
 # The registration wait is fully automated; the File Security install wait
 # depends on a human console step, so it gets a much longer deadline.
-GATE_DEADLINES = {"registration": 25 * 60, "installation": 60 * 60}
+# installation allows 90 min: a freshly launched appliance may first
+# self-upgrade its firmware to the newest release (delivered over-the-air by
+# Vision One, independent of the AMI) before File Security can be installed.
+GATE_DEADLINES = {"registration": 25 * 60, "installation": 90 * 60}
 GATE_POLL_SECONDS = 30
 GATE_REINVOKE_MARGIN_MS = 120 * 1000  # re-invoke self when <2 min of runtime left
 
