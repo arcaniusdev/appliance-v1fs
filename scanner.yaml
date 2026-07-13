@@ -1737,11 +1737,12 @@ Resources:
   #                          appliance provisioned & scan-ready.
   #
   # Each drives the watchdog itself, so neither waits on the 15-min schedule.
+  # No DependsOn here: the ServiceToken GetAtt already orders this after the
+  # provisioner Lambda, and the gate polls until the appliances register, so it
+  # tolerates starting before they exist. An explicit DependsOn on the Lambda or
+  # the SG instances introduces a circular dependency (rejected at create time).
   WaitForRegistration:
     Type: Custom::AwaitRegistration
-    DependsOn:
-      - ServiceGateway01
-      - ProvisionerLambda
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Phase: registration

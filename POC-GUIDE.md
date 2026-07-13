@@ -106,10 +106,14 @@ The Service Gateway image is an AWS Marketplace product. Your account **must acc
 > [!NOTE]
 > **Evaluation sizing:** 2 appliances (c5.2xlarge) — enough to demonstrate load balancing with ~29M files/day of capacity, at roughly $17/day of EC2 cost. Scale to 8 later with a single stack update.
 
-### Step 4a — Get the registration token (console, click by click)
+### Step 4a — Get the template
+
+Download **`scanner.yaml`** from the repository — ideally from a tagged release if one is published, so it matches the provisioner code the stack pulls at deploy time. (The scanner stack's CodeBuild pulls the provisioner from the repo's `main` branch during creation, so a template from that same state stays consistent.) That one file is all you need — you do **not** have to clone the repo.
+
+### Step 4b — Get the registration token (console, click by click)
 
 > [!IMPORTANT]
-> The token expires **24 hours** after you generate it, so do this right before the deploy in Step 4b — not earlier.
+> The token expires **24 hours** after you generate it, so do this right before the deploy in Step 4c — not earlier.
 
 1. Sign in to the Vision One console.
 2. In the left navigation, go to **Workflow and Automation → Service Gateway Management**.
@@ -117,30 +121,30 @@ The Service Gateway image is an AWS Marketplace product. Your account **must acc
 4. In the dialog, find **Registration Token** and click **Copy**. Paste it somewhere safe for the next step.
 5. Close the dialog. **You are not downloading anything** — our appliance AMI comes from AWS Marketplace, so ignore the image-type and download-disk options; the dialog is only where the token lives.
 
-### Step 4b — Launch the stack (CLI)
+### Step 4c — Create the stack (console upload)
 
-```bash
-# 1. Stage the template
-aws s3 cp scanner.yaml s3://<staging-bucket>/scanner.yaml
+The simplest path uploads the template directly in the Create-stack wizard — no S3 bucket to create; the console stages it for you.
 
-# 2. Launch (~10–15 minutes to CREATE_COMPLETE)
-aws cloudformation create-stack \
-  --stack-name scanner-1 \
-  --template-url https://s3.amazonaws.com/<staging-bucket>/scanner.yaml \
-  --parameters \
-    ParameterKey=ServiceGatewayCount,ParameterValue=2 \
-    ParameterKey=VisionOneApiKey,ParameterValue="<api-key>" \
-    ParameterKey=SGRegistrationToken,ParameterValue="<registration-token>" \
-  --capabilities CAPABILITY_IAM \
-  --disable-rollback
+1. Open the **CloudFormation console → Create stack → With new resources (standard)**.
+2. Under **Specify template**, choose **Upload a template file → Choose file →** select `scanner.yaml` **→ Next**.
+3. **Stack name:** `scanner-1`. Then fill the parameters: paste **VisionOneApiKey** (from [§2](#2-vision-one-setup)) and **SGRegistrationToken** (from Step 4b), set **ServiceGatewayCount** (e.g. `2`), and leave the rest at their defaults. **Next**.
+4. Under **Stack failure options**, choose **Preserve successfully provisioned resources** — the console equivalent of `--disable-rollback`, so a failure leaves resources up for inspection. **Next**.
+5. On the review page, tick **"I acknowledge that AWS CloudFormation might create IAM resources"**, then **Submit**.
 
-# 3. Watch the appliances progress through their lifecycle
-aws ec2 describe-instances \
-  --filters "Name=tag:appliance-v1fs:stack,Values=scanner-1" \
-  --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,
-           Tags[?Key==`appliance-v1fs:registered`]|[0].Value,
-           Tags[?Key==`appliance-v1fs:provisioned`]|[0].Value]' --output table
-```
+> [!TIP]
+> **Prefer the CLI?** Upload the template to any S3 bucket and create the stack from its URL. The template exceeds CloudFormation's 51 KB inline limit, so an S3 URL is required (you can't pass it inline with `--template-body`):
+> ```bash
+> aws s3 cp scanner.yaml s3://<staging-bucket>/scanner.yaml
+> aws cloudformation create-stack \
+>   --stack-name scanner-1 \
+>   --template-url https://s3.amazonaws.com/<staging-bucket>/scanner.yaml \
+>   --parameters \
+>     ParameterKey=ServiceGatewayCount,ParameterValue=2 \
+>     ParameterKey=VisionOneApiKey,ParameterValue="<api-key>" \
+>     ParameterKey=SGRegistrationToken,ParameterValue="<registration-token>" \
+>   --capabilities CAPABILITY_IAM \
+>   --disable-rollback
+> ```
 
 **This stack does not report `CREATE_COMPLETE` the moment its resources exist.** Two built-in gates hold it open until the fleet is genuinely scan-ready, so completion is a signal you can trust — no tag-polling:
 
