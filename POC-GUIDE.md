@@ -697,9 +697,29 @@ Scaling is linear at ~170 scans/s per appliance: 1 ≈ 14.7M files/day · 4 ≈ 
 | Task | How |
 |---|---|
 | Steady state | Hands-off. The watchdog reconciles every 15 minutes; appliance updates arrive from Vision One automatically and configuration is re-verified afterward. |
-| Scale the fleet | Update `ServiceGatewayCount` (1–8). New appliances self-register; install File Security on them ([§6](#6-install-file-security)); workers notice within 60 s and rebalance. |
+| Scale the fleet | Change `ServiceGatewayCount` — see [Scaling the fleet](#scaling-the-fleet) below (up and down behave differently). |
 | Tune scan policy | Archive depth/ratio/count/size limits: Vision One → *File Security → Virtual Appliance* — the documented console knobs. |
 | Watch the pipeline | The CloudWatch dashboard · `scan-audit-<worker-stack>` (one JSON line per scan) · `/aws/lambda/provisioner-<scanner-stack>` (watchdog) · SSM Session Manager for a shell anywhere. |
+
+### Scaling the fleet
+
+You resize by updating the scanner stack's `ServiceGatewayCount` (1–8) — but scaling **up** and **down** are not symmetric, because appliances have termination protection on by design.
+
+**Scale up (e.g. 2 → 4)** — fully handled by an update; the two gates from [§4](#4-deploy-the-scanner-stack) re-run:
+
+1. Update the scanner stack with the higher `ServiceGatewayCount` (console **Update → Use current template**, or `update-stack`). *(Existing-VPC deployments must also supply the new `ExistingPrivateSubnetNId` parameters, one per added appliance — otherwise the new instances have no subnet.)*
+2. CloudFormation creates the new appliances and re-runs both gates (their `ExpectedCount` changed). The update **pauses at `WaitForFileSecurity`** — the same cue as first deploy.
+3. **Install File Security on each new appliance** ([§6](#6-install-file-security)). The watchdog registers and provisions them; when all appliances are ready the update reaches `UPDATE_COMPLETE`.
+4. Workers notice the new appliances within 60 seconds and rebalance automatically — no worker-stack change needed.
+
+**Scale down (e.g. 4 → 2)** — requires one manual step first, because CloudFormation **cannot terminate a protected instance**. If you just lower the count, the update fails trying to delete the surplus appliances.
+
+1. Identify the surplus appliances — the highest-numbered ones (`FSVA-AWS-04`, `FSVA-AWS-03`, … down to the new count) — and disable termination protection on each:
+   ```bash
+   aws ec2 modify-instance-attribute --instance-id <id> --no-disable-api-termination
+   ```
+2. Update the scanner stack with the lower `ServiceGatewayCount`. CloudFormation removes those appliances; the gates see the (already-satisfied) lower `ExpectedCount` and pass.
+3. In the Vision One console, **disconnect the removed appliances** (Service Gateway Management → trash icon) so stale entries don't linger. Workers drop them from rotation within 60 seconds.
 
 ## 16. Troubleshooting
 
