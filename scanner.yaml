@@ -82,13 +82,21 @@ Parameters:
     MinValue: 1
     MaxValue: 8
   ServiceGatewayInstanceType:
-    Description: EC2 instance type for Service Gateway appliances (c5 family required by AMI)
+    Description: >-
+      EC2 instance type for Service Gateway appliances. TrendAI documents
+      support for C5, C6, and C7 series; c5.2xlarge is the documented default.
+      C6i/C7i types are newly allowed per updated system requirements - verify
+      Marketplace AMI eligibility on first use.
     Type: String
     Default: c5.2xlarge
     AllowedValues:
       - c5.2xlarge
       - c5.4xlarge
       - c5.9xlarge
+      - c6i.2xlarge
+      - c6i.4xlarge
+      - c7i.2xlarge
+      - c7i.4xlarge
   MaxFileSizeMB:
     Description: Maximum file size in MB for gRPC scanning (nginx and gRPC channel limit)
     Type: Number
@@ -1235,16 +1243,6 @@ Resources:
       SecurityGroupIds:
         - !Ref VPCEndpointSecGroup
 
-  # ── SSH Key Pair ────────────────────────────────────────────────────
-  ServiceGatewayKeyPair:
-    Type: AWS::EC2::KeyPair
-    Properties:
-      KeyName: !Sub ServiceGatewayKeyPair-${AWS::StackName}
-      KeyType: ed25519
-      Tags:
-        - Key: Name
-          Value: !Sub ServiceGatewayKeyPair-${AWS::StackName}
-
   # ── Service Gateway Security Group ───────────────────────────────────
   ServiceGatewaySecGroup:
     Type: AWS::EC2::SecurityGroup
@@ -1304,7 +1302,6 @@ Resources:
       LaunchTemplateData:
         ImageId: !FindInMap [ServiceGatewayAMI, !Ref "AWS::Region", AMI]
         InstanceType: !Ref ServiceGatewayInstanceType
-        KeyName: !Ref ServiceGatewayKeyPair
         IamInstanceProfile:
           Arn: !GetAtt ServiceGatewayInstanceProfile.Arn
         SecurityGroupIds:
@@ -1427,105 +1424,6 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${ServiceGatewayHostname}-08
-
-  # ── Private Hosted Zone (TLS hostname matching) ────────────────────
-  # The SG wildcard cert (*.sgi.xdr.trendmicro.com) requires connections
-  # to a matching hostname for TLS to validate. This private zone resolves
-  # per-SG hostnames to their private IPs within the VPC.
-  ScannerHostedZone:
-    Type: AWS::Route53::HostedZone
-    Properties:
-      Name: sgi.xdr.trendmicro.com
-      VPCs:
-        - VPCId: !If [CreateNetworking, !Ref BaseVPC, !Ref ExistingVPCId]
-          VPCRegion: !Ref "AWS::Region"
-
-  ServiceGateway01DNS:
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref ScannerHostedZone
-      Name: !Sub "${ServiceGatewayHostname}-01.sgi.xdr.trendmicro.com"
-      Type: A
-      TTL: 10
-      ResourceRecords:
-        - !GetAtt ServiceGateway01.PrivateIp
-
-  ServiceGateway02DNS:
-    Condition: CreateSG2
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref ScannerHostedZone
-      Name: !Sub "${ServiceGatewayHostname}-02.sgi.xdr.trendmicro.com"
-      Type: A
-      TTL: 10
-      ResourceRecords:
-        - !GetAtt ServiceGateway02.PrivateIp
-
-  ServiceGateway03DNS:
-    Condition: CreateSG3
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref ScannerHostedZone
-      Name: !Sub "${ServiceGatewayHostname}-03.sgi.xdr.trendmicro.com"
-      Type: A
-      TTL: 10
-      ResourceRecords:
-        - !GetAtt ServiceGateway03.PrivateIp
-
-  ServiceGateway04DNS:
-    Condition: CreateSG4
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref ScannerHostedZone
-      Name: !Sub "${ServiceGatewayHostname}-04.sgi.xdr.trendmicro.com"
-      Type: A
-      TTL: 10
-      ResourceRecords:
-        - !GetAtt ServiceGateway04.PrivateIp
-
-  ServiceGateway05DNS:
-    Condition: CreateSG5
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref ScannerHostedZone
-      Name: !Sub "${ServiceGatewayHostname}-05.sgi.xdr.trendmicro.com"
-      Type: A
-      TTL: 10
-      ResourceRecords:
-        - !GetAtt ServiceGateway05.PrivateIp
-
-  ServiceGateway06DNS:
-    Condition: CreateSG6
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref ScannerHostedZone
-      Name: !Sub "${ServiceGatewayHostname}-06.sgi.xdr.trendmicro.com"
-      Type: A
-      TTL: 10
-      ResourceRecords:
-        - !GetAtt ServiceGateway06.PrivateIp
-
-  ServiceGateway07DNS:
-    Condition: CreateSG7
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref ScannerHostedZone
-      Name: !Sub "${ServiceGatewayHostname}-07.sgi.xdr.trendmicro.com"
-      Type: A
-      TTL: 10
-      ResourceRecords:
-        - !GetAtt ServiceGateway07.PrivateIp
-
-  ServiceGateway08DNS:
-    Condition: CreateSG8
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref ScannerHostedZone
-      Name: !Sub "${ServiceGatewayHostname}-08.sgi.xdr.trendmicro.com"
-      Type: A
-      TTL: 10
-      ResourceRecords:
-        - !GetAtt ServiceGateway08.PrivateIp
 
   # ── Scanner Deploy Bucket & CodeBuild ─────────────────────────────
   ScannerDeployBucket:

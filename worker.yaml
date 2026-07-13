@@ -47,9 +47,12 @@ Parameters:
     MinValue: 10
     MaxValue: 2048
   EnableTLS:
-    Description: Enable TLS for gRPC connections to Service Gateways (disable for private VPC)
+    Description: >-
+      TLS for gRPC connections to Service Gateways (port 443, the documented
+      appliance scanner endpoint). Disable only for troubleshooting - plaintext
+      gRPC on port 80 is not a documented interface.
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues: ["true", "false"]
 
 Resources:

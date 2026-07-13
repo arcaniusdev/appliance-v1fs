@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 
 import amaas.grpc.aio
 import boto3
+import grpc
 from aiobotocore.session import AioSession
 
 logger = logging.getLogger("scanner")
@@ -50,26 +51,36 @@ def _build_handles(api_key):
     if not sgs:
         raise RuntimeError("No running SGs found")
 
-    enable_tls = os.environ.get("ENABLE_TLS", "false").lower() == "true"
-    cert_path = None
+    enable_tls = os.environ.get("ENABLE_TLS", "true").lower() == "true"
+    creds = None
+    tls_override = None
     if enable_tls:
         sm = boto3.client("secretsmanager")
         ca_cert_pem = sm.get_secret_value(SecretId=os.environ["SG_CA_CERT_SECRET_ARN"])["SecretString"]
-        cert_path = "/tmp/sg-ca.pem"
-        with open(cert_path, "w") as f:
-            f.write(ca_cert_pem)
+        # The appliance serves a wildcard cert (*.sgi.xdr.trendmicro.com).
+        # We connect by IP and satisfy hostname verification with an SNI/
+        # authority override, so no DNS records for that domain are needed.
+        tls_override = os.environ.get("SG_TLS_OVERRIDE", "sg.sgi.xdr.trendmicro.com")
+        call_creds = grpc.metadata_call_credentials(
+            lambda ctx, cb: cb((("authorization", f"ApiKey {api_key}"),), None))
+        creds = grpc.composite_channel_credentials(
+            grpc.ssl_channel_credentials(ca_cert_pem.encode("utf-8")), call_creds)
 
     handles = []
     for ip, name in sgs:
         if enable_tls:
-            # Connect via DNS hostname so cert (*.sgi.xdr.trendmicro.com) validates
-            host = f"{name.lower()}.sgi.xdr.trendmicro.com:443"
-            handle = amaas.grpc.aio.init(host, api_key=api_key, enable_tls=True, ca_cert=cert_path)
+            host = f"{ip}:443"
+            # SDK scan functions accept any gRPC channel; init() itself does
+            # not expose the target-name override, so build the channel here.
+            handle = grpc.aio.secure_channel(
+                host, creds,
+                options=[("grpc.ssl_target_name_override", tls_override)])
         else:
             host = f"{ip}:80"
             handle = amaas.grpc.aio.init(host, api_key=api_key, enable_tls=False)
         handles.append((handle, name))
-        logger.info("SDK handle: %s (%s)", name, host)
+        logger.info("SDK handle: %s (%s%s)", name, host,
+                    f", sni={tls_override}" if enable_tls else "")
     return handles
 
 
