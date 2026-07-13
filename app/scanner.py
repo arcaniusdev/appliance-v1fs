@@ -1,3 +1,28 @@
+"""S3 malware-scanning worker — SQS poller driving Service Gateway appliances.
+
+One async event loop does everything:
+
+    poll SQS → download object from S3 → gRPC scan via File Security SDK
+        → clean:      tag ScanResult=Clean, leave in place
+        → malicious:  tag, copy to quarantine bucket, delete from scan bucket
+        → either way: JSON audit entry to CloudWatch Logs
+
+Design notes:
+  * Appliances are discovered by EC2 tag (SG_DISCOVERY_TAG) and re-discovered
+    every SG_REFRESH_INTERVAL seconds; handles rebuild when the set changes.
+  * One gRPC handle per appliance, reused for all scans (HTTP/2 multiplexing).
+    TLS mode connects by IP with an SNI override so the appliance wildcard
+    cert validates without DNS; h2c (port 80) is a troubleshooting fallback.
+  * Concurrency is sized from capacity, not guessed: appliances x 32 scan
+    handlers x 1.5, enforced with an asyncio.Semaphore.
+  * Long scans hold their SQS message via a visibility heartbeat; failures
+    surface quickly by shrinking visibility to 30s (DLQ after 5 receives).
+  * SIGTERM drains in-flight scans before exit (safe with auto-scaling).
+
+Async on purpose: the synchronous SDK leaked OS threads under sustained load
+(9,000+ observed); a single event loop holds steady and is easier to reason
+about. All configuration comes from environment variables set by worker.yaml.
+"""
 import asyncio
 import json
 import logging
