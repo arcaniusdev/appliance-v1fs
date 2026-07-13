@@ -5,7 +5,9 @@ One async event loop does everything:
     poll SQS → download object from S3 → gRPC scan via File Security SDK
         → clean:      tag ScanResult=Clean, leave in place
         → malicious:  tag, copy to quarantine bucket, delete from scan bucket
-        → either way: JSON audit entry to CloudWatch Logs
+        → decompression limit hit (scanResult 0 + foundErrors): tag
+          ScanResult=NotFullyScanned, leave in place — never marked Clean
+        → all cases:  JSON audit entry to CloudWatch Logs
 
 Design notes:
   * Appliances are discovered by EC2 tag (SG_DISCOVERY_TAG) and re-discovered
@@ -143,6 +145,9 @@ async def _process_file(s3, scan_bucket, key, size, pml, feedback, handle, sg_na
     scan_ms = int((time.monotonic() - scan_start) * 1000)
     result = json.loads(result_json)
     is_malicious = result.get("scanResult", 0) > 0
+    # scanResult 0 with foundErrors means a decompression limit was hit —
+    # the file was NOT fully inspected and must not be tagged Clean.
+    scan_errors = [e.get("name", "") for e in result.get("foundErrors") or []]
     scan_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Route based on verdict
@@ -165,6 +170,17 @@ async def _process_file(s3, scan_bucket, key, size, pml, feedback, handle, sg_na
         )
         await s3.delete_object(Bucket=scan_bucket, Key=key)
         verdict = "malicious"
+    elif scan_errors:
+        logger.warning("NOT FULLY SCANNED: s3://%s/%s errors=%s scan=%dms sg=%s",
+                       scan_bucket, key, scan_errors, scan_ms, sg_name)
+        await s3.put_object_tagging(
+            Bucket=scan_bucket, Key=key,
+            Tagging={"TagSet": [
+                {"Key": "ScanResult", "Value": "NotFullyScanned"},
+                {"Key": "ScanTimestamp", "Value": scan_ts},
+            ]},
+        )
+        verdict = "not_fully_scanned"
     else:
         logger.info("CLEAN: s3://%s/%s scan=%dms sg=%s", scan_bucket, key, scan_ms, sg_name)
         await s3.put_object_tagging(
@@ -177,14 +193,14 @@ async def _process_file(s3, scan_bucket, key, size, pml, feedback, handle, sg_na
         verdict = "clean"
 
     await _audit(logs, audit_log_group, scan_bucket, key, size, verdict,
-                 result, scan_ms, sg_name)
+                 result, scan_ms, sg_name, scan_errors)
     del file_bytes
 
 
 # ── Audit Trail ──────────────────────────────────────────────────────
 
 async def _audit(logs, log_group, bucket, key, size, verdict, result,
-                 scan_ms, sg_name):
+                 scan_ms, sg_name, scan_errors=None):
     if not log_group or not logs:
         return
     stream = f"scanner-{socket.gethostname()}"
@@ -197,6 +213,7 @@ async def _audit(logs, log_group, bucket, key, size, verdict, result,
         "scanResult": result.get("scanResult", -1),
         "sha256": result.get("fileSHA256", ""),
         "malware": [m.get("malwareName", "") for m in result.get("foundMalwares", [])],
+        "scanErrors": scan_errors or [],
         "scanId": result.get("scanId", ""),
         "scanDurationMs": scan_ms,
         "serviceGateway": sg_name,
