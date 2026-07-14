@@ -1297,16 +1297,16 @@ Resources:
           ToPort: 22
           CidrIp: !If [CreateNetworking, !GetAtt BaseVPC.CidrBlock, !Ref ExistingVPCCidr]
           Description: SSH to Service Gateway instances
+        # 443 must reach both the interface endpoints AND S3 (via the gateway
+        # endpoint). The deploy gates PUT their CloudFormation response to an
+        # S3 presigned URL; the S3 gateway endpoint routes to the S3 prefix
+        # list, not the VPC CIDR, so 0.0.0.0/0 is required here. Traffic stays
+        # private via the gateway endpoint. (EC2 caps rule descriptions <256.)
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
-          Description: >-
-            HTTPS to the interface endpoints (Secrets Manager, SSM, EC2, STS)
-            and, via the S3 gateway endpoint, to S3, which the deploy gates
-            need to PUT their CloudFormation response. The gateway endpoint
-            keeps S3 traffic private; the destination is the S3 prefix list
-            (not the VPC CIDR), so this rule must allow it.
+          Description: HTTPS to VPC interface endpoints and to S3 via the gateway endpoint (deploy-gate cfnresponse)
       Tags:
         - Key: Name
           Value: !Sub ProvisionerLambdaSG-${AWS::StackName}
