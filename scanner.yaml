@@ -1712,12 +1712,6 @@ Resources:
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ec2/keypair/*"
-              # Self-invoke: deployment gates re-invoke the function to wait
-              # longer than one Lambda timeout. Scoped to this function by name
-              # (not !GetAtt) to avoid a role<->function circular dependency.
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:provisioner-${AWS::StackName}"
 
   ProvisionerLambda:
     Type: AWS::Lambda::Function
@@ -1768,6 +1762,69 @@ Resources:
       CompatibleRuntimes:
         - python3.12
 
+  # ── Deployment-gate dispatcher (NON-VPC) ────────────────────────────
+  # Backs the WaitForRegistration/WaitForFileSecurity custom resources. It runs
+  # OUTSIDE the VPC on purpose: a VPC-resident Lambda cannot reliably PUT its
+  # cfnresponse to S3 during stack DELETE (the NAT / route path is torn down
+  # mid-delete, so the connect times out and the stack wedges in DELETE_FAILED).
+  # Outside the VPC it reaches S3 directly. SSH provisioning still needs the VPC,
+  # so the gate delegates each watchdog pass to the VPC ProvisionerLambda via a
+  # synchronous invoke (WATCHDOG_FUNCTION_ARN).
+  GateLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GatePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Poll appliance readiness tags.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              # Drive the VPC watchdog + self-reinvoke to outlast one Lambda
+              # timeout. Scoped by function name (not !GetAtt) to avoid a
+              # role<->function circular dependency.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:provisioner-${AWS::StackName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:gate-${AWS::StackName}"
+
+  GateLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: ScannerCodeBuild
+    Properties:
+      FunctionName: !Sub gate-${AWS::StackName}
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref ScannerDeployBucket
+        S3Key: provisioner-code.zip
+      Layers:
+        - !Ref ProvisionerLayer
+      Role: !GetAtt GateLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      # Deliberately NOT in the VPC — see the comment above.
+      Environment:
+        Variables:
+          SG_TAG_KEY: "appliance-v1fs:stack"
+          SG_TAG_VALUE: !Ref "AWS::StackName"
+          AWS_REGION_NAME: !Ref "AWS::Region"
+          WATCHDOG_FUNCTION_ARN: !GetAtt ProvisionerLambda.Arn
+
   WatchdogSchedule:
     Type: AWS::Events::Rule
     Properties:
@@ -1798,39 +1855,25 @@ Resources:
   #   WaitForFileSecurity  → File Security installed (console) and each
   #                          appliance provisioned & scan-ready.
   #
-  # Each drives the watchdog itself, so neither waits on the 15-min schedule.
-  #
-  # DependsOn notes:
-  #  - NOT on ProvisionerLambda or the SG instances: the ServiceToken GetAtt
-  #    already orders the gate after the Lambda, and the gate polls until the
-  #    appliances register, so it tolerates starting before they exist. An
-  #    explicit DependsOn on either introduces a circular dependency (rejected
-  #    at create time).
-  #  - DO depend on S3GatewayEndpoint. The gate Lambda is VPC-resident and PUTs
-  #    its cfnresponse to S3 via this gateway endpoint. On stack DELETE, without
-  #    the dependency CloudFormation may tear the endpoint (and its route-table
-  #    routes) down before/while invoking the gate's Delete, leaving the Lambda
-  #    with no route to S3 — the response never arrives and the stack sticks in
-  #    DELETE_FAILED, blocking the Lambda and the whole VPC behind it. Depending
-  #    on the endpoint forces it (and the private route tables it references) to
-  #    outlive the gate on delete. The endpoint does not reference the gate, so
-  #    this is acyclic. When deploying into an existing VPC (CreateNetworking
-  #    false) the endpoint is not created and CloudFormation ignores the
-  #    dependency; S3 reachability is then the existing VPC's responsibility and
-  #    is not torn down by this stack, so there is no race.
+  # Backed by GateLambda (NON-VPC) so the cfnresponse PUT always reaches S3,
+  # including on stack DELETE — a VPC-resident backer cannot (its route to S3 is
+  # torn down mid-delete, wedging the stack in DELETE_FAILED). No DependsOn on
+  # ProvisionerLambda or the SG instances: the ServiceToken GetAtt already orders
+  # the gate after GateLambda, and the gate polls until the appliances register,
+  # so it tolerates starting before they exist; an explicit DependsOn on either
+  # introduces a circular dependency (rejected at create time).
   WaitForRegistration:
     Type: Custom::AwaitRegistration
-    DependsOn: S3GatewayEndpoint
     Properties:
-      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      ServiceToken: !GetAtt GateLambda.Arn
       Phase: registration
       ExpectedCount: !Ref ServiceGatewayCount
 
   WaitForFileSecurity:
     Type: Custom::AwaitInstallation
-    DependsOn: [WaitForRegistration, S3GatewayEndpoint]
+    DependsOn: WaitForRegistration
     Properties:
-      ServiceToken: !GetAtt ProvisionerLambda.Arn
+      ServiceToken: !GetAtt GateLambda.Arn
       Phase: installation
       ExpectedCount: !Ref ServiceGatewayCount
 

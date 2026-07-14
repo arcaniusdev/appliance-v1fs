@@ -417,6 +417,33 @@ def _count_ready(region, tag_key):
                if inst.get(tag_key) == "true")
 
 
+def _drive_watchdog(phase, context):
+    """Run one watchdog (SSH provisioning) pass.
+
+    The gate Lambda runs OUTSIDE the VPC so its cfnresponse PUT always reaches
+    S3 (a VPC Lambda cannot reliably reach S3 during stack teardown — the NAT /
+    route path is torn down mid-delete, wedging the stack in DELETE_FAILED). SSH
+    to the appliance needs the VPC, so the gate delegates each watchdog pass to
+    the VPC-resident watchdog Lambda via a synchronous invoke (serialised, so
+    passes don't overlap). WATCHDOG_FUNCTION_ARN unset ⇒ same-Lambda fallback.
+    """
+    wd_arn = os.environ.get("WATCHDOG_FUNCTION_ARN")
+    if not wd_arn:
+        try:
+            _handle_watchdog({}, context)
+        except Exception:
+            logger.exception("Gate(%s): in-process watchdog pass failed", phase)
+        return
+    try:
+        from botocore.config import Config
+        cfg = Config(connect_timeout=10, read_timeout=300, retries={"max_attempts": 0})
+        boto3.client("lambda", config=cfg).invoke(
+            FunctionName=wd_arn, InvocationType="RequestResponse", Payload=b"{}")
+    except Exception:
+        # A slow/failed watchdog pass must not stop the gate; it retries next poll.
+        logger.exception("Gate(%s): watchdog invoke failed, will retry", phase)
+
+
 def _handle_gate(event, context):
     """Block a CloudFormation stack until the fleet reaches a target state.
 
@@ -442,10 +469,7 @@ def _handle_gate(event, context):
 
     try:
         while True:
-            try:
-                _handle_watchdog({}, context)
-            except Exception:
-                logger.exception("Gate(%s): watchdog pass failed, will retry", phase)
+            _drive_watchdog(phase, context)
 
             ready = _count_ready(region, tag_key)
             logger.info("Gate(%s): %d/%d appliances ready", phase, ready, expected)
