@@ -1799,12 +1799,28 @@ Resources:
   #                          appliance provisioned & scan-ready.
   #
   # Each drives the watchdog itself, so neither waits on the 15-min schedule.
-  # No DependsOn here: the ServiceToken GetAtt already orders this after the
-  # provisioner Lambda, and the gate polls until the appliances register, so it
-  # tolerates starting before they exist. An explicit DependsOn on the Lambda or
-  # the SG instances introduces a circular dependency (rejected at create time).
+  #
+  # DependsOn notes:
+  #  - NOT on ProvisionerLambda or the SG instances: the ServiceToken GetAtt
+  #    already orders the gate after the Lambda, and the gate polls until the
+  #    appliances register, so it tolerates starting before they exist. An
+  #    explicit DependsOn on either introduces a circular dependency (rejected
+  #    at create time).
+  #  - DO depend on S3GatewayEndpoint. The gate Lambda is VPC-resident and PUTs
+  #    its cfnresponse to S3 via this gateway endpoint. On stack DELETE, without
+  #    the dependency CloudFormation may tear the endpoint (and its route-table
+  #    routes) down before/while invoking the gate's Delete, leaving the Lambda
+  #    with no route to S3 — the response never arrives and the stack sticks in
+  #    DELETE_FAILED, blocking the Lambda and the whole VPC behind it. Depending
+  #    on the endpoint forces it (and the private route tables it references) to
+  #    outlive the gate on delete. The endpoint does not reference the gate, so
+  #    this is acyclic. When deploying into an existing VPC (CreateNetworking
+  #    false) the endpoint is not created and CloudFormation ignores the
+  #    dependency; S3 reachability is then the existing VPC's responsibility and
+  #    is not torn down by this stack, so there is no race.
   WaitForRegistration:
     Type: Custom::AwaitRegistration
+    DependsOn: S3GatewayEndpoint
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Phase: registration
@@ -1812,7 +1828,7 @@ Resources:
 
   WaitForFileSecurity:
     Type: Custom::AwaitInstallation
-    DependsOn: WaitForRegistration
+    DependsOn: [WaitForRegistration, S3GatewayEndpoint]
     Properties:
       ServiceToken: !GetAtt ProvisionerLambda.Arn
       Phase: installation

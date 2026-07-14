@@ -364,7 +364,21 @@ def _cfn_respond(event, status, data=None, reason=None, physical_id=None):
     req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT")
     req.add_header("content-type", "")
     req.add_header("content-length", str(len(body)))
-    urllib.request.urlopen(req, timeout=15)
+    # The response URL is an S3 presigned PUT reached (in the VPC) via the S3
+    # gateway endpoint. During stack DELETE that path can be momentarily flaky
+    # as networking tears down, so retry a few times before giving up — a lost
+    # response leaves the stack stuck in DELETE_FAILED.
+    last_exc = None
+    for attempt in range(5):
+        try:
+            urllib.request.urlopen(req, timeout=15)
+            return
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("cfnresponse PUT attempt %d failed: %s", attempt + 1, exc)
+            time.sleep(3 * (attempt + 1))
+    logger.error("cfnresponse PUT failed after retries: %s", last_exc)
+    raise last_exc
 
 
 def _count_ready(region, tag_key):
