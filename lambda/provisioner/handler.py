@@ -361,7 +361,12 @@ def _cfn_respond(event, status, data=None, reason=None, physical_id=None):
         "Data": data or {},
     }).encode("utf-8")
     import urllib.request
-    req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT")
+    from urllib.parse import urlparse
+    url = event["ResponseURL"]
+    host = urlparse(url).hostname or ""
+    logger.info("cfnresponse: %s PUT to host=%s (RequestType=%s)",
+                status, host, event.get("RequestType"))
+    req = urllib.request.Request(url, data=body, method="PUT")
     req.add_header("content-type", "")
     req.add_header("content-length", str(len(body)))
     # The response URL is an S3 presigned PUT reached (in the VPC) via the S3
@@ -372,13 +377,39 @@ def _cfn_respond(event, status, data=None, reason=None, physical_id=None):
     for attempt in range(5):
         try:
             urllib.request.urlopen(req, timeout=15)
+            logger.info("cfnresponse PUT succeeded on attempt %d", attempt + 1)
             return
         except Exception as exc:
             last_exc = exc
-            logger.warning("cfnresponse PUT attempt %d failed: %s", attempt + 1, exc)
+            logger.warning("cfnresponse PUT attempt %d failed: %r", attempt + 1, exc)
+            _diagnose_connectivity(host)
             time.sleep(3 * (attempt + 1))
-    logger.error("cfnresponse PUT failed after retries: %s", last_exc)
+    logger.error("cfnresponse PUT failed after retries: %r", last_exc)
     raise last_exc
+
+
+def _diagnose_connectivity(host):
+    """Log DNS + TCP-connect probes so a failed cfnresponse tells us WHY:
+    DNS failure vs no route/timeout vs connection refused."""
+    import socket
+    if not host:
+        return
+    try:
+        ip = socket.gethostbyname(host)
+        logger.warning("diag: DNS %s -> %s OK", host, ip)
+    except Exception as exc:
+        logger.warning("diag: DNS resolution of %s FAILED: %r", host, exc)
+        return
+    for port in (443,):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(8)
+        try:
+            s.connect((ip, port))
+            logger.warning("diag: TCP connect %s:%d OK", ip, port)
+        except Exception as exc:
+            logger.warning("diag: TCP connect %s:%d FAILED: %r", ip, port, exc)
+        finally:
+            s.close()
 
 
 def _count_ready(region, tag_key):
