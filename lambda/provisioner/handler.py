@@ -138,13 +138,22 @@ def _patch_nginx_body_size(client):
 
 
 def _set_scan_cache(client):
-    """Override TM_AM_SCAN_CACHE only when disabled for baseline testing; else default."""
-    enabled = os.environ.get("SCAN_CACHE_ENABLED", "true")
-    env = "TM_AM_SCAN_CACHE=false" if enabled == "false" else "TM_AM_SCAN_CACHE-"
+    """Disable TM_AM_SCAN_CACHE only when ScanCacheEnabled=false (baseline testing).
+
+    When scan cache is enabled (the appliance default) leave the Trend-shipped
+    deployment completely untouched. Previously this issued
+    ``kubectl set env deployment --all TM_AM_SCAN_CACHE-`` even in the enabled
+    case — stripping the shipped variable mutates the pod template and triggers a
+    deployment rollout. A rollout that lands during the scanner's first-time
+    Postgres bootstrap interrupts init before ``v1fs_db`` is created, wedging the
+    File Security install at ``Init:x/y`` forever. So act only when we must
+    actually disable the cache; otherwise do nothing (no mutation, no rollout)."""
+    if os.environ.get("SCAN_CACHE_ENABLED", "true") != "false":
+        return
     out = _run(client,
-               f"sudo microk8s kubectl set env deployment --all "
-               f"-n sg-sfs-scanner {env} 2>&1", timeout=15)
-    logger.info("scan cache (%s): %s", env, out)
+               "sudo microk8s kubectl set env deployment --all "
+               "-n sg-sfs-scanner TM_AM_SCAN_CACHE=false 2>&1", timeout=15)
+    logger.info("scan cache disabled (ScanCacheEnabled=false): %s", out)
 
 
 def _harden_ciphers(host, port, admin_key):
@@ -159,12 +168,30 @@ def _harden_ciphers(host, port, admin_key):
 
 
 def _scanner_pod_running(host, port, admin_key):
-    """Check via admin clish whether the File Security scanner pod is Running."""
+    """True only when the scanner pod itself is Running with all containers ready.
+
+    ``configure verify plat`` lists every pod in every namespace, so a naive
+    ``"sg-sfs-scanner" in out and "Running" in out`` test is a false positive
+    while the scanner is still in ``Init`` — its name is already present and
+    unrelated pods (nginx, calico, sg-apl) are ``Running``. Reporting the pod
+    ready too early let the watchdog run provisioning mutations mid-init. Parse
+    the scanner pod's own row and require STATUS=Running with a full READY count
+    (N/N, N>0)."""
     with ClishSession(host, "admin", admin_key, port=port) as session:
         session.connect(timeout=30)
         session.send_command("enable", expect="# ", timeout=15)
         out = session.send_command("configure verify plat", expect="# ", timeout=60)
-    return "sg-sfs-scanner" in out and "Running" in out
+    for line in out.splitlines():
+        parts = line.split()
+        # Row format: NAMESPACE NAME READY STATUS RESTARTS AGE
+        if (len(parts) >= 4 and parts[0] == "sg-sfs-scanner"
+                and parts[1].startswith("sg-sfs-scanner-")):
+            ready, status = parts[2], parts[3]
+            if status == "Running" and "/" in ready:
+                got, _, want = ready.partition("/")
+                if got.isdigit() and got == want and int(got) > 0:
+                    return True
+    return False
 
 
 # ── Discovery ─────────────────────────────────────────────────────────

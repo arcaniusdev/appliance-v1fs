@@ -7,3 +7,7 @@ docs/
 guide/
 *.html
 settings.json
+
+# Local environment / secrets — never commit (public repo)
+.env
+.env.*
